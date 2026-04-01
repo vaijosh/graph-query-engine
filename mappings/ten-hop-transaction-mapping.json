@@ -1,0 +1,27 @@
+{
+  "vertices": {
+    "Account": {
+      "table": "hop_tx_nodes",
+      "idColumn": "id",
+      "properties": {
+        "name": "name",
+        "txId": "tx_id",
+        "accountType": "account_type"
+      }
+    }
+  },
+  "edges": {
+    "TRANSFER": {
+      "table": "hop_tx_links",
+      "idColumn": "id",
+      "outColumn": "out_id",
+      "inColumn": "in_id",
+      "properties": {
+        "txId": "tx_id",
+        "amount": "amount",
+        "eventTime": "event_time"
+      }
+    }
+  }
+}
+
