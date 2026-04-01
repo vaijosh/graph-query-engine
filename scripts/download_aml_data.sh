@@ -76,11 +76,30 @@ fi
 
 chmod 600 "$KAGGLE_JSON"
 
+# ── Validate variant name ─────────────────────────────────────────────────────
+VALID_VARIANTS=("HI-Small" "HI-Medium" "HI-Large" "LI-Small" "LI-Medium" "LI-Large")
+if [[ -n "$VARIANT" ]]; then
+    valid=0
+    for v in "${VALID_VARIANTS[@]}"; do
+        [[ "$v" == "$VARIANT" ]] && valid=1 && break
+    done
+    if [[ $valid -eq 0 ]]; then
+        error "Unknown variant '$VARIANT'.
+       Valid variants: ${VALID_VARIANTS[*]}
+       Example: --variant HI-Small"
+    fi
+fi
+
 # ── Create destination directory ──────────────────────────────────────────────
 mkdir -p "$DEST_DIR"
 info "Destination: $DEST_DIR"
 
 # ── Download ──────────────────────────────────────────────────────────────────
+info "Note: if this is your first download, you must accept the dataset rules at:"
+info "  https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml"
+info "(click 'Rules' → 'I Understand and Accept' on that page, then re-run)"
+echo ""
+
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
