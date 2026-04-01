@@ -24,10 +24,6 @@ public class GremlinExecutionService {
         return graphProvider.executeInTransaction(gremlin);
     }
 
-    public synchronized void resetTransactionDemoGraph() {
-        graphProvider.resetTransactionDemoGraph();
-    }
-
     public String providerId() {
         return graphProvider.providerId();
     }

@@ -2,6 +2,8 @@ package com.graphqueryengine.gremlin;
 
 import com.graphqueryengine.gremlin.provider.GraphProvider;
 import com.graphqueryengine.gremlin.provider.TinkerGraphProvider;
+import org.apache.tinkerpop.gremlin.structure.T;
+import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -11,17 +13,35 @@ import javax.script.ScriptException;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 @DisplayName("Gremlin Compatibility Tests (Curated Subset)")
 class GremlinCompatibilityTest {
 
     private GraphProvider provider;
 
+    private static void seedTenHopChain(TinkerGraphProvider provider) {
+        Vertex previous = null;
+        for (int i = 1; i <= 11; i++) {
+            Vertex current = provider.getGraph().addVertex(
+                    T.id, i,
+                    T.label, "Account",
+                    "name", "Acct-" + i,
+                    "accountType", (i % 2 == 0) ? "MERCHANT" : "PERSONAL",
+                    "txId", "TXN-900" + i
+            );
+            if (previous != null) {
+                previous.addEdge("TRANSFER", current, T.id, 1000L + i, "amount", String.valueOf(10 * i));
+            }
+            previous = current;
+        }
+    }
+
     @BeforeEach
     void setup() {
-        provider = new TinkerGraphProvider();
+        TinkerGraphProvider tinkerProvider = new TinkerGraphProvider();
+        seedTenHopChain(tinkerProvider);
+        provider = tinkerProvider;
     }
 
     @Nested
@@ -90,7 +110,7 @@ class GremlinCompatibilityTest {
         void collectPaths() throws ScriptException {
             GremlinExecutionResult result = provider.execute("g.V(1).repeat(out()).times(2).path()");
             assertEquals(1, result.resultCount());
-            assertTrue(result.results().get(0) instanceof List);
+            assertInstanceOf(List.class, result.results().get(0));
         }
     }
 
@@ -117,6 +137,7 @@ class GremlinCompatibilityTest {
         void tenHopRepeat() throws ScriptException {
             GremlinExecutionResult result = provider.execute("g.V(1).repeat(out()).times(10)");
             assertEquals(1, result.resultCount());
+            @SuppressWarnings("unchecked")
             Map<String, Object> vertex = (Map<String, Object>) result.results().get(0);
             assertEquals(11, vertex.get("id"));
         }
@@ -151,6 +172,7 @@ class GremlinCompatibilityTest {
         void inboundHop() throws ScriptException {
             GremlinExecutionResult result = provider.execute("g.V(11).repeat(in()).times(1)");
             assertEquals(1, result.resultCount());
+            @SuppressWarnings("unchecked")
             Map<String, Object> vertex = (Map<String, Object>) result.results().get(0);
             assertEquals(10, vertex.get("id"));
         }

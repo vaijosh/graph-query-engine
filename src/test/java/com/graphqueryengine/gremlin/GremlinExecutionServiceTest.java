@@ -16,9 +16,31 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class GremlinExecutionServiceTest {
 
+    private GremlinExecutionService newSeededTenHopService() {
+        TinkerGraphProvider provider = new TinkerGraphProvider();
+        TinkerGraph graph = provider.getGraph();
+
+        Vertex previous = null;
+        for (int i = 1; i <= 11; i++) {
+            Vertex current = graph.addVertex(
+                    T.id, i,
+                    T.label, "Account",
+                    "name", "Acct-" + i,
+                    "accountType", (i % 2 == 0) ? "MERCHANT" : "PERSONAL",
+                    "txId", "TXN-900" + i
+            );
+            if (previous != null) {
+                previous.addEdge("TRANSFER", current, T.id, 1000L + i, "amount", String.valueOf(10 * i));
+            }
+            previous = current;
+        }
+
+        return new GremlinExecutionService(provider);
+    }
+
     @Test
     void executesTenHopRepeatOutQuery() throws ScriptException {
-        GremlinExecutionService service = new GremlinExecutionService();
+        GremlinExecutionService service = newSeededTenHopService();
 
         GremlinExecutionResult result = service.execute(
                 "g.V(1).hasLabel('Account').has('txId','TXN-9001').repeat(out('TRANSFER')).times(10).values('name')"
@@ -30,19 +52,19 @@ class GremlinExecutionServiceTest {
 
     @Test
     void executesPathQueryWithSimplePath() throws ScriptException {
-        GremlinExecutionService service = new GremlinExecutionService();
+        GremlinExecutionService service = newSeededTenHopService();
 
         GremlinExecutionResult result = service.execute(
                 "g.V(1).repeat(out().simplePath()).times(10).path().limit(100)"
         );
 
         assertEquals(1, result.resultCount());
-        assertTrue(result.results().get(0) instanceof java.util.List);
+        assertInstanceOf(List.class, result.results().get(0));
     }
 
     @Test
     void executesQueryThroughTransactionApi() throws ScriptException {
-        GremlinExecutionService service = new GremlinExecutionService();
+        GremlinExecutionService service = newSeededTenHopService();
 
         GremlinTransactionalExecutionResult result = service.executeInTransaction(
                 "g.V(1).hasLabel('Account').repeat(out('TRANSFER')).times(10).values('name')"

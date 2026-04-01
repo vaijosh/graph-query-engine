@@ -7,7 +7,6 @@ import org.apache.tinkerpop.gremlin.process.traversal.Path;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.structure.Edge;
-import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
 
@@ -27,7 +26,7 @@ public class TinkerGraphProvider implements GraphProvider {
     private GraphTransactionApi transactionApi;
 
     public TinkerGraphProvider() {
-        resetTransactionDemoGraph();
+        initializeIfNeeded();
     }
 
     @Override
@@ -41,6 +40,8 @@ public class TinkerGraphProvider implements GraphProvider {
             throw new IllegalArgumentException("Gremlin query is required");
         }
 
+        initializeIfNeeded();
+
         Bindings bindings = new SimpleBindings();
         bindings.put("g", traversal);
 
@@ -51,6 +52,7 @@ public class TinkerGraphProvider implements GraphProvider {
 
     @Override
     public synchronized GremlinTransactionalExecutionResult executeInTransaction(String gremlin) throws ScriptException {
+        initializeIfNeeded();
         try {
             GraphTransactionApi.TransactionExecution<GremlinExecutionResult> txExecution = transactionApi.execute(() -> execute(gremlin));
             GremlinExecutionResult result = txExecution.value();
@@ -74,6 +76,7 @@ public class TinkerGraphProvider implements GraphProvider {
      * Not intended for use by the core engine.
      */
     public synchronized TinkerGraph getGraph() {
+        initializeIfNeeded();
         return graph;
     }
 
@@ -82,26 +85,15 @@ public class TinkerGraphProvider implements GraphProvider {
      * Not intended for use by the core engine.
      */
     public synchronized GraphTraversalSource getTraversal() {
+        initializeIfNeeded();
         return traversal;
     }
 
-    /**
-     * Resets the in-memory TinkerGraph to a clean empty state.
-     * Called at startup and by the /admin/seed-gremlin-10hop-tx endpoint
-     * so transaction-demo scenarios can be replayed from scratch.
-     */
-    @Override
-    public synchronized void resetTransactionDemoGraph() {
-        // Close existing traversal and graph if present
-        if (traversal != null) {
-            try { traversal.close(); } catch (Exception ignored) {}
-            traversal = null;
+    private void initializeIfNeeded() {
+        if (graph != null && traversal != null && transactionApi != null) {
+            return;
         }
-        if (graph != null) {
-            try { graph.close(); } catch (Exception ignored) {}
-            graph = null;
-        }
-        // Open a fresh empty TinkerGraph
+
         graph = TinkerGraph.open();
         traversal = graph.traversal();
         transactionApi = new TinkerGraphTransactionApi(graph);
@@ -202,5 +194,6 @@ public class TinkerGraphProvider implements GraphProvider {
             graph.close();
             graph = null;
         }
+        transactionApi = null;
     }
 }

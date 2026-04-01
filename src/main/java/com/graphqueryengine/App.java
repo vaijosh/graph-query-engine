@@ -37,14 +37,10 @@ import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
 import java.sql.Connection;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.script.ScriptException;
-import java.util.Map;
-import java.util.Optional;
 
 public class App {
     private static final Logger LOG = LoggerFactory.getLogger(App.class);
@@ -115,7 +111,7 @@ public class App {
                         "message", "Mapping loaded",
                         "mappingId", stored.id(),
                         "mappingName", stored.name(),
-                        "active", mappingStore.activeMappingId().orElse(null).equals(stored.id()),
+                        "active", Objects.equals(mappingStore.activeMappingId().orElse(null), stored.id()),
                         "vertexLabels", mappingConfig.vertices().keySet(),
                         "edgeLabels", mappingConfig.edges().keySet(),
                         "createdAt", stored.createdAt()
@@ -142,7 +138,7 @@ public class App {
         });
 
         app.get("/mappings", ctx -> ctx.json(Map.of(
-                "activeMappingId", mappingStore.activeMappingId().orElse(null),
+                "activeMappingId", Objects.requireNonNull(mappingStore.activeMappingId().orElse(null)),
                 "mappings", mappingStore.list()
         )));
 
@@ -203,9 +199,8 @@ public class App {
         });
 
         app.post("/query", ctx -> {
-            QueryRequest request;
             try {
-                request = ctx.bodyAsClass(QueryRequest.class);
+                ctx.bodyAsClass(QueryRequest.class);
             } catch (Exception ex) {
                 ctx.status(400).json(Map.of("error", "Body must be JSON: {\"gremlin\":\"...\"}"));
                 return;
@@ -305,11 +300,6 @@ public class App {
 
         app.get("/gremlin/provider", ctx -> ctx.json(Map.of("provider", gremlinExecutionService.providerId())));
 
-        app.post("/admin/seed-gremlin-10hop-tx", ctx -> {
-            gremlinExecutionService.resetTransactionDemoGraph();
-            ctx.json(Map.of("message", "Gremlin in-memory transaction graph reset"));
-        });
-
         app.post("/admin/load-aml-csv", ctx -> {
             String pathParam = ctx.queryParam("path");
             if (pathParam == null || pathParam.isBlank()) {
@@ -388,7 +378,7 @@ public class App {
                 AtomicInteger alertsCreated = new AtomicInteger(0);
 
                 CSVFormat fmt = CSVFormat.DEFAULT.builder()
-                        .setHeader().setSkipHeaderRecord(true).setTrim(true).build();
+                        .setHeader().setSkipHeaderRecord(true).setTrim(true).get();
 
                 try (Reader reader = Files.newBufferedReader(csvPath, StandardCharsets.UTF_8);
                      CSVParser parser = fmt.parse(reader)) {

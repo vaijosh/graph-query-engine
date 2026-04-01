@@ -13,9 +13,11 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Integration test for the /admin/load-aml-csv endpoint.
@@ -43,11 +45,17 @@ class AmlCsvLoadIntegrationTest {
     /** The demo CSV has exactly 5 rows where is_laundering=1. */
     private static final int EXPECTED_ALERTS = 5;
 
+    /** Keep a single default so tests don't pass magic numbers repeatedly. */
+    private static final int DEFAULT_MAX_ROWS = 100_000;
+
     private static Javalin app;
     private static int port;
 
     @BeforeAll
     static void startServer() {
+        assumeTrue(Files.exists(Path.of(CSV_PATH)),
+                "Skipping AML CSV integration tests: missing input file at " + CSV_PATH
+                + ". Generate/download it before running these tests.");
         app = App.start(0);
         port = app.port();
     }
@@ -69,10 +77,10 @@ class AmlCsvLoadIntegrationTest {
      * POST /admin/load-aml-csv and return the parsed JSON response body.
      * Fails the test immediately if the HTTP status is not 200.
      */
-    private JsonNode loadCsv(int maxRows) throws IOException, InterruptedException {
+    private JsonNode loadCsv() throws IOException, InterruptedException {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(baseUrl() + "/admin/load-aml-csv"
-                        + "?path=" + CSV_PATH + "&maxRows=" + maxRows))
+                        + "?path=" + CSV_PATH + "&maxRows=" + DEFAULT_MAX_ROWS))
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
 
@@ -111,7 +119,7 @@ class AmlCsvLoadIntegrationTest {
      */
     @Test
     void loadAmlCsv_returnsSuccessJson() throws IOException, InterruptedException {
-        JsonNode result = loadCsv(100_000);
+        JsonNode result = loadCsv();
 
         assertTrue(result.path("accountsCreated").asInt() > 0,
                 "At least one Account vertex should be created");
@@ -131,7 +139,7 @@ class AmlCsvLoadIntegrationTest {
     @Test
     void alertCount_equalsExpectedAfterLoad() throws IOException, InterruptedException {
         // Load the data first (idempotent — clears graph then reloads)
-        loadCsv(100_000);
+        loadCsv();
 
         JsonNode result = gremlin("g.V().hasLabel('Alert').count()");
         assertEquals(1, result.path("resultCount").asInt(), "resultCount should be 1");
@@ -145,7 +153,7 @@ class AmlCsvLoadIntegrationTest {
      */
     @Test
     void c1_topSenderAccounts_returnsResults() throws IOException, InterruptedException {
-        loadCsv(100_000);
+        loadCsv();
 
         JsonNode result = gremlin(
                 "g.V().hasLabel('Account')" +
@@ -172,8 +180,8 @@ class AmlCsvLoadIntegrationTest {
      */
     @Test
     void doubleLoad_stillProducesCorrectAlertCount() throws IOException, InterruptedException {
-        loadCsv(100_000);  // first load
-        JsonNode second = loadCsv(100_000);  // second load (clears the now-populated graph)
+        loadCsv();  // first load
+        JsonNode second = loadCsv();  // second load (clears the now-populated graph)
 
         assertEquals(EXPECTED_ALERTS, second.path("alertsCreated").asInt(),
                 "Second load should produce the same alert count as the first");

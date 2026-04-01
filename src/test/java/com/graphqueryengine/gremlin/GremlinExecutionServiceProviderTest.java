@@ -27,10 +27,6 @@ class GremlinExecutionServiceProviderTest {
             public GremlinTransactionalExecutionResult executeInTransaction(String gremlin) {
                 return new GremlinTransactionalExecutionResult(gremlin, List.of("ok"), 1, "FAKE", "COMMITTED");
             }
-
-            @Override
-            public void resetTransactionDemoGraph() {
-            }
         };
 
         GremlinExecutionService service = new GremlinExecutionService(provider);
