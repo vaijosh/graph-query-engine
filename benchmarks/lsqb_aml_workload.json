@@ -1,0 +1,55 @@
+{
+  "name": "aml-lsqb-inspired",
+  "description": "Weighted AML workload for GraphQueryEngine benchmark runs.",
+  "queries": [
+    {
+      "name": "S1_count_accounts",
+      "gremlin": "g.V().count()",
+      "endpoint": "/gremlin/query",
+      "weight": 5
+    },
+    {
+      "name": "S3_suspicious_count",
+      "gremlin": "g.E().has('isLaundering','1').count()",
+      "endpoint": "/gremlin/query",
+      "weight": 5
+    },
+    {
+      "name": "C1_top_hubs",
+      "gremlin": "g.V().project('accountId','bankId','outDegree').by('accountId').by('bankId').by(outE('TRANSFER').count()).order().by(select('outDegree'),Order.desc).limit(15)",
+      "endpoint": "/gremlin/query",
+      "weight": 3
+    },
+    {
+      "name": "C2_suspicious_hubs",
+      "gremlin": "g.V().project('accountId','bankId','suspiciousOut','totalOut').by('accountId').by('bankId').by(outE('TRANSFER').has('isLaundering','1').count()).by(outE('TRANSFER').count()).where(select('suspiciousOut').is(gt(0))).order().by(select('suspiciousOut'),Order.desc).limit(15)",
+      "endpoint": "/gremlin/query",
+      "weight": 2
+    },
+    {
+      "name": "C4_two_hop_suspicious_chain",
+      "gremlin": "g.E().has('isLaundering','1').outV().as('a').outE('TRANSFER').has('isLaundering','1').inV().as('b').where('a',neq('b')).select('a','b').by('accountId').limit(20)",
+      "endpoint": "/gremlin/query",
+      "weight": 2
+    },
+    {
+      "name": "C8_ten_hop_path",
+      "gremlin": "g.V().where(outE('TRANSFER').has('isLaundering','1')).limit(1).repeat(out('TRANSFER').simplePath()).times(10).path().by('accountId').limit(5)",
+      "endpoint": "/gremlin/query",
+      "weight": 1
+    },
+    {
+      "name": "C11_ten_hop_reachability_count",
+      "gremlin": "g.V().where(outE('TRANSFER').has('isLaundering','1')).limit(1).repeat(out('TRANSFER')).times(10).dedup().count()",
+      "endpoint": "/gremlin/query",
+      "weight": 2
+    },
+    {
+      "name": "C10_tx_suspicious_count",
+      "gremlin": "g.E().has('isLaundering','1').count()",
+      "endpoint": "/gremlin/query/tx",
+      "weight": 1
+    }
+  ]
+}
+

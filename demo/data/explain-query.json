@@ -1,0 +1,2 @@
+{"gremlin":"g.V(1).hasLabel(\"Node\").repeat(out(\"LINK\")).times(3)"}
+
