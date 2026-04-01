@@ -62,19 +62,60 @@ error() { echo "[ERROR] $*" >&2; exit 1; }
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 info "Checking prerequisites..."
 
-if ! command -v kaggle &>/dev/null; then
-    error "kaggle CLI not found. Install it with: pip install kaggle
-       Then create your API token at https://www.kaggle.com/settings
-       and save it to ~/.kaggle/kaggle.json"
-fi
+# Locate kaggle CLI — prefer the project venv, then PATH
+SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+KAGGLE_CMD=""
+for candidate in \
+    "$SCRIPT_ROOT/.venv/bin/kaggle" \
+    "${VIRTUAL_ENV:-}/bin/kaggle" \
+    "$(command -v kaggle 2>/dev/null || true)"; do
+    if [[ -x "$candidate" ]]; then
+        KAGGLE_CMD="$candidate"
+        break
+    fi
+done
 
-KAGGLE_JSON="${KAGGLE_CONFIG_DIR:-$HOME/.kaggle}/kaggle.json"
-if [[ ! -f "$KAGGLE_JSON" ]]; then
-    error "Kaggle API token not found at $KAGGLE_JSON
-       Create one at https://www.kaggle.com/settings → API → Create New Token"
+if [[ -z "$KAGGLE_CMD" ]]; then
+    error "kaggle CLI not found. Install it with:
+       pip install kaggle          (or: pip install kaggle inside your venv)
+       Then set up credentials at https://www.kaggle.com/settings → API"
 fi
+info "Using kaggle CLI: $KAGGLE_CMD"
 
-chmod 600 "$KAGGLE_JSON"
+# Accept new-style KGAT_ access tokens (stored in ~/.kaggle/access_token)
+# as well as legacy API keys (stored in ~/.kaggle/kaggle.json)
+KAGGLE_CONFIG_HOME="${KAGGLE_CONFIG_DIR:-$HOME/.kaggle}"
+KAGGLE_JSON="$KAGGLE_CONFIG_HOME/kaggle.json"
+KAGGLE_ACCESS_TOKEN_FILE="$KAGGLE_CONFIG_HOME/access_token"
+
+if [[ -f "$KAGGLE_ACCESS_TOKEN_FILE" ]]; then
+    # New-style OAuth/access-token — the kagglesdk reads this automatically
+    chmod 600 "$KAGGLE_ACCESS_TOKEN_FILE"
+    info "Found access token: $KAGGLE_ACCESS_TOKEN_FILE"
+elif [[ -f "$KAGGLE_JSON" ]]; then
+    # Legacy API key — must be valid JSON with username + key
+    chmod 600 "$KAGGLE_JSON"
+    # Detect raw KGAT_ token accidentally placed in kaggle.json and auto-migrate
+    raw_content="$(tr -d '[:space:]' < "$KAGGLE_JSON")"
+    if [[ "$raw_content" == KGAT_* ]]; then
+        warn "kaggle.json contains a raw KGAT_ access token instead of JSON."
+        warn "Migrating it to $KAGGLE_ACCESS_TOKEN_FILE automatically..."
+        cp "$KAGGLE_JSON" "$KAGGLE_ACCESS_TOKEN_FILE"
+        chmod 600 "$KAGGLE_ACCESS_TOKEN_FILE"
+        info "Migrated. Using access_token file going forward."
+    fi
+else
+    error "No Kaggle credentials found.
+       Option A (new-style token — starts with KGAT_):
+         Go to https://www.kaggle.com/settings → API → Create New Token
+         Save the raw token string to: $KAGGLE_ACCESS_TOKEN_FILE
+         chmod 600 $KAGGLE_ACCESS_TOKEN_FILE
+
+       Option B (legacy API key):
+         Download kaggle.json from https://www.kaggle.com/settings → API
+         mv ~/Downloads/kaggle.json $KAGGLE_JSON
+         chmod 600 $KAGGLE_JSON"
+fi
 
 # ── Validate variant name ─────────────────────────────────────────────────────
 VALID_VARIANTS=("HI-Small" "HI-Medium" "HI-Large" "LI-Small" "LI-Medium" "LI-Large")
@@ -113,7 +154,7 @@ if [[ -n "$VARIANT" ]]; then
     )
     for f in "${FILES[@]}"; do
         info "  → $f"
-        kaggle datasets download \
+        "$KAGGLE_CMD" datasets download \
             --dataset "$DATASET" \
             --file "$f" \
             --path "$TMP_DIR" \
@@ -121,7 +162,7 @@ if [[ -n "$VARIANT" ]]; then
     done
 else
     info "Downloading full dataset from Kaggle (this may take a while)..."
-    kaggle datasets download \
+    "$KAGGLE_CMD" datasets download \
         --dataset "$DATASET" \
         --path "$TMP_DIR" \
         --unzip 2>&1 | sed 's/^/    /'
