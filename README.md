@@ -84,10 +84,32 @@ curl -X POST http://localhost:7000/query/explain \
 
 ## AML demo (Jupyter notebook)
 
+The IBM AML dataset is **not checked into git** (files range from 32 MB to 16 GB).
+Download it first using the provided script:
+
 ```bash
-mvn exec:java                  # terminal 1
-python3 scripts/normalize_aml.py          # first time only
-jupyter notebook aml_demo_queries.ipynb   # terminal 2
+# Requires Kaggle CLI and a ~/.kaggle/kaggle.json API token
+# Get your token at https://www.kaggle.com/settings → API → Create New Token
+pip install kaggle
+
+# Download HI-Small only (fastest, ~500 MB) and normalize 100k rows
+./scripts/download_aml_data.sh --variant HI-Small
+
+# Or download all variants (all sizes, ~70 GB total)
+./scripts/download_aml_data.sh
+
+# Options:
+#   --variant HI-Small|HI-Medium|HI-Large|LI-Small|LI-Medium|LI-Large
+#   --rows 50000          number of rows for aml-demo.csv (default: 100000)
+#   --skip-normalize      skip the normalize_aml.py step
+#   --src HI-Medium_Trans.csv   pick a different source for normalization
+```
+
+Then run the demo:
+
+```bash
+mvn exec:java                              # terminal 1 — start engine
+jupyter notebook aml_demo_queries.ipynb   # terminal 2 — open notebook
 ```
 
 Run cells top-to-bottom. Queries S1–S8 (simple) and C1–C11 (complex, including 10-hop) execute against the live service. See `QUICK_REFERENCE.md` for all queries in copy-paste form.
@@ -126,8 +148,8 @@ src/main/java/com/graphqueryengine/
 
 mappings/       Sample mapping JSON files
 benchmarks/     LSQB workload definitions
-scripts/        normalize_aml.py, benchmark_lsqb.py
-demo/data/      AML dataset CSVs
+scripts/        download_aml_data.sh, normalize_aml.py, benchmark_lsqb.py
+demo/data/      AML dataset CSVs  ← not in git, run scripts/download_aml_data.sh
 ```
 
 ## IntelliJ sync
