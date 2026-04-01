@@ -36,39 +36,6 @@ public class TinkerGraphProvider implements GraphProvider {
     }
 
     @Override
-    public synchronized void resetTransactionDemoGraph() {
-        close();
-
-        graph = TinkerGraph.open();
-        traversal = graph.traversal();
-        transactionApi = new TinkerGraphTransactionApi(graph);
-
-        String txId = "TXN-9001";
-        Vertex previous = null;
-        for (int i = 1; i <= 11; i++) {
-            String accountType = i % 2 == 0 ? "MERCHANT" : "CUSTOMER";
-            Vertex current = graph.addVertex(
-                    T.id, i,
-                    T.label, "Account",
-                    "name", "Acct-" + i,
-                    "txId", txId,
-                    "accountType", accountType
-            );
-            if (previous != null) {
-                previous.addEdge(
-                        "TRANSFER",
-                        current,
-                        T.id, 2000 + i,
-                        "txId", txId,
-                        "amount", 100 + i * 10,
-                        "eventTime", "2026-03-" + (10 + i) + "T10:00:00Z"
-                );
-            }
-            previous = current;
-        }
-    }
-
-    @Override
     public synchronized GremlinExecutionResult execute(String gremlin) throws ScriptException {
         if (gremlin == null || gremlin.isBlank()) {
             throw new IllegalArgumentException("Gremlin query is required");
@@ -116,6 +83,28 @@ public class TinkerGraphProvider implements GraphProvider {
      */
     public synchronized GraphTraversalSource getTraversal() {
         return traversal;
+    }
+
+    /**
+     * Resets the in-memory TinkerGraph to a clean empty state.
+     * Called at startup and by the /admin/seed-gremlin-10hop-tx endpoint
+     * so transaction-demo scenarios can be replayed from scratch.
+     */
+    @Override
+    public synchronized void resetTransactionDemoGraph() {
+        // Close existing traversal and graph if present
+        if (traversal != null) {
+            try { traversal.close(); } catch (Exception ignored) {}
+            traversal = null;
+        }
+        if (graph != null) {
+            try { graph.close(); } catch (Exception ignored) {}
+            graph = null;
+        }
+        // Open a fresh empty TinkerGraph
+        graph = TinkerGraph.open();
+        traversal = graph.traversal();
+        transactionApi = new TinkerGraphTransactionApi(graph);
     }
 
     private List<Object> normalizeResult(Object raw) {
@@ -215,4 +204,3 @@ public class TinkerGraphProvider implements GraphProvider {
         }
     }
 }
-
