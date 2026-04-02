@@ -31,7 +31,7 @@ class GremlinCompatibilityTest {
                     "txId", "TXN-900" + i
             );
             if (previous != null) {
-                previous.addEdge("TRANSFER", current, T.id, 1000L + i, "amount", String.valueOf(10 * i));
+                previous.addEdge("TRANSFER", current, T.id, 1000L + i, "amount", 10.0 * i);
             }
             previous = current;
         }

@@ -30,7 +30,7 @@ class GremlinExecutionServiceTest {
                     "txId", "TXN-900" + i
             );
             if (previous != null) {
-                previous.addEdge("TRANSFER", current, T.id, 1000L + i, "amount", String.valueOf(10 * i));
+                previous.addEdge("TRANSFER", current, T.id, 1000L + i, "amount", 10.0 * i);
             }
             previous = current;
         }
@@ -75,6 +75,21 @@ class GremlinExecutionServiceTest {
         assertEquals("EXECUTED", result.transactionStatus());
     }
 
+    @Test
+    void executesTransactionalSumOnNumericAmountProperty() throws ScriptException {
+        GremlinExecutionService service = newSeededTenHopService();
+
+        GremlinTransactionalExecutionResult result = service.executeInTransaction(
+                "g.E().hasLabel('TRANSFER').values('amount').sum()"
+        );
+
+        assertEquals(1, result.resultCount());
+        assertInstanceOf(Number.class, result.results().get(0));
+        Number sum = (Number) result.results().get(0);
+        assertEquals(650.0, sum.doubleValue(), 1e-9);
+        assertEquals("EXECUTED", result.transactionStatus());
+    }
+
     /**
      * Reproduces C1: project + outE count + order().by(select(),Order.desc) on
      * an AML-shaped mini graph. Verifies that Order.desc is in scope and that
@@ -101,11 +116,11 @@ class GremlinExecutionServiceTest {
                 "accountId", "ACC-2", "bankId", "BANK-A");
         Vertex pa3 = providerGraph.addVertex(T.id, 103L, T.label, "Account",
                 "accountId", "ACC-3", "bankId", "BANK-B");
-        pa1.addEdge("TRANSFER", pa2, T.id, 200L, "amount", "100");
-        pa1.addEdge("TRANSFER", pa2, T.id, 201L, "amount", "200");
-        pa1.addEdge("TRANSFER", pa2, T.id, 202L, "amount", "300");
-        pa1.addEdge("TRANSFER", pa3, T.id, 203L, "amount", "50");
-        pa2.addEdge("TRANSFER", pa3, T.id, 204L, "amount", "75");
+        pa1.addEdge("TRANSFER", pa2, T.id, 200L, "amount", 100.0);
+        pa1.addEdge("TRANSFER", pa2, T.id, 201L, "amount", 200.0);
+        pa1.addEdge("TRANSFER", pa2, T.id, 202L, "amount", 300.0);
+        pa1.addEdge("TRANSFER", pa3, T.id, 203L, "amount", 50.0);
+        pa2.addEdge("TRANSFER", pa3, T.id, 204L, "amount", 75.0);
 
         GremlinExecutionService service = new GremlinExecutionService(provider);
 

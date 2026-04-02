@@ -1,4 +1,4 @@
-package com.graphqueryengine.query;
+package com.graphqueryengine.query.api;
 
 import java.util.List;
 
@@ -10,4 +10,5 @@ public record QueryExplanation(
         String note
 ) {
 }
+
 

@@ -8,10 +8,12 @@ import com.graphqueryengine.gremlin.GremlinExecutionService;
 import com.graphqueryengine.gremlin.GremlinTransactionalExecutionResult;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.MappingStore;
-import com.graphqueryengine.query.GremlinSqlTranslator;
-import com.graphqueryengine.query.QueryRequest;
-import com.graphqueryengine.query.QueryExplanation;
-import com.graphqueryengine.query.TranslationResult;
+import com.graphqueryengine.query.api.GraphQueryTranslator;
+import com.graphqueryengine.query.api.QueryExplanation;
+import com.graphqueryengine.query.api.QueryRequest;
+import com.graphqueryengine.query.api.TranslationResult;
+import com.graphqueryengine.query.factory.DefaultGraphQueryTranslatorFactory;
+import com.graphqueryengine.query.factory.GraphQueryTranslatorFactory;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.UploadedFile;
@@ -54,7 +56,7 @@ public class App {
     }
 
     public static Javalin start(int port) {
-        return start(port, (app, svc) -> {});
+        return start(port, (app, svc) -> {}, new DefaultGraphQueryTranslatorFactory());
     }
 
     /**
@@ -63,11 +65,17 @@ public class App {
      * creating a dependency from the engine onto demo code.
      */
     public static Javalin start(int port, java.util.function.BiConsumer<Javalin, GremlinExecutionService> extensions) {
+        return start(port, extensions, new DefaultGraphQueryTranslatorFactory());
+    }
+
+    public static Javalin start(int port,
+                                java.util.function.BiConsumer<Javalin, GremlinExecutionService> extensions,
+                                GraphQueryTranslatorFactory translatorFactory) {
         DatabaseConfig databaseConfig = DatabaseConfig.fromEnvironment();
         DatabaseManager databaseManager = new DatabaseManager(databaseConfig);
         ensureDatabaseFileInitialized(databaseManager, databaseConfig);
         MappingStore mappingStore = new MappingStore();
-        GremlinSqlTranslator translator = new GremlinSqlTranslator();
+        GraphQueryTranslator translator = translatorFactory.create();
         GremlinExecutionService gremlinExecutionService = new GremlinExecutionService();
         ObjectMapper objectMapper = new ObjectMapper();
 
@@ -390,7 +398,8 @@ public class App {
                         String fromAcctId = rec.get("from_account");
                         String toBankId   = rec.get("to_bank");
                         String toAcctId   = rec.get("to_account");
-                        String amount     = rec.get("amount_paid");
+                        String amountRaw  = rec.get("amount_paid");
+                        double amount     = Double.parseDouble(amountRaw);
                         String currency   = rec.get("payment_currency");
                         String format     = rec.get("payment_format");
                         String ts         = rec.get("timestamp");
@@ -494,7 +503,7 @@ public class App {
 
                         // ── FLAGGED_BY edge: Account → Alert (suspicious only) ─
                         if (suspicious) {
-                            String severity = Double.parseDouble(amount) > 50_000 ? "HIGH" : "MEDIUM";
+                            String severity = amount > 50_000 ? "HIGH" : "MEDIUM";
                             Vertex alert = graph.addVertex(
                                     T.id, vid.getAndIncrement(), T.label, "Alert",
                                     "alertId",   "ALERT-" + txId,
@@ -553,7 +562,7 @@ public class App {
                                                      String gremlin,
                                                      Context ctx,
                                                      MappingStore mappingStore,
-                                                     GremlinSqlTranslator translator,
+                                                     GraphQueryTranslator translator,
                                                      boolean sqlTraceEnabledForRequest) {
         LOG.info("[GREMLIN] endpoint={} query={}", endpoint, gremlin);
 

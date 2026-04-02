@@ -1,9 +1,8 @@
-package com.graphqueryengine.query;
+package com.graphqueryengine.query.translate.sql;
 
 import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.VertexMapping;
-import com.graphqueryengine.query.translate.sql.GremlinSqlTranslator;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -386,4 +385,5 @@ class NotebookQueryCoverageTest {
         assertEquals(List.of("1"), r.parameters());
     }
 }
+
 

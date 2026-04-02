@@ -1,4 +1,4 @@
-package com.graphqueryengine.query;
+package com.graphqueryengine.query.translate.sql;
 
 import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
@@ -6,7 +6,6 @@ import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.parser.LegacyGremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
-import com.graphqueryengine.query.translate.sql.GremlinSqlTranslator;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -171,6 +170,30 @@ class GremlinSqlTranslatorTest {
 
         assertEquals(
                 "SELECT v.account_id AS \"accountId\", (SELECT COUNT(*) FROM aml_transfers WHERE in_id = v.id) AS \"inDegree\" FROM aml_accounts v ORDER BY \"inDegree\" DESC LIMIT 10",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesVertexProjectWithChooseConstantProjection() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of("Account", new VertexMapping("aml_accounts", "id", Map.of(
+                        "accountId", "account_id",
+                        "riskScore", "risk_score"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').limit(10).project('accountId','category')" +
+                ".by('accountId')" +
+                ".by(choose(values('riskScore').is(gt(0.7)), constant('WHALE'), constant('RETAIL')))",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT v.account_id AS \"accountId\", CASE WHEN v.risk_score > 0.7 THEN 'WHALE' ELSE 'RETAIL' END AS \"category\" FROM aml_accounts v LIMIT 10",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -724,5 +747,123 @@ class GremlinSqlTranslatorTest {
         // branches, so the param appears once per branch → [1, 1].
         assertEquals(List.of("1", "1"), result.parameters());
     }
-}
 
+    @Test
+    void translatesTerminalOutEPathWithEdgePropertyFilter() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of("Account", new VertexMapping("aml_accounts", "id", Map.of(
+                        "accountId", "account_id",
+                        "riskScore", "risk_score"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of(
+                        "amount", "amount"
+                )))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').has('riskScore', gt(0.8)).outE('TRANSFER').has('amount', gt(1000000)).path().by('accountId').by('amount').limit(10)",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT v0.account_id AS accountId0, e1.amount AS amount1 FROM aml_accounts v0 JOIN aml_transfers e1 ON e1.out_id = v0.id WHERE v0.risk_score > ? AND e1.amount > ? LIMIT 10",
+                result.sql()
+        );
+        assertEquals(List.of("0.8", "1000000"), result.parameters());
+    }
+
+    @Test
+    void translatesAliasNeqByPropertyAcrossHopAliases() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of("Account", new VertexMapping("aml_accounts", "id", Map.of(
+                        "accountId", "account_id",
+                        "bankId", "bank_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "from_account_id", "to_account_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').as('a').out('TRANSFER').as('b').where('a',neq('b')).by('bankId').path().by('accountId').limit(10)",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT v0.account_id AS accountId0, v1.account_id AS accountId1 FROM aml_accounts v0 JOIN aml_transfers e1 ON e1.from_account_id = v0.id JOIN aml_accounts v1 ON v1.id = e1.to_account_id WHERE v0.bank_id <> v1.bank_id LIMIT 10",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesTerminalOutEWithAmlDirectionColumns() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of("Account", new VertexMapping("aml_accounts", "id", Map.of(
+                        "accountId", "account_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "from_account_id", "to_account_id", Map.of(
+                        "amount", "amount"
+                )))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').outE('TRANSFER').has('amount', gt(100)).path().by('accountId').by('amount').limit(5)",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT v0.account_id AS accountId0, e1.amount AS amount1 FROM aml_accounts v0 JOIN aml_transfers e1 ON e1.from_account_id = v0.id WHERE e1.amount > ? LIMIT 5",
+                result.sql()
+        );
+        assertEquals(List.of("100"), result.parameters());
+    }
+
+    @Test
+    void translatesAliasKeyedGroupCountWithOutEUsesOutColumnDirection() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of("Account", new VertexMapping("aml_accounts", "id", Map.of(
+                        "accountId", "account_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "from_account_id", "to_account_id", Map.of(
+                        "amount", "amount"
+                )))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').as('a').outE('TRANSFER').groupCount().by(select('a').by('accountId')).order(local).by(values, desc).limit(local, 15)",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT v0.account_id AS \"accountId\", COUNT(*) AS count FROM aml_accounts v0 JOIN aml_transfers e1 ON e1.from_account_id = v0.id JOIN aml_accounts v1 ON v1.id = e1.to_account_id GROUP BY v0.account_id ORDER BY count DESC LIMIT 15",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesMeanAfterProjectSelectAliasOnTerminalOutE() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of(
+                        "Country", new VertexMapping("aml_countries", "id", Map.of("countryName", "country_name")),
+                        "Bank", new VertexMapping("aml_banks", "id", Map.of()),
+                        "Account", new VertexMapping("aml_accounts", "id", Map.of())
+                ),
+                Map.of(
+                        "LOCATED_IN", new EdgeMapping("aml_bank_country", "id", "bank_id", "country_id", Map.of()),
+                        "BELONGS_TO", new EdgeMapping("aml_account_bank", "id", "account_id", "bank_id", Map.of()),
+                        "TRANSFER", new EdgeMapping("aml_transfers", "id", "from_account_id", "to_account_id", Map.of("amount", "amount"))
+                )
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Country').has('countryName', 'Singapore').in('LOCATED_IN').in('BELONGS_TO').outE('TRANSFER').project('amt').by('amount').select('amt').mean()",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT AVG(e3.amount) AS mean FROM aml_countries v0 JOIN aml_bank_country e1 ON e1.country_id = v0.id JOIN aml_banks v1 ON v1.id = e1.bank_id JOIN aml_account_bank e2 ON e2.bank_id = v1.id JOIN aml_accounts v2 ON v2.id = e2.account_id JOIN aml_transfers e3 ON e3.from_account_id = v2.id WHERE v0.country_name = ?",
+                result.sql()
+        );
+        assertEquals(List.of("Singapore"), result.parameters());
+    }
+}
