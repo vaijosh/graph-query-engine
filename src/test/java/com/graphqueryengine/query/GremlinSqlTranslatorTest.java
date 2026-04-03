@@ -48,6 +48,48 @@ class GremlinSqlTranslatorTest {
     }
 
     @Test
+    void translatesVertexQueryAgainstIcebergTableReference() {
+        MappingConfig mappingConfig = new MappingConfig(
+                Map.of("Account", new VertexMapping("iceberg:s3://warehouse/aml/accounts", "id", Map.of(
+                        "accountId", "account_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').values('accountId').limit(5)",
+                mappingConfig
+        );
+
+        assertEquals(
+                "SELECT account_id AS accountId FROM iceberg_scan('s3://warehouse/aml/accounts') LIMIT 5",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesVertexQueryAgainstIcebergCatalogIdentifier() {
+        MappingConfig mappingConfig = new MappingConfig(
+                Map.of("Account", new VertexMapping("iceberg:prod.aml.accounts", "id", Map.of(
+                        "accountId", "account_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').values('accountId').limit(5)",
+                mappingConfig
+        );
+
+        assertEquals(
+                "SELECT account_id AS accountId FROM prod.aml.accounts LIMIT 5",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
     void translatesTenHopOutTraversal() {
         MappingConfig mappingConfig = new MappingConfig(
                 Map.of("Node", new VertexMapping("hop_nodes", "id", Map.of("name", "name"))),

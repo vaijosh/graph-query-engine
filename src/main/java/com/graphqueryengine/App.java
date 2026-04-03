@@ -401,10 +401,14 @@ public class App {
                         String amountRaw  = rec.get("amount_paid");
                         double amount     = Double.parseDouble(amountRaw);
                         String currency   = rec.get("payment_currency");
-                        String format     = rec.get("payment_format");
+                        String rawFormat  = (rec.isMapped("payment_format") && rec.isSet("payment_format"))
+                                ? rec.get("payment_format")
+                                : "UNKNOWN";
+                        String format     = (rawFormat == null || rawFormat.isBlank()) ? "UNKNOWN" : rawFormat;
                         String ts         = rec.get("timestamp");
                         String laundering = rec.get("is_laundering");
                         String txId       = rec.get("transaction_id");
+                        String channel    = format.toLowerCase(Locale.ROOT).contains("wire") ? "WIRE" : "DIGITAL";
 
                         // Derive country from bankId hash
                         String fromCC = COUNTRIES[Math.abs(fromBankId.hashCode()) % COUNTRIES.length][0];
@@ -455,7 +459,7 @@ public class App {
                                 "paymentFormat", format,
                                 "eventTime",     ts,
                                 "isLaundering",  laundering,
-                                "channel",       format.toLowerCase().contains("wire") ? "WIRE" : "DIGITAL"));
+                                "channel",       channel));
 
                         // ── TRANSFER edge: Account → Account ─────────────────
                         fromAcct.addEdge("TRANSFER", toAcct,

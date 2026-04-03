@@ -7,6 +7,8 @@ import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.parser.LegacyGremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
 import com.graphqueryengine.query.parser.model.GremlinStep;
+import com.graphqueryengine.query.translate.sql.dialect.SqlDialect;
+import com.graphqueryengine.query.translate.sql.dialect.StandardSqlDialect;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -32,7 +34,14 @@ public class GremlinSqlTranslator {
    private static final Pattern CHOOSE_VALUES_IS_CONSTANT_PATTERN = Pattern.compile("^choose\\(\\s*values\\(['\"]([^'\"]+)['\"]\\)\\.is\\((gt|gte|lt|lte|eq|neq)\\(([^)]+)\\)\\)\\s*,\\s*constant\\(([^)]+)\\)\\s*,\\s*constant\\(([^)]+)\\)\\s*\\)$");
    private static final Pattern GROUP_COUNT_SELECT_BY_PATTERN = Pattern.compile("^select\\(['\"]([^'\"]+)['\"]\\)\\.by\\(['\"]([^'\"]+)['\"]\\)$");
 
+   private final SqlDialect dialect;
+
    public GremlinSqlTranslator() {
+      this(new StandardSqlDialect());
+   }
+
+   public GremlinSqlTranslator(SqlDialect dialect) {
+      this.dialect = dialect;
    }
 
    public TranslationResult translate(String gremlin, MappingConfig mappingConfig) {
@@ -1132,6 +1141,12 @@ public class GremlinSqlTranslator {
                      String neighborProp = parts[2];
                      EdgeMapping edgeMapping = Optional.ofNullable(mappingConfig.edges().get(edgeLabel)).orElseThrow(() -> new IllegalArgumentException("No edge mapping found for label: " + edgeLabel));
                      VertexMapping neighborMapping = this.resolveTargetVertexMapping(mappingConfig, edgeMapping, isOut);
+                     if (neighborMapping == null || !neighborMapping.properties().containsKey(neighborProp)) {
+                        VertexMapping propertyMatched = this.resolveUniqueVertexMappingByProperty(mappingConfig, neighborProp);
+                        if (propertyMatched != null) {
+                           neighborMapping = propertyMatched;
+                        }
+                     }
                      if (neighborMapping == null) {
                         neighborMapping = vertexMapping;
                      }
@@ -1142,7 +1157,7 @@ public class GremlinSqlTranslator {
                      String subqAlias = "_nje" + neighborJoinIdx;
                      String vAlias = "_njv" + neighborJoinIdx;
                      ++neighborJoinIdx;
-                     String subq = "(SELECT STRING_AGG(" + vAlias + "." + mappedCol + ", ',') FROM " + edgeMapping.table() + " " + subqAlias + " JOIN " + neighborMapping.table() + " " + vAlias + " ON " + vAlias + "." + neighborMapping.idColumn() + " = " + subqAlias + "." + targetCol + " WHERE " + subqAlias + "." + anchorCol + " = v." + vertexMapping.idColumn() + ")";
+                     String subq = "(SELECT " + this.dialect.stringAgg(vAlias + "." + mappedCol, ",") + " FROM " + edgeMapping.table() + " " + subqAlias + " JOIN " + neighborMapping.table() + " " + vAlias + " ON " + vAlias + "." + neighborMapping.idColumn() + " = " + subqAlias + "." + targetCol + " WHERE " + subqAlias + "." + anchorCol + " = v." + vertexMapping.idColumn() + ")";
                      selectJoiner.add(subq + " AS " + alias);
                   }
                } else {
@@ -1308,6 +1323,23 @@ public class GremlinSqlTranslator {
       String anchorCol = isOut ? edgeMapping.outColumn() : edgeMapping.inColumn();
       String targetCol = isOut ? edgeMapping.inColumn() : edgeMapping.outColumn();
       VertexMapping neighborVertexMapping = this.resolveTargetVertexMapping(mappingConfig, edgeMapping, isOut);
+      boolean missingFilterProps = false;
+      if (neighborVertexMapping != null) {
+         for(HasFilter filter : whereClause.filters()) {
+            if (!neighborVertexMapping.properties().containsKey(filter.property())) {
+               missingFilterProps = true;
+               break;
+            }
+         }
+      }
+
+      if (neighborVertexMapping == null || missingFilterProps) {
+         List<String> filterProps = whereClause.filters().stream().map(HasFilter::property).toList();
+         VertexMapping propMatched = this.resolveVertexMappingByProperties(mappingConfig, filterProps);
+         if (propMatched != null) {
+            neighborVertexMapping = propMatched;
+         }
+      }
       if (neighborVertexMapping == null) {
          neighborVertexMapping = vertexMapping;
       }
@@ -1380,10 +1412,10 @@ public class GremlinSqlTranslator {
 
    }
 
-   private static void appendOrderBy(StringBuilder sql, String orderByProperty, String orderDirection) {
+   private void appendOrderBy(StringBuilder sql, String orderByProperty, String orderDirection) {
       if (orderByProperty != null) {
          String direction = orderDirection != null ? orderDirection : "ASC";
-         sql.append(" ORDER BY \"").append(orderByProperty).append("\" ").append(direction);
+         sql.append(" ORDER BY ").append(this.dialect.quoteIdentifier(orderByProperty)).append(" ").append(direction);
       }
 
    }
@@ -1744,8 +1776,18 @@ public class GremlinSqlTranslator {
                   simplePathRequested = true;
                }
 
-               for(int i = 0; i < repeatCount; ++i) {
-                  hops.add(pendingRepeatHop.hop());
+               HopStep repeatHop = pendingRepeatHop.hop();
+               // When the label count matches times(n), treat each label as a sequential
+               // single-label hop: repeat(out('A','B')).times(2) → hop1=out('A'), hop2=out('B').
+               // This models ordered multi-edge-type path traversals (e.g. Account→Bank→Country).
+               if (repeatHop.labels().size() == repeatCount && repeatCount > 1) {
+                  for (String lbl : repeatHop.labels()) {
+                     hops.add(new HopStep(repeatHop.direction(), lbl));
+                  }
+               } else {
+                  for (int i = 0; i < repeatCount; ++i) {
+                     hops.add(repeatHop);
+                  }
                }
 
                pendingRepeatHop = null;
@@ -2089,6 +2131,18 @@ public class GremlinSqlTranslator {
       }
    }
 
+   private VertexMapping resolveUniqueVertexMappingByProperty(MappingConfig mappingConfig, String propertyName) {
+      List<VertexMapping> matches = new ArrayList<>();
+
+      for(VertexMapping vm : mappingConfig.vertices().values()) {
+         if (vm.properties().containsKey(propertyName)) {
+            matches.add(vm);
+         }
+      }
+
+      return matches.size() == 1 ? matches.get(0) : null;
+   }
+
    private VertexMapping resolveTargetVertexMapping(MappingConfig mappingConfig, EdgeMapping edgeMapping, boolean outDirection) {
       if (mappingConfig.vertices().size() == 1) {
          return mappingConfig.vertices().values().iterator().next();
@@ -2096,22 +2150,56 @@ public class GremlinSqlTranslator {
          String targetCol = outDirection ? edgeMapping.inColumn() : edgeMapping.outColumn();
          String stem = targetCol.replaceAll("_id$", "").replaceAll("^.*_", "");
 
-         for(Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
-            String tableStem = entry.getValue().table().replaceAll("^[a-z]+_", "");
-            if (tableStem.equals(stem) || tableStem.startsWith(stem)) {
+         // Pass 1: match stem against unqualified vertex table name (last '.' or '_' segment).
+         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+            String rawTable = entry.getValue().table();
+            String unqualified = rawTable.contains(".")
+                    ? rawTable.substring(rawTable.lastIndexOf('.') + 1)
+                    : rawTable.replaceAll("^[a-z]+_", "");
+            if (unqualified.equals(stem) || unqualified.startsWith(stem)) {
                return entry.getValue();
             }
          }
 
-         for(Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+         // Pass 2: match stem against vertex label key (e.g. stem "bank" matches label "Bank").
+         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
             if (entry.getKey().equalsIgnoreCase(stem)) {
                return entry.getValue();
             }
          }
 
-         for(VertexMapping vm : mappingConfig.vertices().values()) {
+         // Pass 3: exact idColumn match.
+         for (VertexMapping vm : mappingConfig.vertices().values()) {
             if (targetCol.equals(vm.idColumn())) {
                return vm;
+            }
+         }
+
+         // Pass 4: for generic column names (e.g. in_id / out_id), derive a target hint from
+         // the edge table name itself.  "aml.account_bank" → last token "bank" → label "Bank".
+         // "aml.bank_country" → last token "country" → label "Country".
+         String edgeTable = edgeMapping.table();
+         String edgeTableBase = edgeTable.contains(".")
+                 ? edgeTable.substring(edgeTable.lastIndexOf('.') + 1)
+                 : edgeTable;
+         String[] edgeParts = edgeTableBase.split("_");
+         // For out direction the target is the tail token; for in direction it's the head token.
+         String edgeStem = outDirection
+                 ? edgeParts[edgeParts.length - 1]
+                 : edgeParts[0];
+         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(edgeStem)) {
+               return entry.getValue();
+            }
+         }
+         // Also try matching the vertex unqualified table name against the edge stem.
+         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+            String rawTable = entry.getValue().table();
+            String unqualified = rawTable.contains(".")
+                    ? rawTable.substring(rawTable.lastIndexOf('.') + 1)
+                    : rawTable.replaceAll("^[a-z]+_", "");
+            if (unqualified.startsWith(edgeStem)) {
+               return entry.getValue();
             }
          }
 
@@ -2120,8 +2208,7 @@ public class GremlinSqlTranslator {
    }
 
    private String quoteAlias(String alias) {
-      String escaped = alias.replace("\"", "\"\"");
-      return "\"" + escaped + "\"";
+      return this.dialect.quoteIdentifier(alias);
    }
 
    private List<HasFilter> parseHasChain(String hasChain) {

@@ -47,6 +47,48 @@ class GremlinSqlTranslatorTest {
     }
 
     @Test
+    void translatesVertexQueryAgainstIcebergTableReference() {
+        MappingConfig mappingConfig = new MappingConfig(
+                Map.of("Account", new VertexMapping("iceberg:s3://warehouse/aml/accounts", "id", Map.of(
+                        "accountId", "account_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').values('accountId').limit(5)",
+                mappingConfig
+        );
+
+        assertEquals(
+                "SELECT account_id AS accountId FROM iceberg_scan('s3://warehouse/aml/accounts') LIMIT 5",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesVertexQueryAgainstIcebergCatalogIdentifier() {
+        MappingConfig mappingConfig = new MappingConfig(
+                Map.of("Account", new VertexMapping("iceberg:prod.aml.accounts", "id", Map.of(
+                        "accountId", "account_id"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').values('accountId').limit(5)",
+                mappingConfig
+        );
+
+        assertEquals(
+                "SELECT account_id AS accountId FROM prod.aml.accounts LIMIT 5",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
     void translatesTenHopOutTraversal() {
         MappingConfig mappingConfig = new MappingConfig(
                 Map.of("Node", new VertexMapping("hop_nodes", "id", Map.of("name", "name"))),
@@ -531,6 +573,41 @@ class GremlinSqlTranslatorTest {
         // Must NOT have an outer LEFT JOIN (avoids duplicate rows per account)
         assertFalse(sql.contains("LEFT JOIN aml_belongs_to"),     "no outer LEFT JOIN for fold()");
         assertEquals(0, result.parameters().size());
+    }
+
+    @Test
+    void translatesNeighborPropertyFoldWithGenericEdgeColumns() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of(
+                        "Account", new VertexMapping("aml.accounts", "id", Map.of(
+                                "accountId", "account_id",
+                                "bankId", "bank_id"
+                        )),
+                        "Bank", new VertexMapping("aml.banks", "id", Map.of(
+                                "bankId", "bank_id",
+                                "bankName", "bank_name"
+                        )),
+                        "Country", new VertexMapping("aml.countries", "id", Map.of(
+                                "countryName", "country_name"
+                        ))
+                ),
+                Map.of(
+                        "BELONGS_TO", new EdgeMapping("aml.account_bank", "id", "out_id", "in_id", Map.of()),
+                        "LOCATED_IN", new EdgeMapping("aml.bank_country", "id", "out_id", "in_id", Map.of())
+                )
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').limit(15).project('accountId','bankId','bankName')"
+                        + ".by('accountId').by('bankId').by(out('BELONGS_TO').values('bankName').fold())",
+                mapping
+        );
+
+        String sql = result.sql();
+        assertTrue(sql.contains("FROM aml.accounts v"), "base table should be Account");
+        assertTrue(sql.contains("aml.account_bank"), "BELONGS_TO edge table should be referenced");
+        assertTrue(sql.contains("aml.banks"), "neighbor table should resolve to Bank");
+        assertTrue(sql.contains("bank_name"), "neighbor property should resolve to bank_name");
     }
 
     @Test

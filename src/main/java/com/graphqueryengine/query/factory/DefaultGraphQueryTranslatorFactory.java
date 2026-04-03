@@ -5,7 +5,10 @@ import com.graphqueryengine.query.parser.AntlrGremlinTraversalParser;
 import com.graphqueryengine.query.parser.GremlinTraversalParser;
 import com.graphqueryengine.query.parser.LegacyGremlinTraversalParser;
 import com.graphqueryengine.query.translate.sql.GremlinSqlTranslator;
-import com.graphqueryengine.query.translate.sql.SqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.IcebergSqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.StandardSqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.dialect.IcebergSqlDialect;
+import com.graphqueryengine.query.translate.sql.dialect.StandardSqlDialect;
 
 import java.util.Locale;
 
@@ -31,7 +34,10 @@ public class DefaultGraphQueryTranslatorFactory implements GraphQueryTranslatorF
     @Override
     public GraphQueryTranslator create() {
         if (backend.isBlank() || "sql".equals(backend) || "legacy-sql".equals(backend)) {
-            return new SqlGraphQueryTranslator(resolveParser(), new GremlinSqlTranslator());
+            return new StandardSqlGraphQueryTranslator(resolveParser(), new GremlinSqlTranslator(new StandardSqlDialect()));
+        }
+        if ("iceberg".equals(backend) || "iceberg-sql".equals(backend)) {
+            return new IcebergSqlGraphQueryTranslator(resolveParser(), new GremlinSqlTranslator(new IcebergSqlDialect()));
         }
         throw new IllegalStateException("Unsupported query translator backend: " + backend);
     }

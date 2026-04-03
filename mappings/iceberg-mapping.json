@@ -1,0 +1,34 @@
+{
+  "vertices": {
+    "Account": {
+      "table": "iceberg:s3://warehouse/aml/accounts",
+      "idColumn": "id",
+      "properties": {
+        "accountId": "account_id",
+        "bankId": "bank_id",
+        "riskScore": "risk_score"
+      }
+    },
+    "Bank": {
+      "table": "iceberg:prod.aml.banks",
+      "idColumn": "id",
+      "properties": {
+        "bankId": "bank_id",
+        "bankName": "bank_name"
+      }
+    }
+  },
+  "edges": {
+    "TRANSFER": {
+      "table": "iceberg:prod.aml.transfers",
+      "idColumn": "id",
+      "outColumn": "out_id",
+      "inColumn": "in_id",
+      "properties": {
+        "amount": "amount",
+        "currency": "currency"
+      }
+    }
+  }
+}
+

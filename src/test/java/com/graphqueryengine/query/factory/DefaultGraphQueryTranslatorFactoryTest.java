@@ -4,7 +4,8 @@ import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.GraphQueryTranslator;
 import com.graphqueryengine.query.api.TranslationResult;
-import com.graphqueryengine.query.translate.sql.SqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.IcebergSqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.StandardSqlGraphQueryTranslator;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
@@ -23,13 +24,70 @@ class DefaultGraphQueryTranslatorFactoryTest {
                 sampleMapping()
         );
 
-        assertInstanceOf(SqlGraphQueryTranslator.class, translator);
+        assertInstanceOf(StandardSqlGraphQueryTranslator.class, translator);
         assertEquals("SELECT name AS name FROM people LIMIT 1", result.sql());
     }
 
     @Test
-    void rejectsUnsupportedBackend() {
+    void createsIcebergTranslatorWhenRequested() {
         DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg", "legacy");
+
+        GraphQueryTranslator translator = factory.create();
+
+        assertInstanceOf(IcebergSqlGraphQueryTranslator.class, translator);
+    }
+
+    @Test
+    void icebergTranslatorUsesArrayJoinForFoldProjection() {
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg", "legacy");
+        GraphQueryTranslator translator = factory.create();
+
+        MappingConfig mapping = new MappingConfig(
+                Map.of(
+                        "Account", new VertexMapping("aml.accounts", "id", Map.of("accountId", "account_id", "bankId", "bank_id")),
+                        "Bank", new VertexMapping("aml.banks", "id", Map.of("bankName", "bank_name"))
+                ),
+                Map.of(
+                        "BELONGS_TO", new com.graphqueryengine.mapping.EdgeMapping("aml.account_bank", "id", "out_id", "in_id", Map.of())
+                )
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').project('accountId','bankName').by('accountId').by(out('BELONGS_TO').values('bankName').fold())",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("ARRAY_JOIN(ARRAY_AGG"));
+        assertFalse(result.sql().contains("STRING_AGG("));
+    }
+
+    @Test
+    void standardBackendAutoUsesIcebergDialectForCatalogQualifiedTables() {
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql", "legacy");
+        GraphQueryTranslator translator = factory.create();
+
+        MappingConfig mapping = new MappingConfig(
+                Map.of(
+                        "Account", new VertexMapping("aml.accounts", "id", Map.of("accountId", "account_id")),
+                        "Bank", new VertexMapping("aml.banks", "id", Map.of("bankName", "bank_name"))
+                ),
+                Map.of(
+                        "BELONGS_TO", new com.graphqueryengine.mapping.EdgeMapping("aml.account_bank", "id", "out_id", "in_id", Map.of())
+                )
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').project('accountId','bankName').by('accountId').by(out('BELONGS_TO').values('bankName').fold())",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("ARRAY_JOIN(ARRAY_AGG"));
+        assertFalse(result.sql().contains("STRING_AGG("));
+    }
+
+    @Test
+    void rejectsUnsupportedBackend() {
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sparksql", "legacy");
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, factory::create);
         assertTrue(ex.getMessage().contains("Unsupported query translator backend"));

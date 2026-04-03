@@ -35,7 +35,7 @@ bin/
 target/
 
 ### H2 database files (runtime-generated, root-level data/ only) ###
-/data/
+/data/graph.mv.db
 
 ### AML dataset CSVs — large files downloaded separately via scripts/download_aml_data.sh ###
 # IBM AML raw source files (HI/LI variants, all sizes)
@@ -60,3 +60,4 @@ __pycache__/
 
 ### Maven wrapper cache ###
 .mvn/wrapper/maven-wrapper.jar
+/data/

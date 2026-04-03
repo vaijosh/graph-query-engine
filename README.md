@@ -61,7 +61,103 @@ mvn test                   # run all tests
 }
 ```
 
+Iceberg table references are supported in `table` using the `iceberg:` prefix:
+- Location/path targets (for example `s3://...`) are translated to DuckDB-compatible `iceberg_scan(...)`.
+- Catalog identifiers (for example `prod.aml.accounts`) are emitted directly for engines like Trino/Spark.
+
+```json
+{
+  "vertices": {
+    "Account": {
+      "table": "iceberg:s3://warehouse/aml/accounts",
+      "idColumn": "id",
+      "properties": { "accountId": "account_id" }
+    }
+  }
+}
+```
+
+This translates to SQL like:
+
+```sql
+-- noinspection SqlNoDataSourceInspectionForFile
+
+SELECT account_id AS accountId
+FROM iceberg_scan('s3://warehouse/aml/accounts')
+```
+
+Catalog identifier example:
+
+```json
+{
+  "vertices": {
+    "Account": {
+      "table": "iceberg:prod.aml.accounts",
+      "idColumn": "id",
+      "properties": { "accountId": "account_id" }
+    }
+  }
+}
+```
+
+Which translates to:
+
+```sql
+-- noinspection SqlNoDataSourceInspectionForFile
+
+SELECT account_id AS accountId
+FROM prod.aml.accounts
+```
+
 Sample mappings in `mappings/`.
+For Iceberg examples, see `mappings/iceberg-mapping.json`.
+For local container testing with Trino, use `mappings/iceberg-local-mapping.json`.
+
+## Local Iceberg container test
+
+```zsh
+cd /Users/vjoshi/SourceCode/graph-query-engine
+chmod +x scripts/iceberg_local_up.sh scripts/iceberg_seed_trino.sh scripts/iceberg_local_down.sh
+./scripts/iceberg_local_up.sh
+./scripts/iceberg_seed_trino.sh
+```
+
+Start the API service in another terminal:
+
+```zsh
+cd /Users/vjoshi/SourceCode/graph-query-engine
+mvn exec:java
+```
+
+Upload local Iceberg mapping and generate SQL:
+
+```zsh
+cd /Users/vjoshi/SourceCode/graph-query-engine
+curl -X POST http://localhost:7000/mapping/upload \
+  -F "file=@mappings/iceberg-local-mapping.json" \
+  -F "id=iceberg-local" \
+  -F "activate=true"
+
+curl -X POST http://localhost:7000/query/explain \
+  -H "Content-Type: application/json" \
+  -H "X-Mapping-Id: iceberg-local" \
+  -d '{"gremlin":"g.V().hasLabel(\"Account\").values(\"accountId\").limit(5)"}'
+```
+
+To execute a translated SQL query directly in Trino:
+
+```zsh
+docker exec -i iceberg-trino trino --server http://localhost:8080 --execute "SELECT account_id FROM iceberg.aml.accounts LIMIT 5"
+```
+
+When done:
+
+```zsh
+cd /Users/vjoshi/SourceCode/graph-query-engine
+./scripts/iceberg_local_down.sh
+```
+
+For stack internals and troubleshooting, see `infra/iceberg/README.md`.
 
 ## Supported Gremlin steps (SQL-translatable)
 
@@ -80,6 +176,19 @@ curl -X POST http://localhost:7000/mapping/upload \
 curl -X POST http://localhost:7000/query/explain \
   -H "Content-Type: application/json" \
   -d '{"gremlin":"g.V(1).hasLabel(\"Node\").repeat(out(\"LINK\")).times(10)"}'
+```
+
+```bash
+# Iceberg mapping example (uses mappings/iceberg-mapping.json)
+curl -X POST http://localhost:7000/mapping/upload \
+  -F "file=@mappings/iceberg-mapping.json" \
+  -F "id=iceberg-demo" \
+  -F "activate=true"
+
+curl -X POST http://localhost:7000/query/explain \
+  -H "Content-Type: application/json" \
+  -H "X-Mapping-Id: iceberg-demo" \
+  -d '{"gremlin":"g.V().hasLabel(\"Account\").project(\"accountId\",\"category\").by(\"accountId\").by(choose(values(\"riskScore\").is(gt(0.7)),constant(\"WHALE\"),constant(\"RETAIL\"))).limit(5)"}'
 ```
 
 ## AML demo (Jupyter notebook)

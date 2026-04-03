@@ -13,5 +13,9 @@ public record EdgeMapping(
     public EdgeMapping {
         properties = properties == null ? Collections.emptyMap() : properties;
     }
-}
 
+    @Override
+    public String table() {
+        return TableReferenceResolver.toSqlReference(table);
+    }
+}

@@ -5,7 +5,8 @@ import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.GraphQueryTranslator;
 import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.factory.DefaultGraphQueryTranslatorFactory;
-import com.graphqueryengine.query.translate.sql.SqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.IcebergSqlGraphQueryTranslator;
+import com.graphqueryengine.query.translate.sql.StandardSqlGraphQueryTranslator;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
@@ -24,13 +25,22 @@ class DefaultGraphQueryTranslatorFactoryTest {
                 sampleMapping()
         );
 
-        assertInstanceOf(SqlGraphQueryTranslator.class, translator);
+        assertInstanceOf(StandardSqlGraphQueryTranslator.class, translator);
         assertEquals("SELECT name AS name FROM people LIMIT 1", result.sql());
     }
 
     @Test
-    void rejectsUnsupportedBackend() {
+    void createsIcebergTranslatorWhenRequested() {
         DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg", "legacy");
+
+        GraphQueryTranslator translator = factory.create();
+
+        assertInstanceOf(IcebergSqlGraphQueryTranslator.class, translator);
+    }
+
+    @Test
+    void rejectsUnsupportedBackend() {
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sparksql", "legacy");
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, factory::create);
         assertTrue(ex.getMessage().contains("Unsupported query translator backend"));
