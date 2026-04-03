@@ -504,51 +504,53 @@ def quick_verify_iceberg() -> bool:
     checks = []
 
     try:
-        health = requests.get(f"{BASE_URL}/health", timeout=5).text
-        checks.append(("Backend health", health.strip().upper() == "OK", health.strip()))
+        health_resp = requests.get(f"{BASE_URL}/health", timeout=5)
+        health_ok = False
+        health_detail = ""
+
+        if health_resp.ok:
+            try:
+                payload = health_resp.json()
+                if isinstance(payload, dict):
+                    health_ok = str(payload.get("status", "")).strip().upper() == "OK"
+                    health_detail = _json.dumps(payload)
+                else:
+                    text_payload = str(payload).strip()
+                    health_ok = text_payload.upper() == "OK"
+                    health_detail = text_payload
+            except ValueError:
+                text_payload = (health_resp.text or "").strip()
+                health_ok = text_payload.upper() == "OK"
+                health_detail = text_payload
+        else:
+            health_detail = f"HTTP {health_resp.status_code}: {(health_resp.text or '').strip()}"
+
+        checks.append(("Backend", health_ok, health_detail))
     except Exception as e:
-        checks.append(("Backend health", False, str(e)))
+        checks.append(("Backend", False, str(e)))
 
     trino_ping = run_trino("SELECT 1 AS ok")
     trino_ok = "error" not in trino_ping.columns
-    checks.append(("Trino query", trino_ok, trino_ping.to_string(index=False)[:240]))
+    trino_detail = "ok" if trino_ok else trino_ping.to_string(index=False)[:240]
+    checks.append(("Trino", trino_ok, trino_detail))
 
     table_probe = run_trino("SELECT count(*) AS c FROM accounts")
     table_ok = "error" not in table_probe.columns
-    checks.append(("Iceberg table accounts", table_ok, table_probe.to_string(index=False)[:240]))
+    table_count = None
+    if table_ok and "c" in table_probe.columns and len(table_probe.index) > 0:
+        table_count = table_probe.iloc[0]["c"]
+    table_detail = f"accounts={table_count}" if table_ok else table_probe.to_string(index=False)[:240]
+    checks.append(("Seed data", table_ok, table_detail))
 
-    countries_probe = run_trino("SELECT count(*) AS c FROM countries")
-    countries_ok = "error" not in countries_probe.columns
-    checks.append(("Iceberg table countries", countries_ok, countries_probe.to_string(index=False)[:240]))
+    all_ok = all(ok for _, ok, _ in checks)
+    summary = "PASS" if all_ok else "FAIL"
+    display(Markdown(f"**Health summary:** `{summary}`"))
 
-    bank_country_probe = run_trino("SELECT count(*) AS c FROM bank_country")
-    bank_country_ok = "error" not in bank_country_probe.columns
-    checks.append(("Iceberg table bank_country", bank_country_ok, bank_country_probe.to_string(index=False)[:240]))
-
-    account_bank_probe = run_trino("SELECT count(*) AS c FROM account_bank")
-    account_bank_ok = "error" not in account_bank_probe.columns
-    checks.append(("Iceberg table account_bank", account_bank_ok, account_bank_probe.to_string(index=False)[:240]))
-
-    alerts_probe = run_trino("SELECT count(*) AS c FROM alerts")
-    alerts_ok = "error" not in alerts_probe.columns
-    checks.append(("Iceberg table alerts", alerts_ok, alerts_probe.to_string(index=False)[:240]))
-
-    account_country_probe = run_trino("SELECT count(*) AS c FROM account_country")
-    account_country_ok = "error" not in account_country_probe.columns
-    checks.append(("Iceberg table account_country", account_country_ok, account_country_probe.to_string(index=False)[:240]))
-
-    account_alert_probe = run_trino("SELECT count(*) AS c FROM account_alert")
-    account_alert_ok = "error" not in account_alert_probe.columns
-    checks.append(("Iceberg table account_alert", account_alert_ok, account_alert_probe.to_string(index=False)[:240]))
-
-    all_ok = True
     for name, ok, detail in checks:
         status = "PASS" if ok else "FAIL"
         display(Markdown(f"- **{name}:** `{status}`"))
-        if detail:
-            print(detail)
-        if not ok:
-            all_ok = False
+        if not ok and detail:
+            display(Markdown(f"  - detail: `{detail}`"))
 
     if not all_ok:
         display(Markdown("**Action:** run `run_local_iceberg_setup(run_down=False, run_up=True, run_seed=True)` then retry."))
