@@ -75,6 +75,7 @@ Start backend first in another terminal:
 import requests
 import pandas as pd
 import subprocess
+import json as _json
 from typing import Dict, Any
 from IPython.display import display, Markdown
 from pathlib import Path
@@ -82,6 +83,7 @@ from pathlib import Path
 BASE_URL = "http://localhost:7000"
 MAX_ROWS = 100000
 REPO_ROOT = Path.home() / "SourceCode/graph-query-engine"
+SHOW_PLAN = False
 
 
 def run_aml_data_download(variant: str = "HI-Small", rows: int = 100000) -> bool:
@@ -158,12 +160,13 @@ else:
 """))
 
     cells.append(code("""
-def get_sql_explain(gremlin_query: str) -> Dict[str, Any]:
+def get_sql_explain(gremlin_query: str, include_plan: bool = False) -> Dict[str, Any]:
     try:
         response = requests.post(
             f"{BASE_URL}/query/explain",
             json={"gremlin": gremlin_query},
             headers={"Content-Type": "application/json"},
+            params={"plan": "true"} if include_plan else {},
             timeout=10,
         )
         if response.ok:
@@ -186,7 +189,7 @@ def run_gremlin_query(gremlin_query: str, tx_mode: bool = False) -> Dict[str, An
         result = response.json()
     except Exception as e:
         result = {"error": str(e)}
-    result["_sql_explain"] = get_sql_explain(gremlin_query)
+    result["_sql_explain"] = get_sql_explain(gremlin_query, include_plan=SHOW_PLAN)
     return result
 
 
@@ -202,11 +205,15 @@ def display_query_result(gremlin: str, result: Dict[str, Any], title: str = "", 
     else:
         sql = explain.get("translatedSql", "")
         params = explain.get("parameters", [])
+        plan = explain.get("plan")
         if sql:
             display(Markdown("**SQL Translation:**"))
             display(Markdown(f"```sql\\n{sql}\\n```"))
             if params:
                 display(Markdown(f"**Parameters:** `{params}`"))
+        if plan:
+            display(Markdown("**Query Plan:**"))
+            display(Markdown(f"```json\\n{_json.dumps(plan, indent=2)}\\n```"))
 
     if "error" in result:
         display(Markdown(f"**Error:** {result['error']}"))
@@ -372,6 +379,7 @@ TRINO_CONTAINER = "iceberg-trino"
 TRINO_SERVER = "http://localhost:8080"
 TRINO_CATALOG = "iceberg"
 TRINO_SCHEMA = "aml"
+SHOW_PLAN = False
 """))
 
     cells.append(code("""
@@ -410,25 +418,27 @@ def upload_iceberg_mapping() -> bool:
         return False
 
 
-def get_iceberg_sql(gremlin_query: str) -> tuple[str, list, str | None]:
+def get_iceberg_sql(gremlin_query: str, include_plan: bool = False) -> tuple[str, list, str | None, dict | None]:
     try:
+        params = {"plan": "true"} if include_plan else {}
         resp = requests.post(
             f"{BASE_URL}/query/explain",
             json={"gremlin": gremlin_query},
             headers={"Content-Type": "application/json", "X-Mapping-Id": ICEBERG_MAPPING_ID},
+            params=params,
             timeout=10,
         )
         if resp.ok:
             data = resp.json()
-            return data.get("translatedSql", ""), data.get("parameters", []), None
+            return data.get("translatedSql", ""), data.get("parameters", []), None, data.get("plan")
         err = None
         try:
             err = resp.json().get("error")
         except Exception:
             err = resp.text
-        return "", [], f"HTTP {resp.status_code}: {err}"
+        return "", [], f"HTTP {resp.status_code}: {err}", None
     except Exception as e:
-        return "", [], str(e)
+        return "", [], str(e), None
 
 
 def _sql_literal(value) -> str:
@@ -472,7 +482,7 @@ def run_trino(sql: str) -> pd.DataFrame:
 def compare_sql_and_iceberg(title: str, gremlin: str):
     display(Markdown(f"### {title}"))
     display(Markdown(f"**Gremlin:** `{gremlin}`"))
-    ice_sql, ice_params, ice_err = get_iceberg_sql(gremlin)
+    ice_sql, ice_params, ice_err, ice_plan = get_iceberg_sql(gremlin, include_plan=SHOW_PLAN)
     if not ice_sql:
         if ice_err:
             display(Markdown(f"*Iceberg SQL translation not available: {ice_err}*"))
@@ -482,6 +492,9 @@ def compare_sql_and_iceberg(title: str, gremlin: str):
     display(Markdown(f"```sql\\n{ice_sql}\\n```"))
     if ice_params:
         display(Markdown(f"**Parameters:** `{ice_params}`"))
+    if ice_plan:
+        display(Markdown("**Query Plan:**"))
+        display(Markdown(f"```json\\n{_json.dumps(ice_plan, indent=2)}\\n```"))
     try:
         executable_sql = bind_sql_parameters(ice_sql, ice_params)
     except Exception as e:
