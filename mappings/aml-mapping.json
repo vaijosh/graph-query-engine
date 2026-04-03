@@ -65,6 +65,8 @@
       "idColumn": "id",
       "outColumn": "from_account_id",
       "inColumn":  "to_account_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Account",
       "properties": {
         "transactionId": "transaction_id",
         "amount":        "amount",
@@ -79,6 +81,8 @@
       "idColumn": "id",
       "outColumn": "account_id",
       "inColumn":  "bank_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Bank",
       "properties": {
         "since":     "since",
         "isPrimary": "is_primary"
@@ -89,6 +93,8 @@
       "idColumn": "id",
       "outColumn": "bank_id",
       "inColumn":  "country_id",
+      "outVertexLabel": "Bank",
+      "inVertexLabel": "Country",
       "properties": {
         "isHeadquarters": "is_headquarters"
       }
@@ -98,6 +104,8 @@
       "idColumn": "id",
       "outColumn": "transfer_id",
       "inColumn":  "transaction_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Transaction",
       "properties": {
         "recordedAt": "recorded_at",
         "source":     "source"
@@ -108,6 +116,8 @@
       "idColumn": "id",
       "outColumn": "account_id",
       "inColumn":  "alert_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Alert",
       "properties": {
         "flaggedAt": "flagged_at",
         "reason":    "reason"
@@ -118,6 +128,8 @@
       "idColumn": "id",
       "outColumn": "transfer_id",
       "inColumn":  "country_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Country",
       "properties": {
         "channelType": "channel_type",
         "routedAt":    "routed_at"
@@ -125,4 +137,3 @@
     }
   }
 }
-

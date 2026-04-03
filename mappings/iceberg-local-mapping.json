@@ -47,6 +47,8 @@
       "idColumn": "id",
       "outColumn": "out_id",
       "inColumn": "in_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Account",
       "properties": {
         "amount": "amount",
         "currency": "currency",
@@ -58,6 +60,8 @@
       "idColumn": "id",
       "outColumn": "out_id",
       "inColumn": "in_id",
+      "outVertexLabel": "Bank",
+      "inVertexLabel": "Country",
       "properties": {
         "isHeadquarters": "is_headquarters"
       }
@@ -67,6 +71,8 @@
       "idColumn": "id",
       "outColumn": "out_id",
       "inColumn": "in_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Bank",
       "properties": {
         "isPrimary": "is_primary"
       }
@@ -76,6 +82,8 @@
       "idColumn": "id",
       "outColumn": "out_id",
       "inColumn": "in_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Country",
       "properties": {
         "channelType": "channel_type",
         "routedAt": "routed_at"
@@ -86,6 +94,8 @@
       "idColumn": "id",
       "outColumn": "out_id",
       "inColumn": "in_id",
+      "outVertexLabel": "Account",
+      "inVertexLabel": "Alert",
       "properties": {
         "flaggedAt": "flagged_at",
         "reason": "reason"
@@ -93,4 +103,3 @@
     }
   }
 }
-

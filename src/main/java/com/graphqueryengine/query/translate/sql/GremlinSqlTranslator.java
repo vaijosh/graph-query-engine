@@ -3,6 +3,7 @@ package com.graphqueryengine.query.translate.sql;
 import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.VertexMapping;
+import com.graphqueryengine.query.api.QueryPlan;
 import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.parser.LegacyGremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
@@ -44,19 +45,175 @@ public class GremlinSqlTranslator {
       this.dialect = dialect;
    }
 
-   public TranslationResult translate(String gremlin, MappingConfig mappingConfig) {
+    public TranslationResult translate(String gremlin, MappingConfig mappingConfig) {
+       GremlinParseResult parsed = (new LegacyGremlinTraversalParser()).parse(gremlin);
+       return this.translate(parsed, mappingConfig);
+    }
+
+    public TranslationResult translate(GremlinParseResult parsed, MappingConfig mappingConfig) {
+       if (parsed == null) {
+          throw new IllegalArgumentException("Parsed Gremlin query is required");
+       }
+       ParsedTraversal parsedTraversal = this.parseSteps(parsed.steps(), parsed.rootIdFilter());
+       return parsed.vertexQuery()
+               ? this.buildVertexSql(parsedTraversal, mappingConfig)
+               : this.buildEdgeSql(parsedTraversal, mappingConfig);
+    }
+
+    /**
+     * Translate a Gremlin query string to SQL, also computing and attaching a {@link QueryPlan}
+     * showing all planner-stage decisions before SQL rendering.
+     */
+    public TranslationResult translateWithPlan(String gremlin, MappingConfig mappingConfig) {
+       GremlinParseResult parsed = (new LegacyGremlinTraversalParser()).parse(gremlin);
+       return this.translateWithPlan(parsed, mappingConfig);
+    }
+
+    /**
+     * Like {@link #translate} but also attaches a {@link QueryPlan} to the result
+     * so callers can inspect every resolved mapping decision before SQL rendering.
+     */
+    public TranslationResult translateWithPlan(GremlinParseResult parsed, MappingConfig mappingConfig) {
+       if (parsed == null) {
+          throw new IllegalArgumentException("Parsed Gremlin query is required");
+       }
+       ParsedTraversal parsedTraversal = this.parseSteps(parsed.steps(), parsed.rootIdFilter());
+       TranslationResult base = parsed.vertexQuery()
+               ? this.buildVertexSql(parsedTraversal, mappingConfig)
+               : this.buildEdgeSql(parsedTraversal, mappingConfig);
+       QueryPlan plan = this.buildPlan(parsed.vertexQuery(), parsedTraversal, mappingConfig);
+       return new TranslationResult(base.sql(), base.parameters(), plan);
+    }
+
+   /** Builds a {@link QueryPlan} without producing SQL. */
+   public QueryPlan plan(String gremlin, MappingConfig mappingConfig) {
       GremlinParseResult parsed = (new LegacyGremlinTraversalParser()).parse(gremlin);
-      return this.translate(parsed, mappingConfig);
+      return planFromParsed(parsed, mappingConfig);
    }
 
-   public TranslationResult translate(GremlinParseResult parsed, MappingConfig mappingConfig) {
+   /** Builds a {@link QueryPlan} from an already-parsed result without producing SQL. */
+   public QueryPlan planFromParsed(GremlinParseResult parsed, MappingConfig mappingConfig) {
       if (parsed == null) {
          throw new IllegalArgumentException("Parsed Gremlin query is required");
-      } else {
-         ParsedTraversal parsedTraversal = this.parseSteps(parsed.steps(), parsed.rootIdFilter());
-         return parsed.vertexQuery() ? this.buildVertexSql(parsedTraversal, mappingConfig) : this.buildEdgeSql(parsedTraversal, mappingConfig);
       }
+      ParsedTraversal parsedTraversal = this.parseSteps(parsed.steps(), parsed.rootIdFilter());
+      return buildPlan(parsed.vertexQuery(), parsedTraversal, mappingConfig);
    }
+
+   // ── Internal plan builder ─────────────────────────────────────────────────
+
+   private QueryPlan buildPlan(boolean vertexQuery, ParsedTraversal t, MappingConfig mappingConfig) {
+      String rootType = vertexQuery ? "vertex" : "edge";
+
+      // Resolve root label and table
+      String rootLabel = t.label();
+      String rootTable = null;
+      if (vertexQuery) {
+         if (rootLabel == null && !mappingConfig.vertices().isEmpty()) {
+            try { rootLabel = this.resolveSingleLabel(mappingConfig.vertices(), "vertex"); } catch (Exception ignored) {}
+         }
+         VertexMapping vm = rootLabel != null ? mappingConfig.vertices().get(rootLabel) : null;
+         rootTable = vm != null ? vm.table() : null;
+      } else {
+         if (rootLabel == null && !mappingConfig.edges().isEmpty()) {
+            try { rootLabel = this.resolveSingleLabel(mappingConfig.edges(), "edge"); } catch (Exception ignored) {}
+         }
+         EdgeMapping em = rootLabel != null ? mappingConfig.edges().get(rootLabel) : null;
+         rootTable = em != null ? em.table() : null;
+      }
+
+      // Filters
+      List<QueryPlan.FilterPlan> filterPlans = t.filters().stream()
+              .map(f -> new QueryPlan.FilterPlan(f.property(), f.operator(), f.value()))
+              .toList();
+
+      // Hops
+      List<QueryPlan.HopPlan> hopPlans = new ArrayList<>();
+      for (HopStep hop : t.hops()) {
+         String edgeTable = null;
+         String targetTable = null;
+         String targetLabel = null;
+         if (!hop.labels().isEmpty()) {
+            String firstLabel = hop.labels().get(0);
+            EdgeMapping em = mappingConfig.edges().get(firstLabel);
+            if (em != null) {
+               edgeTable = em.table();
+               boolean outDir = "out".equals(hop.direction()) || "outE".equals(hop.direction());
+               VertexMapping tvm = this.resolveTargetVertexMapping(mappingConfig, em, outDir);
+               if (tvm != null) {
+                  targetTable = tvm.table();
+                  // find its label key
+                  for (Map.Entry<String, VertexMapping> e : mappingConfig.vertices().entrySet()) {
+                     if (e.getValue() == tvm) { targetLabel = e.getKey(); break; }
+                  }
+               }
+            }
+         }
+         hopPlans.add(new QueryPlan.HopPlan(hop.direction(), hop.labels(), edgeTable, targetTable, targetLabel));
+      }
+
+      // Aggregation
+      String aggregation = null;
+      String aggregationProperty = null;
+      if (t.countRequested()) aggregation = "count";
+      else if (t.sumRequested()) { aggregation = "sum"; aggregationProperty = t.valueProperty(); }
+      else if (t.meanRequested()) { aggregation = "mean"; aggregationProperty = t.valueProperty(); }
+      else if (t.groupCountProperty() != null) { aggregation = "groupCount"; aggregationProperty = t.groupCountProperty(); }
+      else if (t.groupCountKeySpec() != null) { aggregation = "groupCount"; }
+
+      // Projections
+      List<QueryPlan.ProjectionPlan> projPlans = t.projections().stream()
+              .map(p -> new QueryPlan.ProjectionPlan(p.alias(), p.kind().name(), p.property()))
+              .toList();
+
+      // Where
+      QueryPlan.WherePlan wherePlan = null;
+      if (t.whereClause() != null) {
+         WhereClause wc = t.whereClause();
+         List<QueryPlan.FilterPlan> wFilters = wc.filters().stream()
+                 .map(f -> new QueryPlan.FilterPlan(f.property(), f.operator(), f.value()))
+                 .toList();
+         wherePlan = new QueryPlan.WherePlan(wc.kind().name(), wc.left(), wc.right(),
+                 wFilters.isEmpty() ? null : wFilters);
+      }
+
+      // As aliases
+      List<QueryPlan.AliasPlan> aliasPlan = t.asAliases().stream()
+              .map(a -> new QueryPlan.AliasPlan(a.label(), a.hopIndexAfter()))
+              .toList();
+
+      // Select fields
+      List<QueryPlan.SelectPlan> selectPlan = t.selectFields().stream()
+              .map(s -> new QueryPlan.SelectPlan(s.alias(), s.property()))
+              .toList();
+
+      return new QueryPlan(
+              rootType,
+              rootLabel,
+              rootTable,
+              dialect.getClass().getSimpleName(),
+              filterPlans.isEmpty() ? null : filterPlans,
+               (t.filters().isEmpty() || !"id".equals(t.filters().get(0).property())) ? null : t.filters().get(0).value(),
+              hopPlans.isEmpty() ? null : hopPlans,
+              t.simplePathRequested() ? true : null,
+              aggregation,
+              aggregationProperty,
+              (t.valueProperty() != null && aggregation == null) ? t.valueProperty() : null,
+              projPlans.isEmpty() ? null : projPlans,
+              t.orderByProperty(),
+              t.orderDirection(),
+              t.orderByCountDesc() ? true : null,
+              t.limit(),
+              t.preHopLimit(),
+              wherePlan,
+              t.dedupRequested() ? true : null,
+              (t.pathByProperties() == null || t.pathByProperties().isEmpty()) ? null : t.pathByProperties(),
+              aliasPlan.isEmpty() ? null : aliasPlan,
+              selectPlan.isEmpty() ? null : selectPlan
+      );
+   }
+
+   // ── Missing methods and inner types (restored from committed version) ─────
 
    private TranslationResult buildVertexSql(final ParsedTraversal parsed, MappingConfig mappingConfig) {
       String label = parsed.label();
@@ -511,151 +668,6 @@ public class GremlinSqlTranslator {
          appendLimit(sql, parsed.limit());
          return new TranslationResult(sql.toString(), params);
       }
-   }
-
-   private boolean appendHopFiltersWithTargetFallback(StringBuilder sql, List<Object> params, List<HasFilter> filters, VertexMapping startVertexMapping, String finalVertexAlias, VertexMapping finalVertexMapping, ParsedTraversal parsed, MappingConfig mappingConfig, boolean hasWhere) {
-      boolean where = hasWhere;
-      HopStep lastHop = parsed.hops().isEmpty() ? null : parsed.hops().get(parsed.hops().size() - 1);
-      EdgeMapping terminalEdgeMapping = null;
-      String terminalEdgeAlias = null;
-      if (lastHop != null && ("outE".equals(lastHop.direction()) || "inE".equals(lastHop.direction()))) {
-         terminalEdgeMapping = this.resolveEdgeMapping(lastHop.singleLabel(), mappingConfig);
-         terminalEdgeAlias = "e" + parsed.hops().size();
-      }
-
-      for(HasFilter filter : filters) {
-         String alias = "v0";
-         String mappedColumn;
-         if ("id".equals(filter.property())) {
-            mappedColumn = startVertexMapping.idColumn();
-         } else {
-            try {
-               mappedColumn = this.mapVertexProperty(startVertexMapping, filter.property());
-            } catch (IllegalArgumentException var16) {
-               try {
-                  mappedColumn = this.mapVertexProperty(finalVertexMapping, filter.property());
-                  alias = finalVertexAlias;
-               } catch (IllegalArgumentException var15) {
-                  if (terminalEdgeMapping == null) {
-                     throw var15;
-                  }
-
-                  mappedColumn = this.mapEdgeProperty(terminalEdgeMapping, filter.property());
-                  alias = terminalEdgeAlias;
-               }
-            }
-         }
-
-         sql.append(where ? " AND " : " WHERE ").append(alias).append('.').append(mappedColumn).append(" ").append(filter.operator()).append(" ?");
-         params.add(filter.value());
-         where = true;
-      }
-
-      return where;
-   }
-
-   private VertexMapping resolveFinalHopVertexMapping(List<HopStep> hops, MappingConfig mappingConfig, VertexMapping startVertexMapping) {
-      VertexMapping current = startVertexMapping;
-
-      for(HopStep hop : hops) {
-         if (!"outV".equals(hop.direction()) && !"inV".equals(hop.direction()) && !"outE".equals(hop.direction()) && !"inE".equals(hop.direction())) {
-            EdgeMapping edgeMapping = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
-            boolean outDirection = "out".equals(hop.direction());
-            current = this.resolveHopTargetVertexMapping(mappingConfig, edgeMapping, outDirection, current);
-         }
-      }
-
-      return current;
-   }
-
-   private String buildHopSumExpression(ParsedTraversal parsed, MappingConfig mappingConfig, VertexMapping startVertexMapping, String finalVertexAlias) {
-      if (parsed.valueProperty() == null) {
-         throw new IllegalArgumentException("sum() requires values('property') before aggregation");
-      } else {
-         if (!parsed.selectFields().isEmpty()) {
-            String alias = parsed.selectFields().get(0).alias();
-            Integer hopIndex = null;
-
-            for(AsAlias asAlias : parsed.asAliases()) {
-               if (asAlias.label().equals(alias)) {
-                  hopIndex = asAlias.hopIndexAfter();
-                  break;
-               }
-            }
-
-            if (hopIndex != null && hopIndex > 0 && hopIndex <= parsed.hops().size()) {
-               HopStep hop = parsed.hops().get(hopIndex - 1);
-               if ("outE".equals(hop.direction()) || "inE".equals(hop.direction()) || "out".equals(hop.direction()) || "in".equals(hop.direction())) {
-                  EdgeMapping edgeMapping = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
-                  String edgeCol = this.mapEdgeProperty(edgeMapping, parsed.valueProperty());
-                  return "SUM(e" + hopIndex + "." + edgeCol + ")";
-               }
-            }
-         }
-
-         try {
-            String mappedColumn = this.mapVertexProperty(startVertexMapping, parsed.valueProperty());
-            return "SUM(" + finalVertexAlias + "." + mappedColumn + ")";
-         } catch (IllegalArgumentException var10) {
-            if (!parsed.hops().isEmpty()) {
-               HopStep lastHop = parsed.hops().get(parsed.hops().size() - 1);
-               if ("outE".equals(lastHop.direction()) || "inE".equals(lastHop.direction())) {
-                  EdgeMapping edgeMapping = this.resolveEdgeMapping(lastHop.singleLabel(), mappingConfig);
-                  String edgeCol = this.mapEdgeProperty(edgeMapping, parsed.valueProperty());
-                  return "SUM(e" + parsed.hops().size() + "." + edgeCol + ")";
-               }
-            }
-
-            throw var10;
-         }
-      }
-   }
-
-   private String buildHopMeanExpression(ParsedTraversal parsed, MappingConfig mappingConfig, VertexMapping startVertexMapping, String finalVertexAlias) {
-      if (parsed.valueProperty() == null) {
-         throw new IllegalArgumentException("mean() requires values('property') before aggregation");
-      } else {
-         if (!parsed.selectFields().isEmpty()) {
-            String alias = parsed.selectFields().get(0).alias();
-            Integer hopIndex = null;
-
-            for(AsAlias asAlias : parsed.asAliases()) {
-               if (asAlias.label().equals(alias)) {
-                  hopIndex = asAlias.hopIndexAfter();
-                  break;
-               }
-            }
-
-            if (hopIndex != null && hopIndex > 0 && hopIndex <= parsed.hops().size()) {
-               HopStep hop = parsed.hops().get(hopIndex - 1);
-               if ("outE".equals(hop.direction()) || "inE".equals(hop.direction()) || "out".equals(hop.direction()) || "in".equals(hop.direction())) {
-                  EdgeMapping edgeMapping = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
-                  String edgeCol = this.mapEdgeProperty(edgeMapping, parsed.valueProperty());
-                  return "AVG(e" + hopIndex + "." + edgeCol + ")";
-               }
-            }
-         }
-
-         try {
-            String mappedColumn = this.mapVertexProperty(startVertexMapping, parsed.valueProperty());
-            return "AVG(" + finalVertexAlias + "." + mappedColumn + ")";
-         } catch (IllegalArgumentException var10) {
-            if (!parsed.hops().isEmpty()) {
-               HopStep lastHop = parsed.hops().get(parsed.hops().size() - 1);
-               if ("outE".equals(lastHop.direction()) || "inE".equals(lastHop.direction())) {
-                  EdgeMapping edgeMapping = this.resolveEdgeMapping(lastHop.singleLabel(), mappingConfig);
-                  String edgeCol = this.mapEdgeProperty(edgeMapping, parsed.valueProperty());
-                  return "AVG(e" + parsed.hops().size() + "." + edgeCol + ")";
-               }
-            }
-
-            throw var10;
-         }
-      }
-   }
-
-   private ParsedTraversal withHops(ParsedTraversal parsed, List<HopStep> newHops) {
-      return new ParsedTraversal(parsed.label(), parsed.filters(), parsed.valueProperty(), parsed.limit(), parsed.preHopLimit(), newHops, parsed.countRequested(), parsed.sumRequested(), parsed.meanRequested(), parsed.projections(), parsed.groupCountProperty(), parsed.orderByProperty(), parsed.orderDirection(), parsed.asAliases(), parsed.selectFields(), parsed.whereClause(), parsed.dedupRequested(), parsed.pathSeen(), parsed.pathByProperties(), parsed.whereByProperty(), parsed.simplePathRequested(), parsed.groupCountKeySpec(), parsed.orderByCountDesc());
    }
 
    private TranslationResult buildBothHopUnionSql(ParsedTraversal parsed, MappingConfig mappingConfig, VertexMapping startVertexMapping) {
@@ -1114,7 +1126,7 @@ public class GremlinSqlTranslator {
                          String var56 = "(SELECT COUNT(*) FROM " + edgeMapping.table() + " WHERE " + anchorCol + " = v." + vertexMapping.idColumn() + ")";
                         selectJoiner.add(var56 + " AS " + alias);
                      } else {
-                        StringBuilder subq = (new StringBuilder("(SELECT COUNT(*) FROM ")).append(edgeMapping.table()).append(" _e").append(" JOIN ").append(targetVertexMapping.table()).append(" _tv").append(" ON _tv.").append(targetVertexMapping.idColumn()).append(" = _e.").append(targetCol).append(" WHERE _e.").append(anchorCol).append(" = v.").append(vertexMapping.idColumn());
+                        StringBuilder subq = (new StringBuilder("(SELECT COUNT(*) FROM ")).append(edgeMapping.table()).append(" _e").append(" JOIN ").append(targetVertexMapping.table()).append(" _tv").append(" ON _tv.").append(targetVertexMapping.idColumn()).append(" = _e.").append(targetCol).append(" WHERE _e.").append(anchorCol).append(" = v." + vertexMapping.idColumn());
 
                         for(int i = 2; i < parts.length; ++i) {
                            int eq = parts[i].indexOf(61);
@@ -1475,7 +1487,7 @@ public class GremlinSqlTranslator {
          HopStep hop = hops.get(i);
          if (!"outV".equals(hop.direction()) && !"inV".equals(hop.direction()) && !"outE".equals(hop.direction()) && !"inE".equals(hop.direction())) {
             EdgeMapping edgeMapping = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
-            boolean outDirection = !"in".equals(hop.direction());
+            boolean outDirection = "out".equals(hop.direction()) || "outE".equals(hop.direction());
             current = this.resolveHopTargetVertexMapping(mappingConfig, edgeMapping, outDirection, current);
          }
       }
@@ -1643,7 +1655,332 @@ public class GremlinSqlTranslator {
       }
    }
 
-   private ParsedTraversal parseSteps(List<GremlinStep> stepNodes, String rootIdFilter) {
+   private ParsedTraversal withHops(ParsedTraversal parsed, List<HopStep> newHops) {
+      return new ParsedTraversal(parsed.label(), parsed.filters(), parsed.valueProperty(), parsed.limit(), parsed.preHopLimit(), newHops, parsed.countRequested(), parsed.sumRequested(), parsed.meanRequested(), parsed.projections(), parsed.groupCountProperty(), parsed.orderByProperty(), parsed.orderDirection(), parsed.asAliases(), parsed.selectFields(), parsed.whereClause(), parsed.dedupRequested(), parsed.pathSeen(), parsed.pathByProperties(), parsed.whereByProperty(), parsed.simplePathRequested(), parsed.groupCountKeySpec(), parsed.orderByCountDesc());
+   }
+
+   private boolean appendHopFiltersWithTargetFallback(StringBuilder sql, List<Object> params, List<HasFilter> filters, VertexMapping startVertexMapping, String finalVertexAlias, VertexMapping finalVertexMapping, ParsedTraversal parsed, MappingConfig mappingConfig, boolean hasWhere) {
+      boolean where = hasWhere;
+      HopStep lastHop = parsed.hops().isEmpty() ? null : parsed.hops().get(parsed.hops().size() - 1);
+      EdgeMapping terminalEdgeMapping = null;
+      String terminalEdgeAlias = null;
+      if (lastHop != null && ("outE".equals(lastHop.direction()) || "inE".equals(lastHop.direction()))) {
+         terminalEdgeMapping = this.resolveEdgeMapping(lastHop.singleLabel(), mappingConfig);
+         terminalEdgeAlias = "e" + parsed.hops().size();
+      }
+
+      for (HasFilter filter : filters) {
+         String alias = "v0";
+         String mappedColumn;
+         if ("id".equals(filter.property())) {
+            mappedColumn = startVertexMapping.idColumn();
+         } else {
+            try {
+               mappedColumn = this.mapVertexProperty(startVertexMapping, filter.property());
+            } catch (IllegalArgumentException ex1) {
+               try {
+                  mappedColumn = this.mapVertexProperty(finalVertexMapping, filter.property());
+                  alias = finalVertexAlias;
+               } catch (IllegalArgumentException ex2) {
+                  if (terminalEdgeMapping == null) throw ex2;
+                  mappedColumn = this.mapEdgeProperty(terminalEdgeMapping, filter.property());
+                  alias = terminalEdgeAlias;
+               }
+            }
+         }
+
+         sql.append(where ? " AND " : " WHERE ").append(alias).append('.').append(mappedColumn).append(" ").append(filter.operator()).append(" ?");
+         params.add(filter.value());
+         where = true;
+      }
+
+      return where;
+   }
+
+   private VertexMapping resolveFinalHopVertexMapping(List<HopStep> hops, MappingConfig mappingConfig, VertexMapping startVertexMapping) {
+      VertexMapping current = startVertexMapping;
+      for (HopStep hop : hops) {
+         if (!"outV".equals(hop.direction()) && !"inV".equals(hop.direction())
+               && !"outE".equals(hop.direction()) && !"inE".equals(hop.direction())) {
+            EdgeMapping edgeMapping = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
+            boolean outDirection = "out".equals(hop.direction());
+            current = this.resolveHopTargetVertexMapping(mappingConfig, edgeMapping, outDirection, current);
+         }
+      }
+      return current;
+   }
+
+   private String buildHopSumExpression(ParsedTraversal parsed, MappingConfig mappingConfig, VertexMapping startVertexMapping, String finalVertexAlias) {
+      if (parsed.valueProperty() == null) {
+         throw new IllegalArgumentException("sum() requires values('property') before aggregation");
+      }
+      if (!parsed.selectFields().isEmpty()) {
+         String alias = parsed.selectFields().get(0).alias();
+         Integer hopIndex = null;
+         for (AsAlias asAlias : parsed.asAliases()) {
+            if (asAlias.label().equals(alias)) { hopIndex = asAlias.hopIndexAfter(); break; }
+         }
+         if (hopIndex != null && hopIndex > 0 && hopIndex <= parsed.hops().size()) {
+            HopStep hop = parsed.hops().get(hopIndex - 1);
+            if ("outE".equals(hop.direction()) || "inE".equals(hop.direction())
+                  || "out".equals(hop.direction()) || "in".equals(hop.direction())) {
+               EdgeMapping em = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
+               return "SUM(e" + hopIndex + "." + this.mapEdgeProperty(em, parsed.valueProperty()) + ")";
+            }
+         }
+      }
+      try {
+         return "SUM(" + finalVertexAlias + "." + this.mapVertexProperty(startVertexMapping, parsed.valueProperty()) + ")";
+      } catch (IllegalArgumentException ex) {
+         if (!parsed.hops().isEmpty()) {
+            VertexMapping finalVm = this.resolveFinalHopVertexMapping(parsed.hops(), mappingConfig, startVertexMapping);
+            return "SUM(" + finalVertexAlias + "." + this.mapVertexProperty(finalVm, parsed.valueProperty()) + ")";
+         }
+         throw ex;
+      }
+   }
+
+   private String buildHopMeanExpression(ParsedTraversal parsed, MappingConfig mappingConfig, VertexMapping startVertexMapping, String finalVertexAlias) {
+      if (parsed.valueProperty() == null) {
+         throw new IllegalArgumentException("mean() requires values('property') before aggregation");
+      }
+      try {
+         return "AVG(" + finalVertexAlias + "." + this.mapVertexProperty(startVertexMapping, parsed.valueProperty()) + ")";
+      } catch (IllegalArgumentException ex) {
+         if (!parsed.hops().isEmpty()) {
+            VertexMapping finalVm = this.resolveFinalHopVertexMapping(parsed.hops(), mappingConfig, startVertexMapping);
+            return "AVG(" + finalVertexAlias + "." + this.mapVertexProperty(finalVm, parsed.valueProperty()) + ")";
+         }
+         throw ex;
+      }
+   }
+
+   private VertexMapping resolveVertexMappingForEdgeProjection(MappingConfig mappingConfig) {
+      return mappingConfig.vertices().size() == 1 ? mappingConfig.vertices().values().iterator().next() : null;
+   }
+
+   private VertexMapping resolveVertexMappingByProperties(MappingConfig mappingConfig, List<String> propertyNames) {
+      if (propertyNames.isEmpty()) return null;
+      for (VertexMapping vm : mappingConfig.vertices().values()) {
+         if (propertyNames.stream().allMatch(p -> vm.properties().containsKey(p))) return vm;
+      }
+      return null;
+   }
+
+   private VertexMapping resolveUniqueVertexMappingByProperty(MappingConfig mappingConfig, String propertyName) {
+      List<VertexMapping> matches = new ArrayList<>();
+      for (VertexMapping vm : mappingConfig.vertices().values()) {
+         if (vm.properties().containsKey(propertyName)) matches.add(vm);
+      }
+      return matches.size() == 1 ? matches.get(0) : null;
+   }
+
+   private VertexMapping resolveTargetVertexMapping(MappingConfig mappingConfig, EdgeMapping edgeMapping, boolean outDirection) {
+      if (mappingConfig.vertices().size() == 1) return mappingConfig.vertices().values().iterator().next();
+
+      // Explicit vertex label declared on the edge mapping takes priority
+      String explicitLabel = outDirection ? edgeMapping.inVertexLabel() : edgeMapping.outVertexLabel();
+      if (explicitLabel != null && !explicitLabel.isBlank()) {
+         VertexMapping vm = mappingConfig.vertices().get(explicitLabel);
+         if (vm != null) return vm;
+      }
+
+      String targetCol = outDirection ? edgeMapping.inColumn() : edgeMapping.outColumn();
+      String stem = targetCol.replaceAll("_id$", "").replaceAll("^.*_", "");
+
+      for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+         String rawTable = entry.getValue().table();
+         String unqualified = rawTable.contains(".") ? rawTable.substring(rawTable.lastIndexOf('.') + 1) : rawTable.replaceAll("^[a-z]+_", "");
+         if (unqualified.equals(stem) || unqualified.startsWith(stem)) return entry.getValue();
+      }
+      for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+         if (entry.getKey().equalsIgnoreCase(stem)) return entry.getValue();
+      }
+      for (VertexMapping vm : mappingConfig.vertices().values()) {
+         if (targetCol.equals(vm.idColumn())) return vm;
+      }
+
+      String edgeTable = edgeMapping.table();
+      String edgeTableBase = edgeTable.contains(".") ? edgeTable.substring(edgeTable.lastIndexOf('.') + 1) : edgeTable;
+      String[] edgeParts = edgeTableBase.split("_");
+      String edgeStem = outDirection ? edgeParts[edgeParts.length - 1] : edgeParts[0];
+      for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+         if (entry.getKey().equalsIgnoreCase(edgeStem)) return entry.getValue();
+      }
+      for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
+         String rawTable = entry.getValue().table();
+         String unqualified = rawTable.contains(".") ? rawTable.substring(rawTable.lastIndexOf('.') + 1) : rawTable.replaceAll("^[a-z]+_", "");
+         if (unqualified.startsWith(edgeStem)) return entry.getValue();
+      }
+      return null;
+   }
+
+   private String quoteAlias(String alias) {
+      return this.dialect.quoteIdentifier(alias);
+   }
+
+   private List<HasFilter> parseHasChain(String hasChain) {
+      List<HasFilter> filters = new ArrayList<>();
+      if (hasChain == null || hasChain.isBlank()) return filters;
+      Matcher m = HAS_CHAIN_ITEM.matcher(hasChain);
+      while (m.find()) filters.add(new HasFilter(m.group(1), m.group(2)));
+      return filters;
+   }
+
+   private RepeatHopResult parseRepeatHop(String repeatBodyRaw) {
+      String text = repeatBodyRaw == null ? "" : repeatBodyRaw.trim();
+      boolean hasSimplePath = text.endsWith(".simplePath()");
+      if (hasSimplePath) text = text.substring(0, text.length() - ".simplePath()".length()).trim();
+      if (!text.endsWith(")")) throw new IllegalArgumentException("Only repeat(out(...)), repeat(in(...)), or repeat(both(...)) is supported");
+
+      String direction;
+      int openParenIndex;
+      if (text.startsWith("out(")) { direction = "out"; openParenIndex = 3; }
+      else if (text.startsWith("in(")) { direction = "in"; openParenIndex = 2; }
+      else if (text.startsWith("both(")) { direction = "both"; openParenIndex = 4; }
+      else throw new IllegalArgumentException("Only repeat(out(...)), repeat(in(...)), or repeat(both(...)) is supported");
+
+      String inner = text.substring(openParenIndex + 1, text.length() - 1).trim();
+      if (inner.isEmpty()) return new RepeatHopResult(new HopStep(direction, List.of()), hasSimplePath);
+      List<String> labels = this.splitArgs(inner).stream().map(this::unquote).toList();
+      return new RepeatHopResult(new HopStep(direction, labels), hasSimplePath);
+   }
+
+   private boolean normalizeEndpointHop(String endpointStep, List<HopStep> hops) {
+      if (hops.isEmpty()) return true;
+      if (hops.size() > 1) {
+         HopStep beforePrevious = hops.get(hops.size() - 2);
+         if ("outV".equals(beforePrevious.direction()) || "inV".equals(beforePrevious.direction())) return true;
+      }
+      HopStep previous = hops.get(hops.size() - 1);
+      if (!"outE".equals(previous.direction()) && !"inE".equals(previous.direction())) return true;
+      hops.remove(hops.size() - 1);
+      String normalized;
+      if ("outE".equals(previous.direction())) { normalized = "inV".equals(endpointStep) ? "out" : "in"; }
+      else { normalized = "inV".equals(endpointStep) ? "in" : "out"; }
+      hops.add(new HopStep(normalized, previous.labels()));
+      return false;
+   }
+
+   private WhereClause parseWhere(String rawWhere) {
+      Matcher neqMatcher = WHERE_NEQ_PATTERN.matcher(rawWhere);
+      if (neqMatcher.matches()) return new WhereClause(WhereKind.NEQ_ALIAS, neqMatcher.group(1), neqMatcher.group(2), List.of());
+      Matcher eqAliasMatcher = WHERE_EQ_ALIAS_PATTERN.matcher(rawWhere);
+      if (eqAliasMatcher.matches()) return new WhereClause(WhereKind.EQ_ALIAS, eqAliasMatcher.group(1), null, List.of());
+      Matcher gtMatcher = WHERE_SELECT_IS_GT_PATTERN.matcher(rawWhere);
+      if (gtMatcher.matches()) {
+         boolean isGte = rawWhere.contains(".is(gte(");
+         return new WhereClause(isGte ? WhereKind.PROJECT_GTE : WhereKind.PROJECT_GT, gtMatcher.group(1), gtMatcher.group(2).trim(), List.of());
+      }
+      Matcher edgeExistsMatcher = WHERE_EDGE_EXISTS_PATTERN.matcher(rawWhere);
+      if (edgeExistsMatcher.matches()) return new WhereClause(WhereKind.EDGE_EXISTS, edgeExistsMatcher.group(1), edgeExistsMatcher.group(2), this.parseHasChain(edgeExistsMatcher.group(3)));
+      Matcher neighborMatcher = WHERE_OUT_NEIGHBOR_HAS_PATTERN.matcher(rawWhere);
+      if (neighborMatcher.matches()) {
+         WhereKind kind = "out".equals(neighborMatcher.group(1)) ? WhereKind.OUT_NEIGHBOR_HAS : WhereKind.IN_NEIGHBOR_HAS;
+         return new WhereClause(kind, neighborMatcher.group(1), neighborMatcher.group(2), this.parseHasChain(neighborMatcher.group(3)));
+      }
+      throw new IllegalArgumentException("Unsupported where() predicate: " + rawWhere);
+   }
+
+   private static void ensureArgCount(String step, List<String> args, int expected) {
+      if (args.size() != expected) throw new IllegalArgumentException(step + " expects " + expected + " argument(s)");
+   }
+
+   private HasFilter parseHasArgument(String property, String rawValue) {
+      String trimmed = rawValue.trim();
+      Matcher m = HAS_PREDICATE_PATTERN.matcher(trimmed);
+      if (m.matches()) {
+         String predicate = m.group(1);
+         String innerVal = this.unquote(m.group(2).trim());
+         String operator = switch (predicate) {
+            case "gt" -> ">";
+            case "gte" -> ">=";
+            case "lt" -> "<";
+            case "lte" -> "<=";
+            case "neq" -> "!=";
+            default -> "=";
+         };
+         return new HasFilter(property, innerVal, operator);
+      }
+      return new HasFilter(property, this.unquote(trimmed));
+   }
+
+   private GroupCountKeySpec tryParseGroupCountSelectKey(String rawExpr) {
+      if (rawExpr == null || rawExpr.isBlank()) return null;
+      Matcher m = GROUP_COUNT_SELECT_BY_PATTERN.matcher(rawExpr.trim());
+      return m.matches() ? new GroupCountKeySpec(m.group(1), m.group(2)) : null;
+   }
+
+   private List<String> splitArgs(String argsText) {
+      List<String> args = new ArrayList<>();
+      StringBuilder current = new StringBuilder();
+      boolean inSingleQuote = false;
+      boolean inDoubleQuote = false;
+      for (int i = 0; i < argsText.length(); i++) {
+         char c = argsText.charAt(i);
+         if (c == '\'' && !inDoubleQuote) { inSingleQuote = !inSingleQuote; current.append(c); }
+         else if (c == '"' && !inSingleQuote) { inDoubleQuote = !inDoubleQuote; current.append(c); }
+         else if (c == ',' && !inSingleQuote && !inDoubleQuote) { args.add(current.toString().trim()); current.setLength(0); }
+         else { current.append(c); }
+      }
+      if (!argsText.isBlank()) args.add(current.toString().trim());
+      return args;
+   }
+
+   private String unquote(String text) {
+      String trimmed = text.trim();
+      if ((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+         return trimmed.substring(1, trimmed.length() - 1);
+      }
+      return trimmed;
+   }
+
+   private ProjectionField parseProjection(String alias, String byExpression) {
+      String expression = byExpression == null ? "" : byExpression.trim();
+      Matcher degreeMatcher = EDGE_DEGREE_PATTERN.matcher(expression);
+      if (degreeMatcher.matches()) {
+         String direction = degreeMatcher.group(1).equals("outE") ? "out" : "in";
+         String edgeLabel = degreeMatcher.group(2);
+         List<HasFilter> degreeFilters = this.parseHasChain(degreeMatcher.group(3));
+         StringBuilder encoded = new StringBuilder(direction + ":" + edgeLabel);
+         for (HasFilter f : degreeFilters) encoded.append(":").append(f.property()).append("=").append(f.value());
+         return new ProjectionField(alias, ProjectionKind.EDGE_DEGREE, encoded.toString());
+      }
+      Matcher vertexCountMatcher = VERTEX_COUNT_PATTERN.matcher(expression);
+      if (vertexCountMatcher.matches()) {
+         String direction = vertexCountMatcher.group(1);
+         String edgeLabel = vertexCountMatcher.group(2);
+         List<HasFilter> vcFilters = this.parseHasChain(vertexCountMatcher.group(3));
+         StringBuilder encoded = new StringBuilder(direction + ":" + edgeLabel);
+         for (HasFilter f : vcFilters) encoded.append(":").append(f.property()).append("=").append(f.value());
+         ProjectionKind kind = "out".equals(direction) ? ProjectionKind.OUT_VERTEX_COUNT : ProjectionKind.IN_VERTEX_COUNT;
+         return new ProjectionField(alias, kind, encoded.toString());
+      }
+      Matcher neighborValuesMatcher = NEIGHBOR_VALUES_FOLD_PATTERN.matcher(expression);
+      if (neighborValuesMatcher.matches()) {
+         String direction = neighborValuesMatcher.group(1);
+         String edgeLabel = this.splitArgs(neighborValuesMatcher.group(2)).stream().map(this::unquote).toList().get(0);
+         String prop = neighborValuesMatcher.group(3);
+         ProjectionKind kind = "out".equals(direction) ? ProjectionKind.OUT_NEIGHBOR_PROPERTY : ProjectionKind.IN_NEIGHBOR_PROPERTY;
+         return new ProjectionField(alias, kind, direction + ":" + edgeLabel + ":" + prop);
+      }
+      ChooseProjectionSpec chooseSpec = this.parseChooseProjection(expression);
+      if (chooseSpec != null) return new ProjectionField(alias, ProjectionKind.CHOOSE_VALUES_IS_CONSTANT, expression);
+      Matcher endpointMatcher = ENDPOINT_VALUES_PATTERN.matcher(expression);
+      if (endpointMatcher.matches()) {
+         String endpoint = endpointMatcher.group(1);
+         String property = this.unquote(endpointMatcher.group(2));
+         if (property.isBlank()) throw new IllegalArgumentException("by(outV().values(...)) and by(inV().values(...)) require a property name");
+         ProjectionKind kind = "outV".equals(endpoint) ? ProjectionKind.OUT_VERTEX_PROPERTY : ProjectionKind.IN_VERTEX_PROPERTY;
+         return new ProjectionField(alias, kind, property);
+      }
+      if (expression.contains("(")) throw new IllegalArgumentException("Unsupported by() projection expression: " + expression);
+      String property = this.unquote(expression);
+      if (property.isBlank()) throw new IllegalArgumentException("by(...) property must be non-empty");
+      return new ProjectionField(alias, ProjectionKind.EDGE_PROPERTY, property);
+   }
+
+   private ParsedTraversal parseSteps(List<com.graphqueryengine.query.parser.model.GremlinStep> stepNodes, String rootIdFilter) {
       String label = null;
       String valuesProperty = null;
       String groupCountProperty = null;
@@ -1675,802 +2012,253 @@ public class GremlinSqlTranslator {
       boolean simplePathRequested = false;
       String whereByProperty = null;
       boolean whereByPending = false;
-      if (rootIdFilter != null) {
-         filters.add(new HasFilter("id", rootIdFilter));
-      }
 
-      for(GremlinStep stepNode : stepNodes) {
+      if (rootIdFilter != null) filters.add(new HasFilter("id", rootIdFilter));
+
+      for (com.graphqueryengine.query.parser.model.GremlinStep stepNode : stepNodes) {
          String stepName = stepNode.name();
          List<String> args = stepNode.args();
          String rawStepArgs = stepNode.rawArgs() == null ? "" : stepNode.rawArgs().trim();
-         if (whereByPending && !"by".equals(stepName)) {
-            whereByPending = false;
-         }
+         if (whereByPending && !"by".equals(stepName)) whereByPending = false;
 
          switch (stepName) {
-            case "hasLabel":
-               ensureArgCount(stepName, args, 1);
-               label = this.unquote(args.get(0));
-               break;
-            case "has":
+            case "hasLabel" -> { ensureArgCount(stepName, args, 1); label = this.unquote(args.get(0)); }
+            case "has" -> {
                ensureArgCount(stepName, args, 2);
-               String hasProp = this.unquote(args.get(0));
-               String hasVal = args.get(1).trim();
-               HasFilter filter = this.parseHasArgument(hasProp, hasVal);
-               filters.add(filter);
-               break;
-            case "values":
-               ensureArgCount(stepName, args, 1);
-               valuesProperty = this.unquote(args.get(0));
-               break;
-            case "out":
-               if (args.isEmpty()) {
-                  throw new IllegalArgumentException("out expects at least 1 argument");
-               }
-
+               filters.add(this.parseHasArgument(this.unquote(args.get(0)), args.get(1).trim()));
+            }
+            case "values" -> { ensureArgCount(stepName, args, 1); valuesProperty = this.unquote(args.get(0)); }
+            case "out" -> {
+               if (args.isEmpty()) throw new IllegalArgumentException("out expects at least 1 argument");
                hopsSeen = true;
                hops.add(new HopStep("out", args.stream().map(this::unquote).toList()));
-               break;
-            case "in":
-               if (args.isEmpty()) {
-                  throw new IllegalArgumentException("in expects at least 1 argument");
-               }
-
+            }
+            case "in" -> {
+               if (args.isEmpty()) throw new IllegalArgumentException("in expects at least 1 argument");
                hopsSeen = true;
                hops.add(new HopStep("in", args.stream().map(this::unquote).toList()));
-               break;
-            case "outV":
+            }
+            case "outV" -> {
                ensureArgCount(stepName, args, 0);
                hopsSeen = true;
-               if (this.normalizeEndpointHop("outV", hops)) {
-                  hops.add(new HopStep("outV", List.of()));
-               }
-               break;
-            case "inV":
+               if (this.normalizeEndpointHop("outV", hops)) hops.add(new HopStep("outV", List.of()));
+            }
+            case "inV" -> {
                ensureArgCount(stepName, args, 0);
                hopsSeen = true;
-               if (this.normalizeEndpointHop("inV", hops)) {
-                  hops.add(new HopStep("inV", List.of()));
-               }
-               break;
-            case "both":
-               if (args.size() > 1) {
-                  throw new IllegalArgumentException("both expects 0 or 1 argument(s)");
-               }
-
+               if (this.normalizeEndpointHop("inV", hops)) hops.add(new HopStep("inV", List.of()));
+            }
+            case "both" -> {
+               if (args.size() > 1) throw new IllegalArgumentException("both expects 0 or 1 argument(s)");
                hopsSeen = true;
-               List<String> labels = args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)));
-               hops.add(new HopStep("both", labels));
-               break;
-            case "repeat":
-               if (rawStepArgs.isBlank()) {
-                  throw new IllegalArgumentException("repeat() requires an argument");
-               }
-
+               hops.add(new HopStep("both", args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)))));
+            }
+            case "repeat" -> {
+               if (rawStepArgs.isBlank()) throw new IllegalArgumentException("repeat() requires an argument");
                hopsSeen = true;
                pendingRepeatHop = this.parseRepeatHop(rawStepArgs);
-               break;
-            case "simplePath":
-               ensureArgCount(stepName, args, 0);
-               simplePathRequested = true;
-               break;
-            case "times":
-               if (pendingRepeatHop == null) {
-                  throw new IllegalArgumentException("times() must follow repeat(out(...)), repeat(in(...)), or repeat(both(...))");
-               }
-
+            }
+            case "simplePath" -> { ensureArgCount(stepName, args, 0); simplePathRequested = true; }
+            case "times" -> {
+               if (pendingRepeatHop == null) throw new IllegalArgumentException("times() must follow repeat(out(...)), repeat(in(...)), or repeat(both(...))");
                ensureArgCount(stepName, args, 1);
-
                int repeatCount;
-               try {
-                  repeatCount = Integer.parseInt(args.get(0).trim());
-               } catch (NumberFormatException var43) {
-                  throw new IllegalArgumentException("times() must be numeric");
-               }
-
-               if (repeatCount < 0) {
-                  throw new IllegalArgumentException("times() must be >= 0");
-               }
-
-               if (pendingRepeatHop.simplePathDetected()) {
-                  simplePathRequested = true;
-               }
-
+               try { repeatCount = Integer.parseInt(args.get(0).trim()); }
+               catch (NumberFormatException ex) { throw new IllegalArgumentException("times() must be numeric"); }
+               if (repeatCount < 0) throw new IllegalArgumentException("times() must be >= 0");
+               if (pendingRepeatHop.simplePathDetected()) simplePathRequested = true;
                HopStep repeatHop = pendingRepeatHop.hop();
-               // When the label count matches times(n), treat each label as a sequential
-               // single-label hop: repeat(out('A','B')).times(2) → hop1=out('A'), hop2=out('B').
-               // This models ordered multi-edge-type path traversals (e.g. Account→Bank→Country).
                if (repeatHop.labels().size() == repeatCount && repeatCount > 1) {
-                  for (String lbl : repeatHop.labels()) {
-                     hops.add(new HopStep(repeatHop.direction(), lbl));
-                  }
+                  for (String lbl : repeatHop.labels()) hops.add(new HopStep(repeatHop.direction(), lbl));
                } else {
-                  for (int i = 0; i < repeatCount; ++i) {
-                     hops.add(repeatHop);
-                  }
+                  for (int i = 0; i < repeatCount; i++) hops.add(repeatHop);
                }
-
                pendingRepeatHop = null;
-               break;
-            case "limit":
-               if (!args.isEmpty() && args.size() <= 2) {
-                  String limitArg = args.get(args.size() - 1).trim();
-
-                  int parsedLimit;
-                  try {
-                     parsedLimit = Integer.parseInt(limitArg);
-                  } catch (NumberFormatException var42) {
-                     throw new IllegalArgumentException("limit() must be numeric");
-                  }
-
-                  if (!hopsSeen) {
-                     preHopLimit = parsedLimit;
-                  } else {
-                     limit = parsedLimit;
-                  }
-                  break;
-               }
-
-               throw new IllegalArgumentException("limit expects 1 or 2 argument(s)");
-            case "count":
+            }
+            case "limit" -> {
+               if (args.isEmpty() || args.size() > 2) throw new IllegalArgumentException("limit expects 1 or 2 argument(s)");
+               String limitArg = args.get(args.size() - 1).trim();
+               int parsedLimit;
+               try { parsedLimit = Integer.parseInt(limitArg); }
+               catch (NumberFormatException ex) { throw new IllegalArgumentException("limit() must be numeric"); }
+               if (!hopsSeen) preHopLimit = parsedLimit; else limit = parsedLimit;
+            }
+            case "count" -> { ensureArgCount(stepName, args, 0); countRequested = true; }
+            case "sum" -> { ensureArgCount(stepName, args, 0); sumRequested = true; }
+            case "mean" -> { ensureArgCount(stepName, args, 0); meanRequested = true; }
+            case "groupCount" -> {
                ensureArgCount(stepName, args, 0);
-               countRequested = true;
-               break;
-            case "sum":
-               ensureArgCount(stepName, args, 0);
-               sumRequested = true;
-               break;
-            case "mean":
-               ensureArgCount(stepName, args, 0);
-               meanRequested = true;
-               break;
-            case "groupCount":
-               ensureArgCount(stepName, args, 0);
-               if (groupCountSeen) {
-                  throw new IllegalArgumentException("Only a single groupCount() step is supported");
-               }
-
+               if (groupCountSeen) throw new IllegalArgumentException("Only a single groupCount() step is supported");
                groupCountSeen = true;
-               break;
-            case "project":
-               if (args.isEmpty()) {
-                  throw new IllegalArgumentException("project expects at least 1 argument");
-               }
-
-               if (!projectAliases.isEmpty()) {
-                  throw new IllegalArgumentException("Only a single project(...) step is supported");
-               }
-
-               for(String arg : args) {
+            }
+            case "project" -> {
+               if (args.isEmpty()) throw new IllegalArgumentException("project expects at least 1 argument");
+               if (!projectAliases.isEmpty()) throw new IllegalArgumentException("Only a single project(...) step is supported");
+               for (String arg : args) {
                   String a = this.unquote(arg);
-                  if (a.isBlank()) {
-                     throw new IllegalArgumentException("project aliases must be non-empty");
-                  }
-
+                  if (a.isBlank()) throw new IllegalArgumentException("project aliases must be non-empty");
                   projectAliases.add(a);
                }
-               break;
-            case "outE":
-               if (args.size() > 1) {
-                  throw new IllegalArgumentException("outE expects 0 or 1 argument(s)");
-               }
-
+            }
+            case "outE" -> {
+               if (args.size() > 1) throw new IllegalArgumentException("outE expects 0 or 1 argument(s)");
                hopsSeen = true;
                hops.add(new HopStep("outE", args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)))));
-               break;
-            case "inE":
-               if (args.size() > 1) {
-                  throw new IllegalArgumentException("inE expects 0 or 1 argument(s)");
-               }
-
+            }
+            case "inE" -> {
+               if (args.size() > 1) throw new IllegalArgumentException("inE expects 0 or 1 argument(s)");
                hopsSeen = true;
                hops.add(new HopStep("inE", args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)))));
-               break;
-            case "as":
+            }
+            case "as" -> {
                ensureArgCount(stepName, args, 1);
                String aliasName = this.unquote(args.get(0));
-               if (aliasName.isBlank()) {
-                  throw new IllegalArgumentException("as() label must be non-empty");
-               }
-
+               if (aliasName.isBlank()) throw new IllegalArgumentException("as() label must be non-empty");
                asAliases.add(new AsAlias(aliasName, hops.size()));
-               break;
-            case "select":
-               if (args.isEmpty()) {
-                  throw new IllegalArgumentException("select expects at least 1 argument");
-               }
-
-               if (selectSeen) {
-                  throw new IllegalArgumentException("Only a single select(...) step is supported");
-               }
-
+            }
+            case "select" -> {
+               if (args.isEmpty()) throw new IllegalArgumentException("select expects at least 1 argument");
+               if (selectSeen) throw new IllegalArgumentException("Only a single select(...) step is supported");
                selectSeen = true;
-
-               for(String arg : args) {
-                  selectAliases.add(this.unquote(arg));
-               }
-               break;
-            case "where":
-               if (whereClause != null) {
-                  throw new IllegalArgumentException("Only a single where() step is supported");
-               }
-
+               for (String arg : args) selectAliases.add(this.unquote(arg));
+            }
+            case "where" -> {
+               if (whereClause != null) throw new IllegalArgumentException("Only a single where() step is supported");
                whereClause = this.parseWhere(rawStepArgs);
-               whereByPending = whereClause.kind() == GremlinSqlTranslator.WhereKind.NEQ_ALIAS;
-               break;
-            case "dedup":
-               ensureArgCount(stepName, args, 0);
-               dedupRequested = true;
-               break;
-            case "path":
-               ensureArgCount(stepName, args, 0);
-               pathSeen = true;
-               break;
-            case "by":
-               if (args.isEmpty()) {
-                  throw new IllegalArgumentException("by(...) expects at least 1 argument");
-               }
-
+               whereByPending = whereClause.kind() == WhereKind.NEQ_ALIAS;
+            }
+            case "dedup" -> { ensureArgCount(stepName, args, 0); dedupRequested = true; }
+            case "path" -> { ensureArgCount(stepName, args, 0); pathSeen = true; }
+            case "by" -> {
+               if (args.isEmpty()) throw new IllegalArgumentException("by(...) expects at least 1 argument");
                if (whereByPending) {
                   ensureArgCount(stepName, args, 1);
                   whereByProperty = this.unquote(args.get(0));
                   whereByPending = false;
-                  break;
-               }
-
-               if (selectSeen) {
-                  if (selectByExpressions.size() >= selectAliases.size()) {
-                     throw new IllegalArgumentException("select(...) has more by(...) modulators than selected aliases");
-                  }
-
+               } else if (selectSeen) {
+                  if (selectByExpressions.size() >= selectAliases.size()) throw new IllegalArgumentException("select(...) has more by(...) modulators than selected aliases");
                   selectByExpressions.add(rawStepArgs);
                } else if (orderSeen && orderByProperty == null && !orderByCountDesc) {
                   List<String> byArgsTrimmed = args.stream().map(String::trim).toList();
                   if (byArgsTrimmed.size() == 2 && ("values".equals(byArgsTrimmed.get(0)) || "__.values()".equals(byArgsTrimmed.get(0)))) {
                      String dirToken = byArgsTrimmed.get(1).toLowerCase();
-                     boolean isDesc = dirToken.equals("desc") || dirToken.equals("order.desc");
                      orderByCountDesc = true;
-                     orderDirection = isDesc ? "DESC" : "ASC";
+                     orderDirection = (dirToken.equals("desc") || dirToken.equals("order.desc")) ? "DESC" : "ASC";
+                  } else if (rawStepArgs.contains("select(") && rawStepArgs.contains("Order.")) {
+                     int selectStart = rawStepArgs.indexOf("select(") + 7;
+                     int selectEnd = rawStepArgs.indexOf(")", selectStart);
+                     orderByProperty = this.unquote(rawStepArgs.substring(selectStart, selectEnd));
+                     orderDirection = rawStepArgs.contains("Order.desc") ? "DESC" : "ASC";
                   } else {
-                     if (rawStepArgs.contains("select(") && rawStepArgs.contains("Order.")) {
-                        int selectStart = rawStepArgs.indexOf("select(") + 7;
-                        int selectEnd = rawStepArgs.indexOf(")", selectStart);
-                        orderByProperty = this.unquote(rawStepArgs.substring(selectStart, selectEnd));
-                        orderDirection = rawStepArgs.contains("Order.desc") ? "DESC" : "ASC";
-                        break;
-                     }
-
                      orderByProperty = this.unquote(rawStepArgs);
                      orderDirection = "ASC";
                   }
                } else if (groupCountSeen && groupCountProperty == null && groupCountKeySpec == null) {
-                  GroupCountKeySpec parsed = this.tryParseGroupCountSelectKey(rawStepArgs);
-                  if (parsed != null) {
-                     groupCountKeySpec = parsed;
-                  } else {
+                  GroupCountKeySpec parsedKey = this.tryParseGroupCountSelectKey(rawStepArgs);
+                  if (parsedKey != null) { groupCountKeySpec = parsedKey; }
+                  else {
                      ensureArgCount(stepName, args, 1);
                      groupCountProperty = this.unquote(args.get(0));
-                     if (groupCountProperty.isBlank()) {
-                        throw new IllegalArgumentException("by(...) property must be non-empty");
-                     }
+                     if (groupCountProperty.isBlank()) throw new IllegalArgumentException("by(...) property must be non-empty");
                   }
                } else if (!projectAliases.isEmpty()) {
-                  if (byExpressions.size() >= projectAliases.size()) {
-                     throw new IllegalArgumentException("project(...) has more by(...) modulators than projected fields");
-                  }
-
+                  if (byExpressions.size() >= projectAliases.size()) throw new IllegalArgumentException("project(...) has more by(...) modulators than projected fields");
                   byExpressions.add(rawStepArgs);
-               } else {
-                  if (!pathSeen) {
-                     throw new IllegalArgumentException("by(...) is only supported after project(...), groupCount(...), or order(...)");
-                  }
-
+               } else if (pathSeen) {
                   ensureArgCount(stepName, args, 1);
                   pathByProperties.add(this.unquote(args.get(0)));
+               } else {
+                  throw new IllegalArgumentException("by(...) is only supported after project(...), groupCount(...), or order(...)");
                }
-               break;
-            case "order":
-               if (args.size() > 1) {
-                  throw new IllegalArgumentException("order expects 0 or 1 argument(s)");
-               }
-
-               if (orderSeen) {
-                  throw new IllegalArgumentException("Only a single order() step is supported");
-               }
-
+            }
+            case "order" -> {
+               if (args.size() > 1) throw new IllegalArgumentException("order expects 0 or 1 argument(s)");
+               if (orderSeen) throw new IllegalArgumentException("Only a single order() step is supported");
                orderSeen = true;
-               break;
-            default:
-               throw new IllegalArgumentException("Unsupported step: " + stepName);
+            }
+            default -> throw new IllegalArgumentException("Unsupported step: " + stepName);
          }
       }
 
-      if (pendingRepeatHop != null) {
-         throw new IllegalArgumentException("repeat(...) must be followed by times(n)");
-      } else if (!projectAliases.isEmpty() && byExpressions.size() != projectAliases.size()) {
+      if (pendingRepeatHop != null) throw new IllegalArgumentException("repeat(...) must be followed by times(n)");
+      if (!projectAliases.isEmpty() && byExpressions.size() != projectAliases.size())
          throw new IllegalArgumentException("project(...) requires one by(...) modulator per projected field");
-      } else {
-         if (pathSeen && pathByProperties.size() == 1 && valuesProperty == null) {
-            valuesProperty = pathByProperties.get(0);
-         }
 
-         List<ProjectionField> projections = new ArrayList<>();
+      if (pathSeen && pathByProperties.size() == 1 && valuesProperty == null) valuesProperty = pathByProperties.get(0);
 
-         for(int i = 0; i < projectAliases.size(); ++i) {
-            projections.add(this.parseProjection(projectAliases.get(i), byExpressions.get(i)));
-         }
+      List<ProjectionField> projections = new ArrayList<>();
+      for (int i = 0; i < projectAliases.size(); i++) projections.add(this.parseProjection(projectAliases.get(i), byExpressions.get(i)));
 
-         List<SelectField> selectFields = new ArrayList<>();
-         String sharedSelectBy = null;
-         if (selectAliases.size() > 1 && selectByExpressions.size() == 1) {
-            sharedSelectBy = this.unquote(selectByExpressions.get(0));
-         }
-
-         for(int i = 0; i < selectAliases.size(); ++i) {
-            String selectAlias = selectAliases.get(i);
-            String property = sharedSelectBy != null ? sharedSelectBy : (i < selectByExpressions.size() ? this.unquote(selectByExpressions.get(i)) : null);
-            selectFields.add(new SelectField(selectAlias, property));
-         }
-
-         if ((sumRequested || meanRequested) && valuesProperty == null) {
-            if (selectFields.size() == 1) {
-               SelectField sf = selectFields.get(0);
-               if (sf.property() != null && !sf.property().isBlank()) {
-                  valuesProperty = sf.property();
-               } else {
-                  for(ProjectionField pf : projections) {
-                     if (pf.alias().equals(sf.alias()) && pf.kind() == GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
-                        valuesProperty = pf.property();
-                        break;
-                     }
-                  }
-               }
-            }
-
-            if (valuesProperty == null) {
-               throw new IllegalArgumentException((meanRequested ? "mean()" : "sum()") + " requires values('property') before aggregation");
-            }
-         }
-
-         return new ParsedTraversal(label, filters, valuesProperty, limit, preHopLimit, hops, countRequested, sumRequested, meanRequested, projections, groupCountProperty, orderByProperty, orderDirection, asAliases, selectFields, whereClause, dedupRequested, pathSeen, pathByProperties, whereByProperty, simplePathRequested, groupCountKeySpec, orderByCountDesc);
+      List<SelectField> selectFields = new ArrayList<>();
+      String sharedSelectBy = (selectAliases.size() > 1 && selectByExpressions.size() == 1) ? this.unquote(selectByExpressions.get(0)) : null;
+      for (int i = 0; i < selectAliases.size(); i++) {
+         String property = sharedSelectBy != null ? sharedSelectBy : (i < selectByExpressions.size() ? this.unquote(selectByExpressions.get(i)) : null);
+         selectFields.add(new SelectField(selectAliases.get(i), property));
       }
-   }
 
-   private ProjectionField parseProjection(String alias, String byExpression) {
-      String expression = byExpression == null ? "" : byExpression.trim();
-      Matcher degreeMatcher = EDGE_DEGREE_PATTERN.matcher(expression);
-      if (degreeMatcher.matches()) {
-         String direction = degreeMatcher.group(1).equals("outE") ? "out" : "in";
-         String edgeLabel = degreeMatcher.group(2);
-         String hasChain = degreeMatcher.group(3);
-         List<HasFilter> degreeFilters = this.parseHasChain(hasChain);
-         String encodedProperty = direction + ":" + edgeLabel;
-         if (!degreeFilters.isEmpty()) {
-            StringBuilder encoded = new StringBuilder(encodedProperty);
-
-            for(HasFilter f : degreeFilters) {
-               encoded.append(":").append(f.property()).append("=").append(f.value());
-            }
-
-            encodedProperty = encoded.toString();
-         }
-
-         return new ProjectionField(alias, GremlinSqlTranslator.ProjectionKind.EDGE_DEGREE, encodedProperty);
-      } else {
-         Matcher vertexCountMatcher = VERTEX_COUNT_PATTERN.matcher(expression);
-         if (!vertexCountMatcher.matches()) {
-            Matcher neighborValuesMatcher = NEIGHBOR_VALUES_FOLD_PATTERN.matcher(expression);
-            if (neighborValuesMatcher.matches()) {
-               String direction = neighborValuesMatcher.group(1);
-               String labelsRaw = neighborValuesMatcher.group(2);
-               String prop = neighborValuesMatcher.group(3);
-               List<String> labelList = this.splitArgs(labelsRaw).stream().map(this::unquote).toList();
-               String edgeLabel = labelList.get(0);
-               String encoded = direction + ":" + edgeLabel + ":" + prop;
-               ProjectionKind kind = "out".equals(direction) ? GremlinSqlTranslator.ProjectionKind.OUT_NEIGHBOR_PROPERTY : GremlinSqlTranslator.ProjectionKind.IN_NEIGHBOR_PROPERTY;
-               return new ProjectionField(alias, kind, encoded);
+      if ((sumRequested || meanRequested) && valuesProperty == null) {
+         if (selectFields.size() == 1) {
+            SelectField sf = selectFields.get(0);
+            if (sf.property() != null && !sf.property().isBlank()) {
+               valuesProperty = sf.property();
             } else {
-               ChooseProjectionSpec chooseSpec = this.parseChooseProjection(expression);
-               if (chooseSpec != null) {
-                  return new ProjectionField(alias, GremlinSqlTranslator.ProjectionKind.CHOOSE_VALUES_IS_CONSTANT, expression);
-               }
-
-               Matcher endpointMatcher = ENDPOINT_VALUES_PATTERN.matcher(expression);
-               if (endpointMatcher.matches()) {
-                  String endpoint = endpointMatcher.group(1);
-                  String property = this.unquote(endpointMatcher.group(2));
-                  if (property.isBlank()) {
-                     throw new IllegalArgumentException("by(outV().values(...)) and by(inV().values(...)) require a property name");
-                  } else {
-                     ProjectionKind kind = "outV".equals(endpoint) ? GremlinSqlTranslator.ProjectionKind.OUT_VERTEX_PROPERTY : GremlinSqlTranslator.ProjectionKind.IN_VERTEX_PROPERTY;
-                     return new ProjectionField(alias, kind, property);
-                  }
-               } else if (expression.contains("(")) {
-                  throw new IllegalArgumentException("Unsupported by() projection expression: " + expression);
-               } else {
-                  String property = this.unquote(expression);
-                  if (property.isBlank()) {
-                     throw new IllegalArgumentException("by(...) property must be non-empty");
-                  } else {
-                     return new ProjectionField(alias, GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY, property);
-                  }
-               }
-            }
-         } else {
-            String direction = vertexCountMatcher.group(1);
-            String edgeLabel = vertexCountMatcher.group(2);
-            String hasChain = vertexCountMatcher.group(3);
-            List<HasFilter> vcFilters = this.parseHasChain(hasChain);
-            StringBuilder encoded = (new StringBuilder(direction)).append(":").append(edgeLabel);
-
-            for(HasFilter f : vcFilters) {
-               encoded.append(":").append(f.property()).append("=").append(f.value());
-            }
-
-            ProjectionKind kind = "out".equals(direction) ? GremlinSqlTranslator.ProjectionKind.OUT_VERTEX_COUNT : GremlinSqlTranslator.ProjectionKind.IN_VERTEX_COUNT;
-            return new ProjectionField(alias, kind, encoded.toString());
-         }
-      }
-   }
-
-   private VertexMapping resolveVertexMappingForEdgeProjection(MappingConfig mappingConfig) {
-      return mappingConfig.vertices().size() == 1 ? mappingConfig.vertices().values().iterator().next() : null;
-   }
-
-   private VertexMapping resolveVertexMappingByProperties(MappingConfig mappingConfig, List<String> propertyNames) {
-      if (propertyNames.isEmpty()) {
-         return null;
-      } else {
-         for(VertexMapping vm : mappingConfig.vertices().values()) {
-            if (propertyNames.stream().allMatch((p) -> vm.properties().containsKey(p))) {
-               return vm;
-            }
-         }
-
-         return null;
-      }
-   }
-
-   private VertexMapping resolveUniqueVertexMappingByProperty(MappingConfig mappingConfig, String propertyName) {
-      List<VertexMapping> matches = new ArrayList<>();
-
-      for(VertexMapping vm : mappingConfig.vertices().values()) {
-         if (vm.properties().containsKey(propertyName)) {
-            matches.add(vm);
-         }
-      }
-
-      return matches.size() == 1 ? matches.get(0) : null;
-   }
-
-   private VertexMapping resolveTargetVertexMapping(MappingConfig mappingConfig, EdgeMapping edgeMapping, boolean outDirection) {
-      if (mappingConfig.vertices().size() == 1) {
-         return mappingConfig.vertices().values().iterator().next();
-      } else {
-         String targetCol = outDirection ? edgeMapping.inColumn() : edgeMapping.outColumn();
-         String stem = targetCol.replaceAll("_id$", "").replaceAll("^.*_", "");
-
-         // Pass 1: match stem against unqualified vertex table name (last '.' or '_' segment).
-         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
-            String rawTable = entry.getValue().table();
-            String unqualified = rawTable.contains(".")
-                    ? rawTable.substring(rawTable.lastIndexOf('.') + 1)
-                    : rawTable.replaceAll("^[a-z]+_", "");
-            if (unqualified.equals(stem) || unqualified.startsWith(stem)) {
-               return entry.getValue();
-            }
-         }
-
-         // Pass 2: match stem against vertex label key (e.g. stem "bank" matches label "Bank").
-         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
-            if (entry.getKey().equalsIgnoreCase(stem)) {
-               return entry.getValue();
-            }
-         }
-
-         // Pass 3: exact idColumn match.
-         for (VertexMapping vm : mappingConfig.vertices().values()) {
-            if (targetCol.equals(vm.idColumn())) {
-               return vm;
-            }
-         }
-
-         // Pass 4: for generic column names (e.g. in_id / out_id), derive a target hint from
-         // the edge table name itself.  "aml.account_bank" → last token "bank" → label "Bank".
-         // "aml.bank_country" → last token "country" → label "Country".
-         String edgeTable = edgeMapping.table();
-         String edgeTableBase = edgeTable.contains(".")
-                 ? edgeTable.substring(edgeTable.lastIndexOf('.') + 1)
-                 : edgeTable;
-         String[] edgeParts = edgeTableBase.split("_");
-         // For out direction the target is the tail token; for in direction it's the head token.
-         String edgeStem = outDirection
-                 ? edgeParts[edgeParts.length - 1]
-                 : edgeParts[0];
-         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
-            if (entry.getKey().equalsIgnoreCase(edgeStem)) {
-               return entry.getValue();
-            }
-         }
-         // Also try matching the vertex unqualified table name against the edge stem.
-         for (Map.Entry<String, VertexMapping> entry : mappingConfig.vertices().entrySet()) {
-            String rawTable = entry.getValue().table();
-            String unqualified = rawTable.contains(".")
-                    ? rawTable.substring(rawTable.lastIndexOf('.') + 1)
-                    : rawTable.replaceAll("^[a-z]+_", "");
-            if (unqualified.startsWith(edgeStem)) {
-               return entry.getValue();
-            }
-         }
-
-         return null;
-      }
-   }
-
-   private String quoteAlias(String alias) {
-      return this.dialect.quoteIdentifier(alias);
-   }
-
-   private List<HasFilter> parseHasChain(String hasChain) {
-      List<HasFilter> filters = new ArrayList<>();
-      if (hasChain != null && !hasChain.isBlank()) {
-         Matcher m = HAS_CHAIN_ITEM.matcher(hasChain);
-
-         while(m.find()) {
-            filters.add(new HasFilter(m.group(1), m.group(2)));
-         }
-
-         return filters;
-      } else {
-         return filters;
-      }
-   }
-
-   private RepeatHopResult parseRepeatHop(String repeatBodyRaw) {
-      String text = repeatBodyRaw == null ? "" : repeatBodyRaw.trim();
-      boolean hasSimplePath = text.endsWith(".simplePath()");
-      if (hasSimplePath) {
-         text = text.substring(0, text.length() - ".simplePath()".length()).trim();
-      }
-
-      if (!text.endsWith(")")) {
-         throw new IllegalArgumentException("Only repeat(out(...)), repeat(in(...)), or repeat(both(...)) is supported");
-      } else {
-         String direction;
-         int openParenIndex;
-         if (text.startsWith("out(")) {
-            direction = "out";
-            openParenIndex = 3;
-         } else if (text.startsWith("in(")) {
-            direction = "in";
-            openParenIndex = 2;
-         } else {
-            if (!text.startsWith("both(")) {
-               throw new IllegalArgumentException("Only repeat(out(...)), repeat(in(...)), or repeat(both(...)) is supported");
-            }
-
-            direction = "both";
-            openParenIndex = 4;
-         }
-
-         String inner = text.substring(openParenIndex + 1, text.length() - 1).trim();
-         if (inner.isEmpty()) {
-            return new RepeatHopResult(new HopStep(direction, List.of()), hasSimplePath);
-         } else {
-            List<String> labels = this.splitArgs(inner).stream().map(this::unquote).toList();
-            return new RepeatHopResult(new HopStep(direction, labels), hasSimplePath);
-         }
-      }
-   }
-
-   private boolean normalizeEndpointHop(String endpointStep, List<HopStep> hops) {
-      if (hops.isEmpty()) {
-         return true;
-      } else {
-         if (hops.size() > 1) {
-            HopStep beforePrevious = hops.get(hops.size() - 2);
-            if ("outV".equals(beforePrevious.direction()) || "inV".equals(beforePrevious.direction())) {
-               return true;
-            }
-         }
-
-         HopStep previous = hops.get(hops.size() - 1);
-         if (!"outE".equals(previous.direction()) && !"inE".equals(previous.direction())) {
-            return true;
-         } else {
-            hops.remove(hops.size() - 1);
-            String normalized;
-            if ("outE".equals(previous.direction())) {
-               normalized = "inV".equals(endpointStep) ? "out" : "in";
-            } else {
-               normalized = "inV".equals(endpointStep) ? "in" : "out";
-            }
-
-            hops.add(new HopStep(normalized, previous.labels()));
-            return false;
-         }
-      }
-   }
-
-   private WhereClause parseWhere(String rawWhere) {
-      Matcher neqMatcher = WHERE_NEQ_PATTERN.matcher(rawWhere);
-      if (neqMatcher.matches()) {
-         return new WhereClause(GremlinSqlTranslator.WhereKind.NEQ_ALIAS, neqMatcher.group(1), neqMatcher.group(2), List.of());
-      } else {
-         Matcher eqAliasMatcher = WHERE_EQ_ALIAS_PATTERN.matcher(rawWhere);
-         if (eqAliasMatcher.matches()) {
-            return new WhereClause(GremlinSqlTranslator.WhereKind.EQ_ALIAS, eqAliasMatcher.group(1), null, List.of());
-         } else {
-            Matcher gtMatcher = WHERE_SELECT_IS_GT_PATTERN.matcher(rawWhere);
-            if (gtMatcher.matches()) {
-               String alias = gtMatcher.group(1);
-               String value = gtMatcher.group(2).trim();
-               boolean isGte = rawWhere.contains(".is(gte(");
-               return new WhereClause(isGte ? GremlinSqlTranslator.WhereKind.PROJECT_GTE : GremlinSqlTranslator.WhereKind.PROJECT_GT, alias, value, List.of());
-            } else {
-               Matcher edgeExistsMatcher = WHERE_EDGE_EXISTS_PATTERN.matcher(rawWhere);
-               if (edgeExistsMatcher.matches()) {
-                  String direction = edgeExistsMatcher.group(1);
-                  String edgeLabel = edgeExistsMatcher.group(2);
-                  String hasChain = edgeExistsMatcher.group(3);
-                  return new WhereClause(GremlinSqlTranslator.WhereKind.EDGE_EXISTS, direction, edgeLabel, this.parseHasChain(hasChain));
-               } else {
-                  Matcher neighborMatcher = WHERE_OUT_NEIGHBOR_HAS_PATTERN.matcher(rawWhere);
-                  if (neighborMatcher.matches()) {
-                     String direction = neighborMatcher.group(1);
-                     String edgeLabel = neighborMatcher.group(2);
-                     String hasChain = neighborMatcher.group(3);
-                     WhereKind kind = "out".equals(direction) ? GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS : GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS;
-                     return new WhereClause(kind, direction, edgeLabel, this.parseHasChain(hasChain));
-                  } else {
-                     throw new IllegalArgumentException("Unsupported where() predicate: " + rawWhere);
-                  }
+               for (ProjectionField pf : projections) {
+                  if (pf.alias().equals(sf.alias()) && pf.kind() == ProjectionKind.EDGE_PROPERTY) { valuesProperty = pf.property(); break; }
                }
             }
          }
-      }
-   }
-
-   private static void ensureArgCount(String step, List<String> args, int expected) {
-      if (args.size() != expected) {
-         throw new IllegalArgumentException(step + " expects " + expected + " argument(s)");
-      }
-   }
-
-   private HasFilter parseHasArgument(String property, String rawValue) {
-      String trimmed = rawValue.trim();
-      Matcher m = HAS_PREDICATE_PATTERN.matcher(trimmed);
-      if (m.matches()) {
-         String predicate = m.group(1);
-         String innerVal = this.unquote(m.group(2).trim());
-         String var10000;
-         switch (predicate) {
-            case "gt" -> var10000 = ">";
-            case "gte" -> var10000 = ">=";
-            case "lt" -> var10000 = "<";
-            case "lte" -> var10000 = "<=";
-            case "neq" -> var10000 = "!=";
-            case "eq" -> var10000 = "=";
-            default -> var10000 = "=";
-         }
-
-         String operator = var10000;
-         return new HasFilter(property, innerVal, operator);
-      } else {
-         return new HasFilter(property, this.unquote(trimmed));
-      }
-   }
-
-   private GroupCountKeySpec tryParseGroupCountSelectKey(String rawExpr) {
-      if (rawExpr != null && !rawExpr.isBlank()) {
-         Matcher m = GROUP_COUNT_SELECT_BY_PATTERN.matcher(rawExpr.trim());
-         return m.matches() ? new GroupCountKeySpec(m.group(1), m.group(2)) : null;
-      } else {
-         return null;
-      }
-   }
-
-   private List<String> splitArgs(String argsText) {
-      List<String> args = new ArrayList<>();
-      StringBuilder current = new StringBuilder();
-      boolean inSingleQuote = false;
-      boolean inDoubleQuote = false;
-
-      for(int i = 0; i < argsText.length(); ++i) {
-         char c = argsText.charAt(i);
-         if (c == '\'' && !inDoubleQuote) {
-            inSingleQuote = !inSingleQuote;
-            current.append(c);
-         } else if (c == '"' && !inSingleQuote) {
-            inDoubleQuote = !inDoubleQuote;
-            current.append(c);
-         } else if (c == ',' && !inSingleQuote && !inDoubleQuote) {
-            args.add(current.toString().trim());
-            current.setLength(0);
-         } else {
-            current.append(c);
-         }
+         if (valuesProperty == null)
+            throw new IllegalArgumentException((meanRequested ? "mean()" : "sum()") + " requires values('property') before aggregation");
       }
 
-      if (!argsText.isBlank()) {
-         args.add(current.toString().trim());
-      }
-
-      return args;
+      return new ParsedTraversal(label, filters, valuesProperty, limit, preHopLimit, hops, countRequested, sumRequested, meanRequested, projections, groupCountProperty, orderByProperty, orderDirection, asAliases, selectFields, whereClause, dedupRequested, pathSeen, pathByProperties, whereByProperty, simplePathRequested, groupCountKeySpec, orderByCountDesc);
    }
 
-   private String unquote(String text) {
-      String trimmed = text.trim();
-      return (!trimmed.startsWith("\"") || !trimmed.endsWith("\"")) && (!trimmed.startsWith("'") || !trimmed.endsWith("'")) ? trimmed : trimmed.substring(1, trimmed.length() - 1);
-   }
+   // ── Inner types ───────────────────────────────────────────────────────────
 
-   private record RepeatHopResult(HopStep hop, boolean simplePathDetected) {
-   }
+   private record RepeatHopResult(HopStep hop, boolean simplePathDetected) {}
 
    private record HopStep(String direction, List<String> labels) {
       HopStep(String direction, String singleLabel) {
          this(direction, singleLabel == null ? List.of() : List.of(singleLabel));
       }
-
       String singleLabel() {
-         if (this.labels.isEmpty()) {
-            return null;
-         } else if (this.labels.size() > 1) {
-            throw new IllegalStateException("singleLabel() called on multi-label HopStep: " + this.labels);
-         } else {
-            return this.labels.get(0);
-         }
+         if (labels.isEmpty()) return null;
+         if (labels.size() > 1) throw new IllegalStateException("singleLabel() called on multi-label HopStep: " + labels);
+         return labels.get(0);
       }
    }
 
-   private record ParsedTraversal(String label, List<HasFilter> filters, String valueProperty, Integer limit, Integer preHopLimit, List<HopStep> hops, boolean countRequested, boolean sumRequested, boolean meanRequested, List<ProjectionField> projections, String groupCountProperty, String orderByProperty, String orderDirection, List<AsAlias> asAliases, List<SelectField> selectFields, WhereClause whereClause, boolean dedupRequested, boolean pathSeen, List<String> pathByProperties, String whereByProperty, boolean simplePathRequested, GroupCountKeySpec groupCountKeySpec, boolean orderByCountDesc) {
-   }
+   private record ParsedTraversal(
+         String label, List<HasFilter> filters, String valueProperty,
+         Integer limit, Integer preHopLimit, List<HopStep> hops,
+         boolean countRequested, boolean sumRequested, boolean meanRequested,
+         List<ProjectionField> projections, String groupCountProperty,
+         String orderByProperty, String orderDirection, List<AsAlias> asAliases,
+         List<SelectField> selectFields, WhereClause whereClause,
+         boolean dedupRequested, boolean pathSeen, List<String> pathByProperties,
+         String whereByProperty, boolean simplePathRequested,
+         GroupCountKeySpec groupCountKeySpec, boolean orderByCountDesc) {}
 
-   private record GroupCountKeySpec(String alias, String property) {
-   }
+   private record GroupCountKeySpec(String alias, String property) {}
 
-   private record ChooseProjectionSpec(String property, String predicate, String predicateValue, String trueConstant, String falseConstant) {
-   }
+   private record ChooseProjectionSpec(String property, String predicate, String predicateValue, String trueConstant, String falseConstant) {}
 
    private enum ProjectionKind {
-      EDGE_PROPERTY,
-      OUT_VERTEX_PROPERTY,
-      IN_VERTEX_PROPERTY,
-      EDGE_DEGREE,
-      OUT_VERTEX_COUNT,
-      IN_VERTEX_COUNT,
-      OUT_NEIGHBOR_PROPERTY,
-      IN_NEIGHBOR_PROPERTY,
-      CHOOSE_VALUES_IS_CONSTANT;
-
-      ProjectionKind() {
-      }
-
+      EDGE_PROPERTY, OUT_VERTEX_PROPERTY, IN_VERTEX_PROPERTY,
+      EDGE_DEGREE, OUT_VERTEX_COUNT, IN_VERTEX_COUNT,
+      OUT_NEIGHBOR_PROPERTY, IN_NEIGHBOR_PROPERTY, CHOOSE_VALUES_IS_CONSTANT
    }
 
-   private record ProjectionField(String alias, ProjectionKind kind, String property) {
-   }
+   private record ProjectionField(String alias, ProjectionKind kind, String property) {}
 
-   private record AsAlias(String label, int hopIndexAfter) {
-   }
+   private record AsAlias(String label, int hopIndexAfter) {}
 
-   private record SelectField(String alias, String property) {
-   }
+   private record SelectField(String alias, String property) {}
 
-   private record WhereClause(WhereKind kind, String left, String right, List<HasFilter> filters) {
-   }
+   private record WhereClause(WhereKind kind, String left, String right, List<HasFilter> filters) {}
 
    private enum WhereKind {
-      NEQ_ALIAS,
-      EQ_ALIAS,
-      PROJECT_GT,
-      PROJECT_GTE,
-      EDGE_EXISTS,
-      OUT_NEIGHBOR_HAS,
-      IN_NEIGHBOR_HAS;
-
-      WhereKind() {
-      }
-
+      NEQ_ALIAS, EQ_ALIAS, PROJECT_GT, PROJECT_GTE, EDGE_EXISTS, OUT_NEIGHBOR_HAS, IN_NEIGHBOR_HAS
    }
 }

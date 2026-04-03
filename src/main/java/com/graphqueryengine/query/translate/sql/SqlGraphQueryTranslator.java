@@ -42,6 +42,15 @@ public class SqlGraphQueryTranslator implements GraphQueryTranslator {
         };
     }
 
+    @Override
+    public TranslationResult translateWithPlan(String gremlin, MappingConfig mappingConfig) {
+        GremlinParseResult parsed = parser.parse(gremlin);
+        return switch (mode) {
+            case ICEBERG -> translateIcebergWithPlan(parsed, mappingConfig);
+            case STANDARD -> translateStandardWithPlan(parsed, mappingConfig);
+        };
+    }
+
     protected TranslationResult translateStandard(GremlinParseResult parsed, MappingConfig mappingConfig) {
         if (looksLikeCatalogQualifiedMapping(mappingConfig)) {
             return icebergFallbackDelegate.translate(parsed, mappingConfig);
@@ -49,8 +58,19 @@ public class SqlGraphQueryTranslator implements GraphQueryTranslator {
         return delegate.translate(parsed, mappingConfig);
     }
 
+    protected TranslationResult translateStandardWithPlan(GremlinParseResult parsed, MappingConfig mappingConfig) {
+        if (looksLikeCatalogQualifiedMapping(mappingConfig)) {
+            return icebergFallbackDelegate.translateWithPlan(parsed, mappingConfig);
+        }
+        return delegate.translateWithPlan(parsed, mappingConfig);
+    }
+
     protected TranslationResult translateIceberg(GremlinParseResult parsed, MappingConfig mappingConfig) {
         return delegate.translate(parsed, mappingConfig);
+    }
+
+    protected TranslationResult translateIcebergWithPlan(GremlinParseResult parsed, MappingConfig mappingConfig) {
+        return delegate.translateWithPlan(parsed, mappingConfig);
     }
 
     private boolean looksLikeCatalogQualifiedMapping(MappingConfig mappingConfig) {

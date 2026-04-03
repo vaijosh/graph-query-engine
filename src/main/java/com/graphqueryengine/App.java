@@ -237,7 +237,12 @@ public class App {
             }
 
             try {
-                TranslationResult translationResult = translator.translate(request.gremlin(), selectedMapping.config());
+                // Check if caller requested planner-stage output via ?plan=true query param
+                boolean includePlan = parseEnabledFlag(ctx.queryParam("plan"), false);
+                TranslationResult translationResult = includePlan
+                        ? translator.translateWithPlan(request.gremlin(), selectedMapping.config())
+                        : translator.translate(request.gremlin(), selectedMapping.config());
+
                 if (isSqlTraceEnabledForRequest(ctx)) {
                     logSqlTranslation("/query/explain", request.gremlin(), translationResult);
                 } else {
@@ -248,7 +253,8 @@ public class App {
                         translationResult.sql(),
                         translationResult.parameters(),
                         "SQL_EXPLAIN",
-                        "This endpoint shows SQL translation for reference. Use /gremlin/query for actual execution. mappingId=" + selectedMapping.id()
+                        "This endpoint shows SQL translation for reference. Use /gremlin/query for actual execution. mappingId=" + selectedMapping.id(),
+                        translationResult.plan()
                 );
                 ctx.json(explanation);
             } catch (IllegalArgumentException ex) {
