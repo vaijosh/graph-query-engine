@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 
@@ -47,7 +49,7 @@ def split_sql_statements(sql_text: str) -> list[str]:
     return statements
 
 
-def run_statement(statement: str, server: str, container: str) -> None:
+def run_statement(statement: str, server: str, container: str, idx: int, total: int) -> None:
     cmd = [
         "docker",
         "exec",
@@ -58,13 +60,24 @@ def run_statement(statement: str, server: str, container: str) -> None:
         "--execute",
         statement,
     ]
+    first_line = statement.splitlines()[0][:80]
+    print(f"[{idx}/{total}] {first_line}...", end=" ", flush=True)
+    sys.stdout.flush()
+
+    t0 = time.time()
     proc = subprocess.run(cmd, text=True, capture_output=True)
-    if proc.stdout:
-        print(proc.stdout.rstrip())
+    elapsed = time.time() - t0
+
     if proc.returncode != 0:
+        print(f"FAILED ({elapsed:.1f}s)")
         if proc.stderr:
             print(proc.stderr.rstrip())
         raise RuntimeError("Trino statement execution failed")
+
+    print(f"OK ({elapsed:.1f}s)")
+    if proc.stdout and proc.stdout.strip():
+        print(f"  → {proc.stdout.rstrip()[:100]}")
+    sys.stdout.flush()
 
 
 def main() -> None:
@@ -84,13 +97,15 @@ def main() -> None:
         print(f"No SQL statements found in: {sql_path}")
         return
 
-    print(f"Executing {len(statements)} SQL statements from {sql_path}")
-    for idx, statement in enumerate(statements, start=1):
-        first_line = statement.splitlines()[0][:80]
-        print(f"[{idx}/{len(statements)}] {first_line}")
-        run_statement(statement, server=args.server, container=args.container)
+    print(f"Executing {len(statements)} SQL statements from {sql_path}\n")
+    sys.stdout.flush()
+    t_start = time.time()
 
-    print("All statements executed successfully.")
+    for idx, statement in enumerate(statements, start=1):
+        run_statement(statement, server=args.server, container=args.container, idx=idx, total=len(statements))
+
+    total_time = time.time() - t_start
+    print(f"\nAll {len(statements)} statements executed successfully in {total_time:.1f}s.")
 
 
 if __name__ == "__main__":

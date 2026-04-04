@@ -102,45 +102,270 @@ def run_aml_data_download(variant: str = "HI-Small", rows: int = 100000) -> bool
     return proc.returncode == 0
 
 
-def resolve_csv_path() -> str | None:
+def resolve_raw_source_csv() -> str | None:
     candidates = [
-        Path.cwd() / "demo/data/aml-demo.csv",
         Path.cwd() / "demo/data/HI-Small_Trans.csv",
-        Path.cwd() / "data/aml-normalized.csv",
-        Path.cwd() / "data/aml-demo.csv",
-        Path.cwd() / "aml-demo.csv",
+        Path.cwd() / "data/HI-Small_Trans.csv",
     ]
     for p in candidates:
         if p.exists():
             return str(p)
 
-    # Fallback to any normalized or raw transaction CSV in demo/data.
     demo_data = Path.cwd() / "demo/data"
     if demo_data.exists():
-        for pat in ["*aml*.csv", "*Trans.csv"]:
-            matches = sorted(demo_data.glob(pat))
-            if matches:
-                return str(matches[0])
+        matches = sorted(demo_data.glob("HI-*_Trans.csv"))
+        if matches:
+            return str(matches[0])
     return None
 
 
-CSV_PATH = resolve_csv_path()
+def normalized_csv_path() -> str:
+    return str(Path.cwd() / "demo/data/aml-demo.csv")
+
+
+def _count_rows_upto(csv_path: str, max_rows: int) -> int:
+    import csv
+    rows = 0
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for _ in reader:
+            rows += 1
+            if rows >= max_rows:
+                break
+    return rows
+
+
+def normalize_for_max_rows(src_csv: str, max_rows: int) -> str | None:
+    out_csv = normalized_csv_path()
+    normalize_py = REPO_ROOT / "scripts/normalize_aml.py"
+    if not normalize_py.exists():
+        display(Markdown(f"**normalize_aml.py missing:** `{normalize_py}`"))
+        return None
+
+    cmd = [
+        "python3",
+        str(normalize_py),
+        "--src",
+        str(src_csv),
+        "--dst",
+        str(out_csv),
+        "--rows",
+        str(max_rows),
+    ]
+    display(Markdown(f"Preparing normalized CSV for MAX_ROWS via: `{ ' '.join(cmd) }`"))
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout)
+    if proc.stderr:
+        print(proc.stderr)
+    if proc.returncode != 0:
+        return None
+    return out_csv if Path(out_csv).exists() else None
+
+
+def resolve_mapping_path() -> str | None:
+    candidates = [
+        Path.cwd() / "mappings/aml-mapping.json",
+        Path.cwd() / "demo/mappings/aml-mapping.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+CSV_PATH = normalized_csv_path() if Path(normalized_csv_path()).exists() else None
+RAW_SOURCE_CSV = resolve_raw_source_csv()
+MAPPING_PATH = resolve_mapping_path()
 print("BASE_URL:", BASE_URL)
 print("CSV_PATH:", CSV_PATH)
+print("RAW_SOURCE_CSV:", RAW_SOURCE_CSV)
+print("MAPPING_PATH:", MAPPING_PATH)
 print("MAX_ROWS:", MAX_ROWS)
+
+
+def try_upload_mapping() -> bool:
+    if not MAPPING_PATH:
+        display(Markdown("**AML mapping not found.** Expected `mappings/aml-mapping.json` or `demo/mappings/aml-mapping.json`."))
+        return False
+
+    try:
+        with open(MAPPING_PATH, "rb") as mapping_file:
+            mapping_resp = requests.post(
+                f"{BASE_URL}/mapping/upload",
+                files={"file": mapping_file},
+                timeout=30,
+            )
+    except Exception as e:
+        display(Markdown(f"**Mapping upload failed:** {e}"))
+        return False
+
+    if mapping_resp.status_code not in (200, 201):
+        display(Markdown(f"**Mapping upload failed** (`HTTP {mapping_resp.status_code}`):"))
+        print(mapping_resp.text)
+        return False
+
+    print(mapping_resp.json())
+    return True
+
+
+def get_account_count() -> int | None:
+    try:
+        count_resp = requests.post(
+            f"{BASE_URL}/gremlin/query",
+            json={"gremlin": "g.V().hasLabel('Account').count()"},
+            timeout=30,
+        )
+        if count_resp.status_code != 200:
+            display(Markdown(f"**Data verification failed** (`HTTP {count_resp.status_code}`):"))
+            print(count_resp.text)
+            return None
+
+        payload = count_resp.json()
+        values = payload.get("results") or []
+        if not values:
+            return 0
+        return int(values[0])
+    except Exception as e:
+        display(Markdown(f"**Data verification error:** {e}"))
+        return None
+
+
+def get_transfer_count() -> int | None:
+    try:
+        count_resp = requests.post(
+            f"{BASE_URL}/gremlin/query",
+            json={"gremlin": "g.E().hasLabel('TRANSFER').count()"},
+            timeout=30,
+        )
+        if count_resp.status_code != 200:
+            display(Markdown(f"**Transfer count check failed** (`HTTP {count_resp.status_code}`):"))
+            print(count_resp.text)
+            return None
+
+        payload = count_resp.json()
+        values = payload.get("results") or []
+        if not values:
+            return 0
+        return int(values[0])
+    except Exception as e:
+        display(Markdown(f"**Transfer count check error:** {e}"))
+        return None
+
+
+def count_csv_rows(csv_path: str, max_rows: int) -> int:
+    return _count_rows_upto(csv_path, max_rows)
+
+
+def run_aml_loader_script(csv_path: str, max_rows: int) -> bool:
+    if not MAPPING_PATH:
+        display(Markdown("**AML mapping not found.** Expected `mappings/aml-mapping.json` or `demo/mappings/aml-mapping.json`."))
+        return False
+
+    if not REPO_ROOT.exists():
+        display(Markdown(f"**Error:** repo path not found: `{REPO_ROOT}`"))
+        return False
+
+    cmd = [
+        "python3",
+        "demo/aml_csv_loader.py",
+        "--path",
+        str(csv_path),
+        "--max-rows",
+        str(max_rows),
+        "--url",
+        BASE_URL,
+        "--mapping",
+        str(MAPPING_PATH),
+    ]
+    display(Markdown(f"Running loader script: `{ ' '.join(cmd) }`"))
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout)
+    if proc.stderr:
+        print(proc.stderr)
+    return proc.returncode == 0
+
+
+def ensure_csv_present(auto_download: bool = True, max_rows: int = 100_000) -> str | None:
+    global CSV_PATH, RAW_SOURCE_CSV
+
+    if CSV_PATH and Path(CSV_PATH).exists():
+        existing = _count_rows_upto(CSV_PATH, max_rows)
+        if existing >= max_rows:
+            return CSV_PATH
+
+    if not RAW_SOURCE_CSV:
+        RAW_SOURCE_CSV = resolve_raw_source_csv()
+
+    if not RAW_SOURCE_CSV and auto_download:
+        ok = run_aml_data_download(variant="HI-Small", rows=max_rows)
+        if ok:
+            RAW_SOURCE_CSV = resolve_raw_source_csv()
+
+    if not RAW_SOURCE_CSV:
+        return None
+
+    prepared = normalize_for_max_rows(RAW_SOURCE_CSV, max_rows)
+    if prepared:
+        CSV_PATH = prepared
+    return CSV_PATH
+
+
+def ensure_aml_ready(auto_download: bool = True, max_rows: int = 100_000) -> None:
+    csv_path = ensure_csv_present(auto_download=auto_download, max_rows=max_rows)
+    if not csv_path:
+        display(Markdown("**CSV not found after download attempt.**"))
+        return
+
+    display(Markdown(f"CSV detected: `{csv_path}`"))
+
+    account_count = get_account_count()
+    if account_count is None:
+        return
+
+    transfer_count = get_transfer_count()
+    if transfer_count is None:
+        return
+
+    expected_rows = count_csv_rows(csv_path, max_rows)
+    display(Markdown(f"CSV rows considered (up to MAX_ROWS): **{expected_rows}**"))
+    display(Markdown(f"Current graph TRANSFER edges: **{transfer_count}**"))
+
+    if transfer_count == expected_rows and expected_rows > 0:
+        # Keep mapping in sync for query/explain even when data already exists.
+        try_upload_mapping()
+        display(Markdown(f"AML data already loaded and up-to-date (`TRANSFER={transfer_count}`)."))
+        return
+
+    display(Markdown("Dataset not loaded (or row count mismatch); running AML loader script..."))
+    loaded = run_aml_loader_script(csv_path, max_rows)
+    if not loaded:
+        display(Markdown("**Loader script failed.** Check output above."))
+        return
+
+    refreshed_accounts = get_account_count()
+    refreshed_transfers = get_transfer_count()
+    if refreshed_accounts is not None and refreshed_transfers is not None:
+        display(Markdown(
+            f"AML data load complete: **{refreshed_accounts}** Account vertices, "
+            f"**{refreshed_transfers}** TRANSFER edges."
+        ))
 """))
 
     cells.append(md("""
 ## Step 1: Prepare CSV (HI-Small)
 
-If `demo/data/aml-demo.csv` is missing, run this in terminal:
+Step 2 reuses existing `HI-Small_Trans.csv` and normalizes `aml-demo.csv` for the current `MAX_ROWS`.
+If raw HI-Small files are missing, run this in terminal:
 
 ```zsh
 cd ~/SourceCode/graph-query-engine
 bash ./scripts/download_aml_data.sh --variant HI-Small --rows 100000
 ```
 
-This downloads `HI-Small_Trans.csv` and creates normalized `demo/data/aml-demo.csv`.
+This downloads `HI-Small_Trans.csv` and prepares `demo/data/aml-demo.csv`.
 
 You can also run the helper below from notebook.
 """))
@@ -153,7 +378,8 @@ DOWNLOAD_ROWS = 100000
 if AUTO_RUN_DOWNLOAD:
     ok = run_aml_data_download(variant=DOWNLOAD_VARIANT, rows=DOWNLOAD_ROWS)
     if ok:
-        CSV_PATH = resolve_csv_path()
+        RAW_SOURCE_CSV = resolve_raw_source_csv()
+        CSV_PATH = normalize_for_max_rows(RAW_SOURCE_CSV, DOWNLOAD_ROWS) if RAW_SOURCE_CSV else None
         print("CSV_PATH refreshed:", CSV_PATH)
 else:
     print("Set AUTO_RUN_DOWNLOAD=True to run download + normalize from notebook.")
@@ -241,27 +467,10 @@ except Exception as e:
     display(Markdown(f"Health check failed: {e}"))
 """))
 
-    cells.append(md("## Step 2: Load AML CSV and Mapping"))
+    cells.append(md("## Step 2: Validate CSV, Upload Mapping, Verify Data"))
     cells.append(code("""
-if not CSV_PATH:
-    display(Markdown("**CSV not found.**"))
-    display(Markdown('''Expected one of:
-- `demo/data/aml-demo.csv`
-- `demo/data/HI-Small_Trans.csv`
-- `data/aml-normalized.csv`
-- `data/aml-demo.csv`'''))
-    display(Markdown('''Use:
-```zsh
-cd ~/SourceCode/graph-query-engine
-bash ./scripts/download_aml_data.sh --variant HI-Small --rows 100000
-```'''))
-else:
-    response = requests.post(
-        f"{BASE_URL}/admin/load-aml-csv",
-        params={"path": CSV_PATH, "maxRows": MAX_ROWS},
-        timeout=120,
-    )
-    print(response.json())
+AUTO_DOWNLOAD_IF_MISSING = True
+ensure_aml_ready(auto_download=AUTO_DOWNLOAD_IF_MISSING, max_rows=MAX_ROWS)
 """))
 
     cells.append(md("## Query Sections"))
@@ -300,8 +509,8 @@ Run first:
 This cell can run the local setup scripts directly:
 1. `bash ./scripts/iceberg_local_down.sh`
 2. `bash ./scripts/iceberg_local_up.sh`
-3. `bash ./scripts/iceberg_seed_trino.sh`
 
+Seeding is handled automatically later based on `MAX_ROWS`.
 `RUN_DOWN` defaults to `False` to avoid deleting volumes unless you opt in.
 """))
 
@@ -313,11 +522,10 @@ from IPython.display import display, Markdown
 REPO_ROOT = Path.home() / "SourceCode/graph-query-engine"
 RUN_DOWN = False
 RUN_UP = True
-RUN_SEED = True
 AUTO_RUN_SETUP = False
 
 
-def run_local_iceberg_setup(run_down: bool = False, run_up: bool = True, run_seed: bool = True) -> bool:
+def run_local_iceberg_setup(run_down: bool = False, run_up: bool = True) -> bool:
     if not REPO_ROOT.exists():
         display(Markdown(f"**Error:** repo path not found: `{REPO_ROOT}`"))
         return False
@@ -327,11 +535,9 @@ def run_local_iceberg_setup(run_down: bool = False, run_up: bool = True, run_see
         steps.append("bash ./scripts/iceberg_local_down.sh")
     if run_up:
         steps.append("bash ./scripts/iceberg_local_up.sh")
-    if run_seed:
-        steps.append("bash ./scripts/iceberg_seed_trino.sh")
 
     if not steps:
-        display(Markdown("No setup steps selected. Set one of `RUN_DOWN/RUN_UP/RUN_SEED` to `True`."))
+        display(Markdown("No setup steps selected. Set one of `RUN_DOWN` or `RUN_UP` to `True`."))
         return False
 
     display(Markdown(f"Running setup in `{REPO_ROOT}`"))
@@ -358,7 +564,7 @@ def run_local_iceberg_setup(run_down: bool = False, run_up: bool = True, run_see
 
 
 if AUTO_RUN_SETUP:
-    run_local_iceberg_setup(run_down=RUN_DOWN, run_up=RUN_UP, run_seed=RUN_SEED)
+    run_local_iceberg_setup(run_down=RUN_DOWN, run_up=RUN_UP)
 else:
     print("Set AUTO_RUN_SETUP=True and run this cell, or call run_local_iceberg_setup(...)")
 """))
@@ -375,11 +581,13 @@ from pathlib import Path
 BASE_URL = "http://localhost:7000"
 ICEBERG_MAPPING_PATH = str(Path.cwd() / "mappings/iceberg-local-mapping.json")
 ICEBERG_MAPPING_ID = "iceberg-local"
+MAX_ROWS = 100000
 TRINO_CONTAINER = "iceberg-trino"
 TRINO_SERVER = "http://localhost:8080"
 TRINO_CATALOG = "iceberg"
 TRINO_SCHEMA = "aml"
 SHOW_PLAN = False
+FORCE_RESEED = False
 """))
 
     cells.append(code("""
@@ -479,31 +687,199 @@ def run_trino(sql: str) -> pd.DataFrame:
     return pd.DataFrame(rows if rows else [{"result": "empty"}])
 
 
-def compare_sql_and_iceberg(title: str, gremlin: str):
-    display(Markdown(f"### {title}"))
-    display(Markdown(f"**Gremlin:** `{gremlin}`"))
-    ice_sql, ice_params, ice_err, ice_plan = get_iceberg_sql(gremlin, include_plan=SHOW_PLAN)
-    if not ice_sql:
-        if ice_err:
-            display(Markdown(f"*Iceberg SQL translation not available: {ice_err}*"))
+def resolve_raw_source_csv() -> str | None:
+    candidates = [
+        REPO_ROOT / "demo/data/HI-Small_Trans.csv",
+        REPO_ROOT / "data/HI-Small_Trans.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    demo_data = REPO_ROOT / "demo/data"
+    if demo_data.exists():
+        matches = sorted(demo_data.glob("HI-*_Trans.csv"))
+        if matches:
+            return str(matches[0])
+    return None
+
+
+def normalized_csv_path() -> str:
+    return str(REPO_ROOT / "demo/data/aml-demo.csv")
+
+
+def count_csv_rows(csv_path: str, max_rows: int) -> int:
+    import csv
+    rows = 0
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for _ in reader:
+            rows += 1
+            if rows >= max_rows:
+                break
+    return rows
+
+
+def prepare_csv_for_max_rows(auto_download: bool = True, max_rows: int = 100000) -> str | None:
+    raw_source = resolve_raw_source_csv()
+    if not raw_source and auto_download:
+        cmd = [
+            "bash",
+            "./scripts/download_aml_data.sh",
+            "--variant",
+            "HI-Small",
+            "--rows",
+            str(max_rows),
+        ]
+        display(Markdown(f"Downloading HI-Small dataset: `{ ' '.join(cmd) }`"))
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+        if proc.stdout:
+            print(proc.stdout)
+        if proc.stderr:
+            print(proc.stderr)
+        if proc.returncode == 0:
+            raw_source = resolve_raw_source_csv()
+
+    if not raw_source:
+        return None
+
+    out_csv = normalized_csv_path()
+    normalize_cmd = [
+        "python3",
+        str(REPO_ROOT / "scripts/normalize_aml.py"),
+        "--src",
+        str(raw_source),
+        "--dst",
+        str(out_csv),
+        "--rows",
+        str(max_rows),
+    ]
+    display(Markdown(f"Preparing normalized CSV for MAX_ROWS: `{ ' '.join(normalize_cmd) }`"))
+    proc = subprocess.run(normalize_cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout)
+    if proc.stderr:
+        print(proc.stderr)
+    if proc.returncode != 0:
+        return None
+    return out_csv if Path(out_csv).exists() else None
+
+
+def get_iceberg_transfer_count() -> int | None:
+    probe = run_trino("SELECT count(*) AS c FROM transfers")
+    if "error" in probe.columns:
+        return None
+    if "c" not in probe.columns or len(probe.index) == 0:
+        return 0
+    return int(probe.iloc[0]["c"])
+
+
+def run_iceberg_seed_script(csv_path: str, max_rows: int) -> bool:
+    cmd = [
+        "bash",
+        "./scripts/iceberg_seed_trino_files.sh",
+        "--csv",
+        str(csv_path),
+        "--rows",
+        str(max_rows),
+        "--format",
+        "csv",
+    ]
+    display(Markdown(f"Seeding Iceberg tables with **{max_rows:,}** rows (file-based load via Hive + object storage)..."))
+    display(Markdown("Real-time progress tracking with per-step timing:"))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+    return proc.wait() == 0
+
+
+def ensure_iceberg_seed_ready(auto_download: bool = True, max_rows: int = 100000) -> None:
+    csv_path = prepare_csv_for_max_rows(auto_download=auto_download, max_rows=max_rows)
+    if not csv_path:
+        display(Markdown("**Unable to prepare normalized CSV for Iceberg seeding.**"))
+        return
+
+    expected_rows = count_csv_rows(csv_path, max_rows)
+    current_rows = get_iceberg_transfer_count()
+
+    display(Markdown(f"CSV rows considered (up to MAX_ROWS): **{expected_rows}**"))
+    display(Markdown(f"Current Iceberg transfers rows: **{current_rows if current_rows is not None else 'unavailable'}**"))
+
+    if not FORCE_RESEED and current_rows is not None and current_rows == expected_rows and expected_rows > 0:
+        display(Markdown(f"Iceberg data already loaded and up-to-date (`transfers={current_rows}`)."))
+        return
+
+    seeded = run_iceberg_seed_script(csv_path, max_rows)
+    if not seeded:
+        display(Markdown("**Iceberg seeding failed.** Check output above."))
+        return
+
+    refreshed_rows = get_iceberg_transfer_count()
+    display(Markdown(f"Iceberg seeding complete. Transfers rows: **{refreshed_rows if refreshed_rows is not None else 'unavailable'}**"))
+
+
+def run_iceberg_query(gremlin_query: str, tx_mode: bool = False) -> Dict[str, Any]:
+    # tx_mode is accepted for shape parity with aml_demo notebook, but Iceberg path ignores it.
+    sql, params, err, plan = get_iceberg_sql(gremlin_query, include_plan=SHOW_PLAN)
+    return {
+        "gremlin": gremlin_query,
+        "icebergSql": sql,
+        "parameters": params,
+        "plan": plan,
+        "icebergError": err,
+    }
+
+
+def display_iceberg_result(gremlin: str, result: Dict[str, Any], title: str = "", limit: int = 10, tx_mode: bool = False):
+    if title:
+        display(Markdown(f"### {title}"))
+    display(Markdown("**Gremlin:**"))
+    display(Markdown(f"```groovy\\n{gremlin}\\n```"))
+
+    sql = result.get("icebergSql", "")
+    params = result.get("parameters", [])
+    plan = result.get("plan")
+    err = result.get("icebergError")
+
+    if not sql:
+        if err:
+            display(Markdown(f"*Iceberg SQL translation not available: {err}*"))
         else:
             display(Markdown("*Iceberg SQL translation not available for this query.*"))
         return
-    display(Markdown(f"```sql\\n{ice_sql}\\n```"))
-    if ice_params:
-        display(Markdown(f"**Parameters:** `{ice_params}`"))
-    if ice_plan:
+
+    display(Markdown("**Iceberg SQL Translation:**"))
+    display(Markdown(f"```sql\\n{sql}\\n```"))
+    if params:
+        display(Markdown(f"**Parameters:** `{params}`"))
+    if plan:
         display(Markdown("**Query Plan:**"))
-        display(Markdown(f"```json\\n{_json.dumps(ice_plan, indent=2)}\\n```"))
+        display(Markdown(f"```json\\n{_json.dumps(plan, indent=2)}\\n```"))
+
     try:
-        executable_sql = bind_sql_parameters(ice_sql, ice_params)
+        executable_sql = bind_sql_parameters(sql, params)
     except Exception as e:
         display(Markdown(f"*Failed to bind SQL parameters: {e}*"))
         return
-    display(run_trino(executable_sql))
+
+    trino_df = run_trino(executable_sql)
+    if "error" in trino_df.columns:
+        display(Markdown(f"**Error:** {trino_df.iloc[0]['error']}"))
+        return
+    display(trino_df.head(limit))
 
 
 upload_iceberg_mapping()
+AUTO_DOWNLOAD_IF_MISSING = True
+ensure_iceberg_seed_ready(auto_download=AUTO_DOWNLOAD_IF_MISSING, max_rows=MAX_ROWS)
 """))
 
     cells.append(md("""
@@ -566,7 +942,7 @@ def quick_verify_iceberg() -> bool:
             display(Markdown(f"  - detail: `{detail}`"))
 
     if not all_ok:
-        display(Markdown("**Action:** run `run_local_iceberg_setup(run_down=False, run_up=True, run_seed=True)` then retry."))
+        display(Markdown("**Action:** run `run_local_iceberg_setup(run_down=False, run_up=True)` then retry."))
     return all_ok
 
 
@@ -581,7 +957,11 @@ quick_verify_iceberg()
             current = q["section"]
             cells.append(md(f"## {current}"))
         cells.append(md(f"### {q['title']}\n\n{q['description']}"))
-        cells.append(code(f"""compare_sql_and_iceberg(\n    title={q['title']!r},\n    gremlin={q['gremlin']!r},\n)"""))
+        cells.append(code(f"""
+gremlin = {q['gremlin']!r}
+result = run_iceberg_query(gremlin, tx_mode={q['tx']})
+display_iceberg_result(gremlin, result, title={q['title']!r}, limit={q['limit']}, tx_mode={q['tx']})
+"""))
 
     cells.append(md("## Done"))
     return {"cells": cells, "metadata": notebook_metadata(), "nbformat": 4, "nbformat_minor": 5}

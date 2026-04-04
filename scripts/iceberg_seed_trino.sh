@@ -6,7 +6,7 @@ DEFAULT_SEED_SQL="$ROOT/infra/iceberg/sql/seed_aml_demo.sql"
 CSV_PATH="${ROOT}/demo/data/aml-demo.csv"
 MAX_ROWS="100000"
 SEED_SQL="$DEFAULT_SEED_SQL"
-GEN_SQL="$ROOT/infra/iceberg/sql/seed_aml_bulk_generated.sql"
+GEN_SQL="$ROOT/infra/iceberg/sql/seed_aml_generated.sql"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

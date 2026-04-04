@@ -71,15 +71,6 @@ Implemented in `App`.
 - `GET /mapping/status`
 - `POST /mapping/active?id=...`
 - `DELETE /mapping?id=...`
-
-### Admin/Seed Utilities
-
-- `POST /admin/seed-demo`
-- `POST /admin/seed-10hop`
-- `POST /admin/seed-10hop-tx`
-- `POST /admin/seed-gremlin-10hop-tx`
-- `POST /admin/load-aml-csv?path=...&maxRows=...`
-
 ---
 
 ## 4) Translator Selection and Modes
@@ -196,14 +187,16 @@ This is the preferred form for schemas that use generic column names (`out_id` /
 column-stem heuristics cannot determine the correct vertex type.
 
 ```json
-"BELONGS_TO": {
-  "table": "iceberg:aml.account_bank",
-  "idColumn": "id",
-  "outColumn": "out_id",
-  "inColumn":  "in_id",
-  "outVertexLabel": "Account",
-  "inVertexLabel":  "Bank",
-  "properties": {}
+{
+  "BELONGS_TO": {
+    "table": "iceberg:aml.account_bank",
+    "idColumn": "id",
+    "outColumn": "out_id",
+    "inColumn": "in_id",
+    "outVertexLabel": "Account",
+    "inVertexLabel": "Bank",
+    "properties": {}
+  }
 }
 ```
 

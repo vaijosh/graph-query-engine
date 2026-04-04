@@ -63,3 +63,5 @@ services:
       - "8080:8080"
     volumes:
       - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
+      - /tmp/seed:/tmp/seed:ro

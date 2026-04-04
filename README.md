@@ -33,10 +33,6 @@ mvn test                   # run all tests
 | `GET` | `/mapping/status` | Mapping store status |
 | `GET` | `/mappings` | List stored mappings |
 | `POST` | `/mapping/active` | Set active mapping (`?id=<id>`) |
-| `POST` | `/admin/seed-demo` | Seed demo data |
-| `POST` | `/admin/seed-10hop` | Seed 10-hop chain (SQL demo) |
-| `POST` | `/admin/seed-gremlin-10hop-tx` | Seed 10-hop chain (TinkerGraph) |
-| `POST` | `/admin/load-aml-csv` | Load AML CSV (`?path=…&maxRows=…`) |
 
 ## Mapping file format
 
@@ -168,8 +164,7 @@ Full TinkerPop semantics (including `cyclicPath`, `match`, etc.) are available v
 ## SQL explain mode
 
 ```bash
-# Seed + upload mapping, then explain any traversal
-curl -X POST http://localhost:7000/admin/seed-10hop
+# Upload mapping, then explain any traversal
 curl -X POST http://localhost:7000/mapping/upload \
   -F "file=@mappings/ten-hop-mapping.json"
 
@@ -177,6 +172,8 @@ curl -X POST http://localhost:7000/query/explain \
   -H "Content-Type: application/json" \
   -d '{"gremlin":"g.V(1).hasLabel(\"Node\").repeat(out(\"LINK\")).times(10)"}'
 ```
+
+For AML/Iceberg demo data setup, use scripts in `scripts/` and notebooks under the repository root.
 
 ```bash
 # Iceberg mapping example (uses mappings/iceberg-mapping.json)

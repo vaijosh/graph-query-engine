@@ -184,8 +184,8 @@ Get the active mapping (or the mapping specified by `X-Mapping-Id`).
   "mappingName": "AML Mapping",
   "active": true,
   "createdAt": "2026-03-30T11:13:55.061265Z",
-  "vertices": { ... },
-  "edges": { ... }
+  "vertices": {},
+  "edges": {}
 }
 ```
 
@@ -261,72 +261,6 @@ Delete a stored mapping. If the deleted mapping was active, the next available m
 
 ---
 
-## Admin / seeding
-
-### `POST /admin/load-aml-csv?path=<absolute-path>&maxRows=<n>`
-Load an AML transactions CSV into the TinkerGraph in-memory graph.
-
-| Param | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `path` | Yes | — | Absolute path to CSV file |
-| `maxRows` | No | `100000` | Maximum rows to load |
-
-**Response**
-```json
-{
-  "sourcePath": "/demo/data/aml-demo.csv",
-  "maxRows": 100000,
-  "rowsLoaded": 81352,
-  "accountsCreated": 12034,
-  "transfersCreated": 81352,
-  "provider": "tinkergraph"
-}
-```
-
-**Example**
-```bash
-curl -X POST "http://localhost:7000/admin/load-aml-csv?path=/absolute/path/to/aml-demo.csv&maxRows=50000"
-```
-
----
-
-### `POST /admin/seed-gremlin-10hop-tx`
-Seed the TinkerGraph in-memory graph with a linear chain:  
-11 `Account` vertices (`Acct-1` … `Acct-11`) connected by 10 `TRANSFER` edges.
-
-```json
-{"message": "Gremlin in-memory transaction graph reset"}
-```
-
----
-
-### `POST /admin/seed-10hop`
-Seed SQL tables `hop_nodes` (11 rows) and `hop_links` (10 rows) for use with `/query/explain`.
-
-```json
-{"message": "10-hop demo schema and chain records created"}
-```
-
----
-
-### `POST /admin/seed-10hop-tx`
-Seed SQL tables with transaction-flavored account data for 10-hop SQL demo.
-
-```json
-{"message": "10-hop transaction demo schema and records created"}
-```
-
----
-
-### `POST /admin/seed-demo`
-Seed SQL `people` and `knows` tables with basic demo data.
-
-```json
-{"message": "Demo schema and sample records created"}
-```
-
----
-
 ## Environment variables
 
 ### Service
@@ -356,7 +290,7 @@ Seed SQL `people` and `knows` tables with basic demo data.
 | `307` | Redirect (`/query` → `/gremlin/query`) |
 | `400` | Bad request (missing/invalid body, missing mapping) |
 | `404` | Not found (mapping ID does not exist) |
-| `500` | Server error (database failure, CSV load failure) |
+| `500` | Server error (database failure, unexpected runtime error) |
 
 ---
 

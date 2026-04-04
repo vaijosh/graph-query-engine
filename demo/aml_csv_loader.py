@@ -2,7 +2,7 @@
 aml_csv_loader.py
 -----------------
 Loads an AML transaction CSV file into the running Graph Query Engine by
-calling the /admin/load-aml-csv and /mapping/upload HTTP endpoints.
+calling /gremlin/query (mutation script) and /mapping/upload HTTP endpoints.
 
 Usage (from notebook):
     from demo.aml_csv_loader import AmlCsvLoader
@@ -28,7 +28,7 @@ import requests
 class AmlCsvLoader:
     """
     Loads an AML transaction CSV into the Graph Query Engine's in-memory
-    TinkerGraph by calling the /admin/load-aml-csv endpoint.
+    TinkerGraph by executing a Gremlin-Groovy mutation script via /gremlin/query.
     """
 
     def __init__(self, base_url: str = "http://localhost:7000", timeout: int = 300):
@@ -91,14 +91,15 @@ class AmlCsvLoader:
             print(f"📂  Loading CSV  : {resolved}")
             print(f"📏  File size    : {size_mb:.1f} MB")
             print(f"🔢  Max rows     : {max_rows:,}")
-            print(f"🌐  Endpoint     : {self.base_url}/admin/load-aml-csv")
+            print(f"🌐  Endpoint     : {self.base_url}/gremlin/query")
 
-        url = f"{self.base_url}/admin/load-aml-csv"
-        params = {"path": str(resolved), "maxRows": str(max_rows)}
+        url = f"{self.base_url}/gremlin/query"
+        gremlin_script = self._build_loader_script(str(resolved), max_rows)
+        payload = {"gremlin": gremlin_script}
 
         t0 = time.time()
         try:
-            response = requests.post(url, params=params, timeout=self.timeout)
+            response = requests.post(url, json=payload, timeout=self.timeout)
         except requests.exceptions.ConnectionError as exc:
             raise RuntimeError(
                 f"Could not connect to Graph Query Engine at {self.base_url}.\n"
@@ -112,13 +113,20 @@ class AmlCsvLoader:
             body = response.text or "<empty response>"
             raise RuntimeError(
                 f"Server returned HTTP {response.status_code} for "
-                f"POST /admin/load-aml-csv:\n{body}"
+                f"POST /gremlin/query (AML load script):\n{body}"
             )
 
-        stats: dict[str, Any] = response.json()
+        response_json: dict[str, Any] = response.json()
+        if "error" in response_json:
+            raise RuntimeError(f"Server error: {response_json['error']}")
 
-        if "error" in stats:
-            raise RuntimeError(f"Server error: {stats['error']}")
+        results = response_json.get("results") or []
+        if not results or not isinstance(results[0], dict):
+            raise RuntimeError(
+                "Unexpected load-script response shape from /gremlin/query; "
+                f"got: {response_json}"
+            )
+        stats = dict(results[0])
 
         if verbose:
             print(f"\n✅  Load complete ({elapsed:.1f}s)")
@@ -128,6 +136,230 @@ class AmlCsvLoader:
             print(f"   Provider         : {stats.get('provider', '?')}")
 
         return stats
+
+    @staticmethod
+    def _escape_groovy_string(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    def _build_loader_script(self, csv_path: str, max_rows: int) -> str:
+        path = self._escape_groovy_string(csv_path)
+        rows = int(max_rows)
+        return f"""
+import org.apache.commons.csv.CSVFormat
+import org.apache.commons.csv.CSVParser
+import org.apache.tinkerpop.gremlin.structure.Vertex
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.charset.StandardCharsets
+import java.util.Locale
+
+def csvPath = '{path}'
+def maxRows = {rows}
+
+g.E().drop().iterate()
+g.V().drop().iterate()
+
+def bankMap = [:]
+def accountMap = [:]
+def countryMap = [:]
+def txMap = [:]
+
+def belongsToSeen = [] as Set
+def locatedInSeen = [] as Set
+def sentViaSeen = [] as Set
+
+def COUNTRIES = [
+    ['US','United States','LOW','Americas','false'],
+    ['GB','United Kingdom','LOW','Europe','false'],
+    ['DE','Germany','LOW','Europe','false'],
+    ['CH','Switzerland','MEDIUM','Europe','false'],
+    ['HK','Hong Kong','MEDIUM','Asia','false'],
+    ['SG','Singapore','LOW','Asia','false'],
+    ['AE','UAE','MEDIUM','Middle East','false'],
+    ['NG','Nigeria','HIGH','Africa','false'],
+    ['KY','Cayman Islands','HIGH','Americas','true'],
+    ['PA','Panama','HIGH','Americas','true']
+]
+
+for (c in COUNTRIES) {{
+    def cv = g.addV('Country')
+        .property('countryCode', c[0])
+        .property('countryName', c[1])
+        .property('riskLevel', c[2])
+        .property('region', c[3])
+        .property('fatfBlacklist', c[4])
+        .next()
+    countryMap[c[0]] = cv
+}}
+
+def rowsLoaded = 0
+def alertsCreated = 0
+
+def fmt = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build()
+def reader = Files.newBufferedReader(Path.of(csvPath), StandardCharsets.UTF_8)
+def parser = fmt.parse(reader)
+
+try {{
+    for (rec in parser) {{
+        if (rowsLoaded >= maxRows) break
+
+        def fromBankId = rec.get('from_bank')
+        def fromAcctId = rec.get('from_account')
+        def toBankId = rec.get('to_bank')
+        def toAcctId = rec.get('to_account')
+        def amount = Double.parseDouble(rec.get('amount_paid'))
+        def currency = rec.get('payment_currency')
+        def rawFormat = (rec.isMapped('payment_format') && rec.isSet('payment_format')) ? rec.get('payment_format') : 'UNKNOWN'
+        def format = (rawFormat == null || rawFormat.trim().isEmpty()) ? 'UNKNOWN' : rawFormat
+        def ts = rec.get('timestamp')
+        def laundering = rec.get('is_laundering')
+        def txId = rec.get('transaction_id')
+        def channel = format.toLowerCase(Locale.ROOT).contains('wire') ? 'WIRE' : 'DIGITAL'
+
+        def fromCC = COUNTRIES[Math.floorMod(fromBankId.hashCode(), COUNTRIES.size())][0]
+        def toCC = COUNTRIES[Math.floorMod(toBankId.hashCode(), COUNTRIES.size())][0]
+
+        Vertex fromBank = bankMap[fromBankId]
+        if (fromBank == null) {{
+            fromBank = g.addV('Bank')
+                .property('bankId', fromBankId)
+                .property('bankName', 'Bank-' + fromBankId)
+                .property('countryCode', fromCC)
+                .property('swiftCode', 'SW' + fromBankId.toUpperCase())
+                .property('tier', String.valueOf(Math.floorMod(fromBankId.hashCode(), 3) + 1))
+                .next()
+            bankMap[fromBankId] = fromBank
+        }}
+
+        Vertex toBank = bankMap[toBankId]
+        if (toBank == null) {{
+            toBank = g.addV('Bank')
+                .property('bankId', toBankId)
+                .property('bankName', 'Bank-' + toBankId)
+                .property('countryCode', toCC)
+                .property('swiftCode', 'SW' + toBankId.toUpperCase())
+                .property('tier', String.valueOf(Math.floorMod(toBankId.hashCode(), 3) + 1))
+                .next()
+            bankMap[toBankId] = toBank
+        }}
+
+        def fromKey = fromBankId + ':' + fromAcctId
+        def toKey = toBankId + ':' + toAcctId
+        def suspicious = '1'.equals(laundering)
+
+        Vertex fromAcct = accountMap[fromKey]
+        if (fromAcct == null) {{
+            fromAcct = g.addV('Account')
+                .property('accountId', fromAcctId)
+                .property('bankId', fromBankId)
+                .property('accountType', Math.floorMod(fromAcctId.hashCode(), 2) == 0 ? 'CORPORATE' : 'PERSONAL')
+                .property('riskScore', suspicious ? '0.85' : '0.15')
+                .property('isBlocked', 'false')
+                .property('openedDate', '2020-01-01')
+                .next()
+            accountMap[fromKey] = fromAcct
+        }}
+
+        Vertex toAcct = accountMap[toKey]
+        if (toAcct == null) {{
+            toAcct = g.addV('Account')
+                .property('accountId', toAcctId)
+                .property('bankId', toBankId)
+                .property('accountType', Math.floorMod(toAcctId.hashCode(), 2) == 0 ? 'CORPORATE' : 'PERSONAL')
+                .property('riskScore', suspicious ? '0.75' : '0.10')
+                .property('isBlocked', 'false')
+                .property('openedDate', '2020-01-01')
+                .next()
+            accountMap[toKey] = toAcct
+        }}
+
+        Vertex txVertex = txMap[txId]
+        if (txVertex == null) {{
+            txVertex = g.addV('Transaction')
+                .property('transactionId', txId)
+                .property('amount', amount)
+                .property('currency', currency)
+                .property('paymentFormat', format)
+                .property('eventTime', ts)
+                .property('isLaundering', laundering)
+                .property('channel', channel)
+                .next()
+            txMap[txId] = txVertex
+        }}
+
+        fromAcct.addEdge('TRANSFER', toAcct,
+            'transactionId', txId,
+            'amount', amount,
+            'currency', currency,
+            'paymentFormat', format,
+            'eventTime', ts,
+            'isLaundering', laundering)
+
+        if (belongsToSeen.add(fromKey)) {{
+            fromAcct.addEdge('BELONGS_TO', fromBank,
+                'since', '2020-01-01',
+                'isPrimary', 'true')
+        }}
+        if (belongsToSeen.add(toKey)) {{
+            toAcct.addEdge('BELONGS_TO', toBank,
+                'since', '2020-01-01',
+                'isPrimary', 'true')
+        }}
+
+        Vertex fromCountryV = countryMap[fromCC]
+        Vertex toCountryV = countryMap[toCC]
+        if (fromCountryV != null && locatedInSeen.add(fromBankId)) {{
+            fromBank.addEdge('LOCATED_IN', fromCountryV, 'isHeadquarters', 'true')
+        }}
+        if (toCountryV != null && locatedInSeen.add(toBankId)) {{
+            toBank.addEdge('LOCATED_IN', toCountryV, 'isHeadquarters', 'true')
+        }}
+
+        fromAcct.addEdge('RECORDED_AS', txVertex,
+            'recordedAt', ts,
+            'source', 'CSV_LOAD')
+
+        if (toCountryV != null && sentViaSeen.add(fromKey + '->' + toCC)) {{
+            fromAcct.addEdge('SENT_VIA', toCountryV,
+                'channelType', format,
+                'routedAt', ts)
+        }}
+
+        if (suspicious) {{
+            def severity = amount > 50000 ? 'HIGH' : 'MEDIUM'
+            Vertex alert = g.addV('Alert')
+                .property('alertId', 'ALERT-' + txId)
+                .property('alertType', 'SUSPICIOUS_TRANSFER')
+                .property('severity', severity)
+                .property('status', 'OPEN')
+                .property('raisedAt', ts)
+                .next()
+            fromAcct.addEdge('FLAGGED_BY', alert,
+                'flaggedAt', ts,
+                'reason', 'Suspicious outbound transfer')
+            alertsCreated += 1
+        }}
+
+        rowsLoaded += 1
+    }}
+}} finally {{
+    parser.close()
+    reader.close()
+}}
+
+return [
+    rowsLoaded: rowsLoaded,
+    accountsCreated: accountMap.size(),
+    banksCreated: bankMap.size(),
+    countriesCreated: countryMap.size(),
+    transactionsCreated: txMap.size(),
+    alertsCreated: alertsCreated,
+    transfersCreated: rowsLoaded,
+    sourcePath: csvPath,
+    maxRows: maxRows,
+    provider: 'tinkergraph'
+]
+"""
 
     # ------------------------------------------------------------------
     # Convenience: also upload the AML mapping if not already active
