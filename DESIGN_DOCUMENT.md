@@ -137,6 +137,8 @@ The translator currently supports a substantial subset of traversal features inc
 - pathing (`repeat(...).times(n)`, `path().by(...)`, `simplePath()`)
 - ordering, limits, dedup, aliases/select, selected `where(...)` forms
 
+See **Section 17** for the full explicit capability matrix with SQL-mode support status for every recognized step.
+
 ### Notable Internal Strategies
 
 - Correlated subqueries for many projection/where patterns
@@ -338,8 +340,441 @@ Important env vars in current design:
 
 ## 16) Suggested Next Design Evolutions
 
-1. Add planner-stage debug output (structured plan JSON) before SQL rendering
-2. Expand grammar support for additional Gremlin steps in SQL mode with explicit capability matrix
-3. Introduce backend-specific SQL conformance tests (H2, Trino, DuckDB) from shared notebook workloads
-4. Add docs for translator invariants (aliasing, parameterization, join ordering) to stabilize future refactors
+1. Introduce backend-specific SQL conformance tests (H2, Trino, DuckDB) from shared notebook workloads
+2. Add docs for translator invariants (aliasing, parameterization, join ordering) to stabilize future refactors
 
+---
+
+## 17) SQL-Mode Capability Matrix
+
+This section is the authoritative reference for which Gremlin steps are supported in SQL translation mode (`/query/explain`, `?plan=true`).
+Native execution (`/gremlin/query`) supports the full TinkerPop step library regardless of this table.
+
+### Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| ✅ | Fully supported — translated to SQL |
+| ⚠️ | Partially supported — works in specific forms only (see notes) |
+| ❌ | Not supported in SQL mode — throws `IllegalArgumentException`; use `/gremlin/query` for native execution |
+
+---
+
+### Root steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `g.V()` | ✅ | Requires `hasLabel` when multiple vertex labels are mapped |
+| `g.E()` | ✅ | Requires `hasLabel` when multiple edge labels are mapped |
+| `g.V(id)` | ✅ | Translated to `WHERE id_column = ?` |
+
+---
+
+### Filter steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.hasLabel(l)` | ✅ | Resolves the root table via mapping |
+| `.has(k, v)` | ✅ | Equality filter; maps property name via mapping |
+| `.has(k, gt(v))` / `gte` / `lt` / `lte` / `neq` / `eq` | ✅ | Predicate forms translated to `>`, `>=`, `<`, `<=`, `!=`, `=` |
+| `.hasNot(k)` | ✅ | Translated to `IS NULL` |
+| `.hasId(id)` | ✅ | Translated to `WHERE id_column = ?` |
+| `.is(predicate)` | ⚠️ | Supported after `values('property')` and inside `where(select(…).is(gt/gte(n)))`. Example: `g.V().hasLabel('Person').values('age').is(gt(30)).limit(2)` → `SELECT age AS age FROM people WHERE age > ? LIMIT 2` |
+
+---
+
+### Traversal / hop steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.out(l)` | ✅ | Single or multiple labels; multi-label expands to UNION or LEFT JOINs |
+| `.in(l)` | ✅ | Same as `out` with reversed join direction |
+| `.both(l)` | ✅ | Expands to UNION of out-branch and in-branch |
+| `.outE(l)` | ✅ | Edge hop; combines with `.inV()`/`.outV()` or used standalone in projections |
+| `.inE(l)` | ✅ | Edge hop; combines with `.inV()`/`.outV()` or used standalone in projections |
+| `.outV()` | ✅ | Resolved against prior `inE`; or as vertex traversal from `g.E()` |
+| `.inV()` | ✅ | Resolved against prior `outE`; or as vertex traversal from `g.E()` |
+| `.bothE(l)` | ✅ | Supported as hop step and in `where(...)` correlated subquery predicates |
+| `.repeat(out/in/both(l)).times(n)` | ✅ | Expands to `n` JOIN hops; sequential label expansion when label count equals `n` |
+| `.until(…)` | ❌ | Conditional termination not translatable to SQL |
+| `.emit()` | ❌ | Not supported in SQL mode |
+| `.loops()` | ❌ | Not supported in SQL mode |
+
+---
+
+### Aggregation steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.count()` | ✅ | `COUNT(*)` or `COUNT(DISTINCT id)` with `dedup()` |
+| `.sum()` | ✅ | Requires preceding `values(p)`; emits `SUM(column)` |
+| `.mean()` | ✅ | Requires preceding `values(p)`; emits `AVG(column)` |
+| `.groupCount().by(p)` | ✅ | `SELECT col, COUNT(*) … GROUP BY col` |
+| `.groupCount().by(select(a).by(p))` | ✅ | Alias-keyed group-count with hop joins |
+| `.max()` / `.min()` | ❌ | Not supported in SQL mode |
+| `.fold()` | ⚠️ | Only as terminal in `by(out(l).values(p).fold())` neighbor-list projections |
+| `.unfold()` | ❌ | Not supported in SQL mode |
+
+---
+
+### Projection steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.values(p)` | ✅ | Projects a single property column |
+| `.project(a…).by(p)` | ✅ | Multi-field SELECT; each `by(…)` maps to a named column |
+| `.by(outV().values(p))` | ✅ | In `project`: fetches out-vertex property via JOIN |
+| `.by(inV().values(p))` | ✅ | In `project`: fetches in-vertex property via JOIN |
+| `.by(outE(l).count())` | ✅ | In `project`: correlated subquery for edge degree |
+| `.by(inE(l).count())` | ✅ | In `project`: correlated subquery for edge degree |
+| `.by(out(l).count())` / `in(l).count()` | ✅ | In `project`: correlated subquery counting connected vertices |
+| `.by(out(l).values(p).fold())` | ✅ | In `project`: aggregated neighbor property list (`STRING_AGG` or `ARRAY_JOIN`) |
+| `.by(choose(values(p).is(pred(v)), constant(a), constant(b)))` | ✅ | In `project`: `CASE WHEN … THEN … ELSE … END` |
+| `.elementMap()` | ❌ | Not supported in SQL mode |
+| `.valueMap()` | ✅ | Supported for root and hop traversals (mapping-backed property columns) |
+| `.properties()` | ❌ | Not supported in SQL mode |
+
+---
+
+### Ordering and paging steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.order().by(p)` | ✅ | `ORDER BY mapped_column ASC` |
+| `.order().by(p, Order.desc)` | ✅ | `ORDER BY mapped_column DESC` |
+| `.order().by(select(a), Order.asc\|desc)` | ✅ | Order by a projected alias |
+| `.order().by(values, desc)` | ✅ | Ordering a `groupCount` result by count descending |
+| `.limit(n)` | ✅ | Pre-hop or post-hop depending on position in traversal |
+| `.limit(scope, n)` | ⚠️ | Scope argument is accepted but ignored; treated as `limit(n)` |
+| `.range(lo, hi)` | ❌ | Not supported in SQL mode |
+| `.tail(n)` | ❌ | Not supported in SQL mode |
+| `.skip(n)` | ❌ | Not supported in SQL mode |
+
+---
+
+### Path / cycle steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.path().by(p)` | ✅ | Emits per-hop property columns (`prop0`, `prop1`, …) |
+| `.simplePath()` | ✅ | Adds `vN.id <> vM.id` / `NOT IN` WHERE conditions across hops |
+| `.cyclicPath()` | ❌ | Not supported in SQL mode |
+
+---
+
+### Dedup / identity steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.dedup()` | ✅ | `SELECT DISTINCT …` or `COUNT(DISTINCT id)` |
+| `.identity()` | ✅ | No-op traversal step; also supported in `project(...).by(identity())` |
+| `.sideEffect(…)` | ❌ | Not supported in SQL mode |
+
+---
+
+### Alias / select / where steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.as(label)` | ✅ | Records hop index for later `select`/`where` reference |
+| `.select(a…).by(p)` | ✅ | Projects aliased hop vertex columns |
+| `.where(a, neq(b))` | ✅ | `vX.id <> vY.id` or property-level neq with `.by(p)` |
+| `.where(eq(a))` | ✅ | `currentAlias.id = vX.id` |
+| `.where(outE\|inE\|bothE(l).has(…))` | ✅ | Correlated `EXISTS` subquery |
+| `.where(out\|in(l).has(…))` | ✅ | Correlated `EXISTS` with vertex JOIN |
+| `.where(select(a).is(gt\|gte(n)))` | ✅ | `HAVING`-style outer filter on projected alias |
+| `.where(and(…))` / `.where(or(…))` | ⚠️ | Supported for recursive composition of traversal-style `where` predicates (`outE/inE/bothE`, `out/in`) |
+| `.where(not(…))` | ⚠️ | Supported as `NOT (...)` for traversal-style `where` predicates |
+| `.not(…)` | ❌ | Standalone step form is not supported; use `where(not(...))` |
+| `.match(…)` | ❌ | Not supported in SQL mode |
+
+---
+
+### Branch / conditional steps
+
+| Step | SQL support | Notes |
+|------|-------------|-------|
+| `.choose(values(p).is(pred), constant(a), constant(b))` | ✅ | Only inside `project(…).by(choose(…))` |
+| `.choose(…)` (general) | ❌ | Not supported in SQL mode outside `project.by` |
+| `.coalesce(…)` | ❌ | Not supported in SQL mode |
+| `.optional(…)` | ❌ | Not supported in SQL mode |
+| `.union(…)` | ❌ | Not supported in SQL mode (internal UNIONs are generated for `both`/multi-label hops) |
+
+---
+
+### Unsupported / native-only steps
+
+All other TinkerPop steps — including `addV`, `addE`, `drop`, `property`, `inject`, `constant` (standalone), `math`, `barrier`, `subgraph`, `profile`, `explain`, `pageRank`, `peerPressure`, `shortestPath` — are **not** translated to SQL.
+These are available at full semantics via `/gremlin/query` (native TinkerGraph execution).
+
+See **Section 18** for a detailed implementation-effort analysis of every unsupported step.
+
+---
+
+## 18) Implementation Effort for Unsupported SQL-Mode Steps
+
+This section analyses the work required to bring each currently-unsupported (❌) or partially-supported (⚠️) step to full SQL translation.
+
+### How to read this section
+
+Every step is assessed against the three-layer pipeline:
+
+- **Layer 1 (Grammar/Parser)** — `Gremlin.g4` already accepts any `IDENT(args)` chain, so changes are only needed when a step's arguments contain anonymous traversals (`__.as(…)`) or bare integer lists that the current `nestedCall` rule does not surface correctly.
+- **Layer 2 (`parseSteps`)** — the `switch` in `GremlinSqlTranslator.parseSteps()` and the `ParsedTraversal` record fields that hold the new state.
+- **Layer 3 (SQL builders)** — `buildVertexSql`, `buildEdgeSql`, `buildHopTraversalSql`, `buildVertexProjectionSql`, and/or new builder methods that emit the SQL.
+
+**Complexity scale:** Low (< 1 day) · Medium (1–3 days) · High (3–7 days) · Very High / Incompatible (impractical without recursive SQL or application-side logic).
+
+---
+
+### Group A — Completing partially-supported steps (⚠️)
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.hasId(id)` | ✅ Implemented | Implemented in `parseSteps` and existing `id` filter emitters | N/A | **Done** | Covered by `translatesHasIdOnVertexRoot` |
+| `.hasNot(k)` | ✅ Implemented | Implemented with `IS NULL` operator sentinel in filters | N/A | **Done** | Covered by `translatesHasNotAsIsNullPredicate` |
+| `.is(pred)` | ⚠️ Partially implemented | Implemented for `values('p').is(pred(...))` and `where(select(...).is(...))` forms | N/A | **Partial** | Standalone/general `is(...)` forms outside value/select contexts remain unsupported |
+| `.bothE(l)` as hop | ✅ Implemented | Implemented as a first-class hop step | N/A | **Done** | Covered by `translatesBothEAsHopStep` |
+| `.limit(scope, n)` | `LIMIT n` (scope ignored) | Already accepted (2-arg form strips first arg) — behaviour is already correct | None | **Already done** | The scope argument (`Scope.local`) has no SQL analogue; document the limitation |
+
+---
+
+### Group B — Aggregation gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.max()` | `SELECT MAX(col)` | Add `maxRequested` boolean to `ParsedTraversal`; set in `"max"` switch case | Mirror the `sum`/`mean` path in all builders — emit `MAX(mapped_col) AS max` | **Low** | Requires `values(p)` before `max()` just like `sum()`; enforce same validation |
+| `.min()` | `SELECT MIN(col)` | Same as `max()` with `minRequested` flag | Emit `MIN(mapped_col) AS min` | **Low** | Same as `max()` |
+| `.unfold()` | No direct SQL equivalent | `unfold()` de-nests an in-memory list — in SQL context it only makes sense after a `fold()` result, which itself only appears in `project.by` sub-expressions | Would need to materialise the fold subquery as a lateral join or VALUES row-set — dialect-specific and not portable | **Very High** | Not practically mappable to portable SQL; recommend native execution |
+
+---
+
+### Group C — Projection gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.elementMap()` | `SELECT col1 AS 'prop1', col2 AS 'prop2', …` for all mapped properties | Add `elementMapRequested` boolean to `ParsedTraversal` | In builders: enumerate all `mapping.properties()` entries and emit `alias.col AS 'propName'` plus the id column; must handle vertex and edge cases separately | **Medium** | Output shape is a fixed-schema SQL row, not a true dynamic map; unmapped properties are silently omitted |
+| `.valueMap()` | ✅ Implemented | Implemented with mapping-backed SELECT list generation | N/A | **Done** | Covered by `translatesValueMapOnVertexRoot` and hop/edge paths |
+| `.properties()` | `SELECT col AS value, 'propName' AS key …` UNION per property | More complex — TinkerPop returns property _objects_; SQL would need one row per property | Requires UNION of per-column selects, one row per mapped property; impractical for multi-hop contexts | **High** | Very different result shape from all other steps; SQL result cannot carry TinkerPop `Property` semantics |
+
+---
+
+### Group D — Ordering and paging gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.range(lo, hi)` | `LIMIT (hi-lo) OFFSET lo` | Add `rangeOffset`/`rangeLimit` fields to `ParsedTraversal`; parse 2-arg form of `range()` | Add `appendOffset(sql, offset)` helper in all builders; extend `SqlDialect` interface with `offsetClause(int)` since H2/Trino/DuckDB syntax differs | **Medium** | `OFFSET` syntax varies across dialects — standard SQL uses `OFFSET n ROWS`, H2/Trino use `OFFSET n` |
+| `.skip(n)` | `OFFSET n` (no limit) | Add `skipOffset` to `ParsedTraversal`; set in `"skip"` case | Same `appendOffset` helper; emit only OFFSET with no LIMIT when `limit` is null | **Low** | Same dialect variation as `range()`; must not emit `LIMIT ALL` for dialects that require it |
+| `.tail(n)` | Subquery: `SELECT * FROM (SELECT * FROM t ORDER BY id DESC LIMIT n) _t ORDER BY id ASC` | Add `tailRequested`/`tailLimit` to `ParsedTraversal` | Wrap the entire query in a reversed-order subquery then re-sort ascending; fragile when no stable sort key is defined | **High** | Requires a stable ordering column; without one, SQL `DESC LIMIT n` does not guarantee last-n semantics — needs an explicit tie-break column from the mapping |
+
+---
+
+### Group E — Path and cycle gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.cyclicPath()` | `WHERE vN.id IN (v0.id, …, vN-1.id)` | Add `cyclicPathRequested` boolean; set in `"cyclicPath"` case; mutually exclusive with `simplePath` | In `buildHopTraversalSql` add a WHERE condition that is the logical negation of `simplePath` — current aliases already tracked | **Low** | Semantically `cyclicPath` is `NOT simplePath` — reuse the alias tracking already built for `simplePath`; must validate mutual exclusion |
+
+---
+
+### Group F — Identity and side-effect gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.identity()` | No-op — pass through unchanged | Add `"identity"` case that does nothing (`// no-op`) | None | **Low** | Purely cosmetic step; no SQL change needed |
+| `.barrier()` | No-op in SQL context — SQL is already set-oriented | Add `"barrier"` case that does nothing | None | **Low** | `barrier()` forces eager evaluation in TinkerPop lazy pipelines; SQL evaluation is already eager |
+| `.sideEffect(…)` | Not mappable — executes a traversal for mutation side effects while passing through the stream | Would need to parse the inner traversal argument as a sub-traversal, translate it, and execute it separately | Cannot be expressed as a single SQL statement; would require two separate queries | **Very High** | Fundamentally a two-statement pattern; not expressible as a pure SQL SELECT |
+
+---
+
+### Group G — Compound WHERE and matching gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.where(and(p1, p2, …))` | ✅ Implemented | Recursive `parseWhere()` support with predicate trees | N/A | **Done** | Covered by `translatesWhereAndPredicates` |
+| `.where(or(p1, p2, …))` | ✅ Implemented | Recursive `parseWhere()` support with predicate trees | N/A | **Done** | Covered by `translatesWhereOrPredicates` |
+| `.where(not(traversal))` | ✅ Implemented | Recursive `parseWhere()` support with predicate trees | N/A | **Done** | Covered by `translatesWhereNotPredicate` |
+| `.match(as, …)` | Multiple correlated subqueries joined on shared alias | Requires parsing multiple anonymous `__.as(l)…` sub-traversals; `__` is not currently handled by the parser | Each pattern becomes a correlated subquery or JOIN; shared aliases become join keys | **Very High** | The `__` anonymous traversal syntax requires grammar and parser changes; arbitrary pattern combinations are not always reducible to joins |
+
+---
+
+### Group H — Branch and conditional gaps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.coalesce(t1, t2)` | `COALESCE(expr1, expr2)` | Parse inner traversal arguments as sub-expressions (e.g., `values(p)` → column reference); add `coalesceExpressions` list to `ParsedTraversal` | In `buildVertexProjectionSql` or `buildHopTraversalSql` emit `COALESCE(col1, col2) AS alias` | **High** | Inner traversals must be simple `values(p)` or `constant(v)` steps — arbitrary inner traversals are not translatable |
+| `.optional(traversal)` | `LEFT JOIN` instead of `INNER JOIN` for the traversal | Parse inner traversal as a single hop; add `optionalHop` flag to `HopStep` | Change `JOIN` to `LEFT JOIN` in the hop join loop when `optionalHop=true`; handle NULLs in SELECT | **Medium** | Only works when the optional traversal is a single hop — nested optionals or multi-hop optionals are not tractable |
+| `.union(t1, t2, …)` | `SELECT … UNION ALL SELECT …` | Parse inner traversal arguments as sub-traversals; add `unionBranches` list to `ParsedTraversal` | Translate each branch separately and join with `UNION ALL`; wrap in outer SELECT if aggregation is needed | **High** | Each branch must be independently translatable; branches that share state with the outer traversal (aliased steps) require correlated rewriting |
+| `.choose(pred, t_true, t_false)` general | `CASE WHEN … THEN … ELSE … END` | Extend `parseChooseProjection` beyond the current `values().is()` / `constant()` limitation; accept branch sub-traversals | In `buildVertexProjectionSql` emit CASE WHEN expressions; simple property branches map to column references | **High** | Branches that are multi-step traversals (not just `constant()` or `values()`) require recursive translation |
+
+---
+
+### Group I — Mutation steps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `addV(label)` | `INSERT INTO vertex_table …` | Requires detecting `addV` at root level (not in `parseSteps` but at `parse()` root); add a new `MutationResult` response type | New `buildInsertVertexSql()` method; must populate `idColumn` and all provided `property()` arguments | **High** | `/query/explain` returns SELECT SQL only; mutations would need a new endpoint or response mode; transaction safety is out of scope for the SQL translate path |
+| `addE(label)` | `INSERT INTO edge_table …` | Same root-level detection as `addV` | New `buildInsertEdgeSql()`; requires `.from()` and `.to()` steps that have no current equivalents | **High** | Depends on `.from()`/`.to()` steps which are not in the current parse model at all |
+| `drop()` | `DELETE FROM table WHERE id = ?` | Add `dropRequested` boolean; currently only makes sense after a filter traversal | New `buildDeleteSql()` in both vertex and edge paths | **High** | SQL `DELETE` requires a well-defined filter; `g.V().drop()` with no filter would be `DELETE FROM table` — extremely dangerous; must require explicit id or property filter |
+| `.property(k, v)` | `UPDATE table SET col = ? WHERE id = ?` | Add `propertyUpdates` list to `ParsedTraversal`; set in `"property"` case | New `buildUpdateSql()` method | **High** | Same danger as `drop()` — an update without a filter is a full table update; must require filter before allowing property mutation |
+
+---
+
+### Group J — Analytics and other steps
+
+| Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
+|------|---------------|-----------------|-----------------|------------|----------|
+| `.pageRank()` | Not mappable — iterative algorithm; no standard SQL equivalent | N/A | Would require recursive CTEs with convergence logic — not portable | **Incompatible** | Graph algorithms requiring iterative convergence cannot be expressed in a single portable SQL query |
+| `.peerPressure()` | Not mappable — iterative community detection | N/A | Same as `pageRank` | **Incompatible** | Same as `pageRank` |
+| `.shortestPath()` | `WITH RECURSIVE cte AS (…)` | Would need recursive CTE support; add `shortestPathRequested` + source/target parameters | New `buildShortestPathSql()` emitting a recursive CTE; only works on databases that support `WITH RECURSIVE` (H2, PostgreSQL, DuckDB — not all Trino versions) | **Very High** | Recursive CTEs are not universally supported; depth-first vs. breadth-first semantics differ between SQL dialects |
+| `.inject(v…)` | `SELECT ? UNION ALL SELECT ?…` (literal row injection) | Add `"inject"` case; store injected values; valid only at root position | Emit a `VALUES (…)` or `SELECT … UNION ALL` literal rows query | **Medium** | `inject()` is only meaningful at the root or as a seed for traversal; combining injected IDs with subsequent hops requires a subquery seed |
+| `.constant(v)` standalone | `SELECT ? AS value` or used inside CASE WHEN | Standalone `constant()` outside `project.by` has no traversal context — would emit a single-literal SELECT | Emit `SELECT ? AS value` with the constant value as a parameter | **Low** | Useful mainly in `project.by(constant(…))` where it already works; standalone form has limited practical use |
+| `.math(expr)` | `SELECT (col1 + col2) AS result` etc. | Parse the expression string; map property references to column names; add `mathExpression` field | Emit the substituted arithmetic expression in the SELECT clause | **High** | Expression parsing requires a mini-expression parser to substitute `_` (current value) and property names with mapped SQL columns; precedence and type safety are not validated |
+| `.barrier()` | No-op | Add `"barrier"` case that does nothing | None | **Low** | SQL execution is already eager/set-oriented; `barrier()` is a TinkerPop pipeline hint with no SQL analogue |
+
+---
+
+## 19) Commercial Zero-ETL Graph DB Gremlin Parity Comparison
+
+A commercial zero-ETL graph database solution is a read-only graph analytics engine that translates Gremlin traversals to queries against external data sources (Iceberg, Delta Lake, JDBC, etc.) — the same core use case as this engine's SQL translation mode. This section compares the two implementations step-by-step.
+
+**Note:** The compared solution explicitly states it does not support Gremlin data manipulation (`addV`, `addE`, `drop`, `property`). Graph algorithms (PageRank, LPA, WCC, Louvain) are exposed via a separate `graph.program(…)` API and Cypher `CALL algo.paral.*` procedures — not as Gremlin steps.
+
+### Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| ✅ Both | Both engines support this step |
+| 🔷 commercial zero-ETL graph DB only | The commercial zero-ETL graph DB supports it; this engine does not in SQL mode |
+| 🔵 This engine only | This engine supports it in SQL mode; not documented by the commercial zero-ETL graph DB |
+| ❌ Neither | Neither engine supports this step in their SQL/translate mode |
+
+---
+
+### Traversal / hop steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `g.V()` / `g.E()` | ✅ Both | Core root steps |
+| `g.V(id)` | ✅ Both | The commercial zero-ETL graph DB uses `label[id]` format IDs |
+| `.out(l)` / `.in(l)` / `.both(l)` | ✅ Both | |
+| `.outE(l)` / `.inE(l)` / `.bothE(l)` | ✅ Both | `bothE` supported as full hop step and in `where()` |
+| `.outV()` / `.inV()` | ✅ Both | |
+| `.bothV()` | ✅ Both | Supported after `g.E()` (union of out/in endpoints) |
+| `.otherV()` | ✅ Both | Supported after `outE()/inE()` |
+| `.repeat(…).times(n)` | ✅ Both | This engine expands to fixed-depth JOINs |
+| `.until(…)` / `.emit()` | ❌ Neither | Variable-depth traversal is not expressible in plain SQL |
+
+---
+
+### Filter steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `.hasLabel(l)` | ✅ Both | |
+| `.has(k, v)` / `.has(k, pred(v))` | ✅ Both | Both support `gt`, `gte`, `lt`, `lte`, `neq`, `eq` predicates |
+| `.hasId(id)` | ✅ Both | Supported natively in SQL mode |
+| `.hasNot(k)` | ✅ Both | Supported via `IS NULL` predicates |
+| `.where(traversal)` | ✅ Both | commercial zero-ETL graph DB: `where(out('created'))`; this engine: edge-exist and neighbor-has correlated subquery forms |
+| `.where(and(t1, t2))` / `.where(or(t1, t2))` | ✅ Both | Supported for recursive composition of traversal-style `where` predicates |
+| `.where(not(traversal))` | ✅ Both | Supported as `NOT (...)` around traversal-style `where` predicates |
+| `.is(predicate)` | ⚠️ Partial parity | Supported for `values(...).is(...)` and `where(select(...).is(...))`; general standalone forms remain unsupported |
+
+---
+
+### Projection / map steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `.values(p)` | ✅ Both | |
+| `.valueMap()` | ✅ Both | Supported in SQL mode with mapping-backed property projection |
+| `.project(a…).by(p)` | ✅ Both | commercial zero-ETL graph DB shows `project('person','knowsCount','createdCount').by(identity()).by(out('knows').count()).by(out('created').count())` |
+| `.by(identity())` in `project` | ✅ Both | Supported for vertex and edge projections |
+| `.by(out(l).count())` in `project` | ✅ Both | commercial zero-ETL graph DB uses this pattern; this engine supports it as `OUT_VERTEX_COUNT` projection kind |
+| `.elementMap()` | ❌ Neither (documented) | Not mentioned in commercial zero-ETL graph DB docs; not in this engine |
+| `.path()` | ✅ Both | commercial zero-ETL graph DB shows full traversal path output |
+| `.path().by(p)` | 🔵 This engine only | This engine supports per-hop property extraction; commercial zero-ETL graph DB shows path without `by()` modulator |
+
+---
+
+### Aggregation steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `.count()` | ✅ Both | |
+| `.dedup()` | ✅ Both | |
+| `.groupCount().by(p)` | ✅ Both | |
+| `.sum()` / `.mean()` | 🔵 This engine only | Not documented by the commercial zero-ETL graph DB as supported Gremlin steps |
+| `.max()` / `.min()` | ❌ Neither (in SQL mode) | Neither engine documents these as SQL-translatable steps |
+| `.fold()` / `.unfold()` | ❌ Neither (general) | This engine supports `fold()` only inside `by(out(l).values(p).fold())`; commercial zero-ETL graph DB does not document them |
+
+---
+
+### Ordering and paging steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `.order().by(p)` / `.order().by(p, desc)` | ✅ Both | |
+| `.limit(n)` | ✅ Both | |
+| `.range(lo, hi)` / `.skip(n)` / `.tail(n)` | ❌ Neither | Not documented by the commercial zero-ETL graph DB; not in this engine's SQL mode |
+
+---
+
+### Alias / select / where steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `.as(l)` / `.select(l…)` | ✅ Both | commercial zero-ETL graph DB shows `as('creator').out('created').select('creator').dedup()` |
+| `.select(l).by(p)` | ✅ Both | |
+| `.where(a, neq(b))` / `.where(eq(a))` | 🔵 This engine only | commercial zero-ETL graph DB does not document these specific `where()` forms |
+| `.where(outE/inE/bothE(l).has(…))` | 🔵 This engine only | Edge-existence correlated subquery; not documented by the commercial zero-ETL graph DB |
+| `.where(select(a).is(gt/gte(n)))` | 🔵 This engine only | Projected-alias filter; not documented by the commercial zero-ETL graph DB |
+
+---
+
+### Utilities
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `.profile()` | 🔷 commercial zero-ETL graph DB only | The commercial zero-ETL graph DB surfaces a query execution profile; this engine has no equivalent (SQL trace logging is the closest analogue) |
+| `.identity()` | ✅ Both | Supported as no-op step and as `project(...).by(identity())` |
+| `.simplePath()` | 🔵 This engine only | Not documented by the commercial zero-ETL graph DB |
+| `.cyclicPath()` | ❌ Neither | |
+
+---
+
+### Mutation steps
+
+| Step | Status | Notes |
+|------|--------|-------|
+| `addV` / `addE` / `drop` / `property` | ❌ Neither | Both engines explicitly do not support Gremlin-based data manipulation. The commercial zero-ETL graph DB states this in its introduction; this engine routes mutation via native TinkerGraph execution only |
+
+---
+
+### Graph algorithms
+
+| Feature | commercial zero-ETL graph DB | This engine |
+|---------|-------------------|-------------|
+| PageRank | Via `graph.program(PageRankProgram…)` — separate API, not a Gremlin step | Not supported in SQL mode; available via TinkerGraph `pageRank()` step in native execution |
+| Label Propagation | Via `graph.program(…)` API | Not supported |
+| Weakly Connected Components | Via `graph.program(…)` API | Not supported |
+| Louvain | Via `graph.program(…)` API | Not supported |
+| Shortest Path | Not documented as a Gremlin step | Not supported in SQL mode |
+
+Both engines treat graph algorithms as out-of-band from the Gremlin step pipeline. The commercial zero-ETL graph DB exposes them via a dedicated Java/Cypher API; this engine exposes them via native TinkerGraph execution.
+
+---
+
+### Summary
+
+| Category | This engine ahead | commercial zero-ETL graph DB ahead | Parity |
+|----------|------------------|------------------------|--------|
+| Traversal hops | — | — | `out/in/both/outE/inE/bothE/outV/inV/bothV/otherV`, `repeat` |
+| Filters | `where(neq/eq/projectGt)` forms | standalone `and()/or()/not()` filter steps, standalone `is()` | `has()`, `hasLabel()`, `hasId()`, `hasNot()`, `where(traversal)` |
+| Projections | `by(outV/inV/edgeDegree/neighborFold/choose)`, `path().by(p)`, `sum/mean` | — | `project.by(p)`, `by(identity())`, `valueMap()`, `by(out.count)`, `as/select`, `dedup`, `count`, `order`, `limit` |
+| Utilities | — | `profile()` | `path()`, `identity()` |
+
+**Key remaining gaps for commercial zero-ETL graph DB parity:**
+1. Standalone filter steps `and(t1,t2)` / `or(t1,t2)` / `not(traversal)` outside `where(...)`
+2. Full standalone/general `is(predicate)` forms beyond `values(...).is(...)` and `where(select(...).is(...))`
+3. `profile()` equivalent in SQL-mode explain output

@@ -167,11 +167,11 @@ class GremlinSqlTranslatorTest {
         assertTrue(result.sql().contains("ON v1.id = e1.out_id"));
         assertEquals(2, result.parameters().size());
         assertEquals("1", result.parameters().get(0));
-        assertEquals("1", result.parameters().get(1));
-    }
+         assertEquals("1", result.parameters().get(1));
+     }
 
-    @Test
-    void translatesEdgeGroupCountWithOrder() {
+     @Test
+     void translatesEdgeGroupCountWithOrder() {
         MappingConfig mappingConfig = amlMapping();
 
         TranslationResult result = translator.translate(
@@ -180,7 +180,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT currency AS \"currency\", COUNT(*) AS count FROM aml_transfers GROUP BY currency ORDER BY \"currency\" DESC",
+                "SELECT currency AS \"currency\", COUNT(*) AS count FROM aml_transfers GROUP BY currency ORDER BY currency DESC",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -196,7 +196,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"outDegree\" FROM aml_accounts v ORDER BY \"outDegree\" DESC LIMIT 15",
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"outDegree\" FROM aml_accounts v ORDER BY outDegree DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -212,7 +212,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", (SELECT COUNT(*) FROM aml_transfers WHERE in_id = v.id) AS \"inDegree\" FROM aml_accounts v ORDER BY \"inDegree\" DESC LIMIT 10",
+                "SELECT v.account_id AS \"accountId\", (SELECT COUNT(*) FROM aml_transfers WHERE in_id = v.id) AS \"inDegree\" FROM aml_accounts v ORDER BY inDegree DESC LIMIT 10",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -259,7 +259,7 @@ class GremlinSqlTranslatorTest {
                 "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", " +
                 "(SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", " +
                 "(SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" " +
-                "FROM aml_accounts v ORDER BY \"suspiciousOut\" DESC LIMIT 15",
+                "FROM aml_accounts v ORDER BY suspiciousOut DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -307,10 +307,26 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT * FROM (SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" FROM aml_accounts v) p WHERE p.\"suspiciousOut\" > 0 ORDER BY \"suspiciousOut\" DESC LIMIT 15",
+                "SELECT * FROM (SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" FROM aml_accounts v) p WHERE p.\"suspiciousOut\" > 0 ORDER BY suspiciousOut DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesWhereOutECountIsZeroBareLiteral() {
+        MappingConfig mappingConfig = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').where(outE('TRANSFER').count().is(0)).project('accountId','bankId').by('accountId').by('bankId').limit(10)",
+                mappingConfig
+        );
+
+        assertEquals(
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\" FROM aml_accounts v WHERE (SELECT COUNT(*) FROM aml_transfers we WHERE we.out_id = v.id) = ? LIMIT 10",
+                result.sql()
+        );
+        assertEquals(List.of("0"), result.parameters());
     }
 
     @Test
@@ -916,6 +932,212 @@ class GremlinSqlTranslatorTest {
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesHasIdOnVertexRoot() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').hasId('A-1').values('accountId')",
+                mapping
+        );
+
+        assertEquals("SELECT account_id AS accountId FROM aml_accounts WHERE id = ?", result.sql());
+        assertEquals(List.of("A-1"), result.parameters());
+    }
+
+    @Test
+    void translatesHasNotAsIsNullPredicate() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').hasNot('bankId').count()",
+                mapping
+        );
+
+        assertEquals("SELECT COUNT(*) AS count FROM aml_accounts WHERE bank_id IS NULL", result.sql());
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesValueMapOnVertexRoot() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').valueMap().limit(2)",
+                mapping
+        );
+
+        assertTrue(result.sql().startsWith("SELECT "));
+        assertTrue(result.sql().contains("account_id AS \"accountId\""));
+        assertTrue(result.sql().contains("bank_id AS \"bankId\""));
+        assertTrue(result.sql().contains(" FROM aml_accounts LIMIT 2"));
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesEdgeBothVToUnionOfEndpoints() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.E().hasLabel('TRANSFER').has('isLaundering','1').bothV().limit(5)",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("UNION ALL"));
+        assertTrue(result.sql().contains("e.out_id"));
+        assertTrue(result.sql().contains("e.in_id"));
+        assertEquals(List.of("1", "1"), result.parameters());
+    }
+
+    @Test
+    void translatesProjectByIdentityOnVertices() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').project('id','accountId').by(identity()).by('accountId').limit(3)",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT v.id AS \"id\", v.account_id AS \"accountId\" FROM aml_accounts v LIMIT 3",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesValuesWithIsPredicate() {
+        MappingConfig mapping = sampleMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Person').values('age').is(gt(30)).limit(2)",
+                mapping
+        );
+
+        assertEquals("SELECT age AS age FROM people WHERE age > ? LIMIT 2", result.sql());
+        assertEquals(List.of("30"), result.parameters());
+    }
+
+    @Test
+    void translatesWhereAndPredicates() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').where(and(outE('TRANSFER').has('isLaundering','1'),inE('TRANSFER').has('currency','USD'))).count()",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("WHERE ("));
+        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?)"));
+        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.in_id = id AND we.currency = ?)"));
+        assertEquals(List.of("1", "USD"), result.parameters());
+    }
+
+    @Test
+    void translatesWhereOrPredicates() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').where(or(outE('TRANSFER').has('isLaundering','1'),inE('TRANSFER').has('currency','USD'))).count()",
+                mapping
+        );
+
+        assertTrue(result.sql().contains(" OR "));
+        assertTrue(result.sql().contains("we.is_laundering = ?"));
+        assertTrue(result.sql().contains("we.currency = ?"));
+        assertEquals(List.of("1", "USD"), result.parameters());
+    }
+
+    @Test
+    void translatesWhereNotPredicate() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').where(not(outE('TRANSFER').has('isLaundering','1'))).count()",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("WHERE NOT (EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?))"));
+        assertEquals(List.of("1"), result.parameters());
+    }
+
+    @Test
+    void translatesBothEAsHopStep() {
+        MappingConfig mapping = amlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').bothE('TRANSFER').has('isLaundering','1').values('currency').limit(5)",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("SELECT e1.currency AS currency"));
+        assertTrue(result.sql().contains("ON (e1.out_id = v0.id OR e1.in_id = v0.id)"));
+        assertTrue(result.sql().contains("WHERE e1.is_laundering = ?"));
+        assertTrue(result.sql().endsWith("LIMIT 5"));
+        assertEquals(List.of("1"), result.parameters());
+    }
+
+    @Test
+    void translatesOrderByPropertyWithOrderDescToken() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of("Account", new VertexMapping("aml_accounts", "id", Map.of(
+                        "riskScore", "risk_score"
+                ))),
+                Map.of("TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of()))
+        );
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').order().by('riskScore', Order.desc).values('riskScore').limit(10)",
+                mapping
+        );
+
+        assertEquals(
+                "SELECT risk_score AS riskScore FROM aml_accounts ORDER BY riskScore DESC LIMIT 10",
+                result.sql()
+        );
+        assertTrue(result.parameters().isEmpty());
+    }
+
+    @Test
+    void translatesHopProjectionUsingTerminalVertexMapping() {
+        MappingConfig mapping = fullAmlMapping();
+
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').limit(5).out('BELONGS_TO').project('bankId','bankName').by('bankId').by('bankName')",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("bank_id AS \"bankId\""));
+        assertTrue(result.sql().contains("bank_name AS \"bankName\""));
+        assertTrue(result.sql().contains("JOIN aml_belongs_to e1"));
+        assertTrue(result.sql().contains("JOIN aml_banks v1"));
+        assertTrue(result.sql().contains("LIMIT 5"));
+    }
+
+    @Test
+    void translatesEdgeOutVProjectionUsingEndpointVertexProperties() {
+        MappingConfig mapping = new MappingConfig(
+                Map.of(
+                        "Account", new VertexMapping("aml_accounts", "id", Map.of(
+                                "accountId", "account_id",
+                                "bankId", "bank_id"
+                        ))
+                ),
+                Map.of(
+                        "TRANSFER", new EdgeMapping("aml_transfers", "id", "out_id", "in_id", Map.of(), "Account", "Account")
+                )
+        );
+
+        TranslationResult result = translator.translate(
+                "g.E().hasLabel('TRANSFER').limit(5).outV().project('accountId','bankId').by('accountId').by('bankId')",
+                mapping
+        );
+
+        assertTrue(result.sql().contains("SELECT DISTINCT v.account_id AS \"accountId\", v.bank_id AS \"bankId\""));
+        assertTrue(result.sql().contains("FROM aml_accounts v JOIN aml_transfers e ON v.id = e.out_id"));
+        assertTrue(result.sql().endsWith("LIMIT 5"));
     }
 
     @Test

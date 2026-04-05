@@ -30,7 +30,8 @@ public class GremlinSqlTranslator {
    private static final Pattern WHERE_EQ_ALIAS_PATTERN = Pattern.compile("^eq\\(['\"]([^'\"]+)['\"]\\)$");
    private static final Pattern WHERE_SELECT_IS_GT_PATTERN = Pattern.compile("^select\\(['\"]([^'\"]+)['\"]\\)\\.is\\(gte?\\(([^)]+)\\)\\)$");
    private static final Pattern WHERE_EDGE_EXISTS_PATTERN = Pattern.compile("^(outE|inE|bothE)\\(['\"]([^'\"]+)['\"]\\)((?:\\.has\\(['\"][^'\"]+['\"],\\s*['\"][^'\"]*['\"]\\))*)$");
-   private static final Pattern WHERE_OUT_NEIGHBOR_HAS_PATTERN = Pattern.compile("^(out|in)\\(['\"]([^'\"]+)['\"]\\)((?:\\.has\\(['\"][^'\"]+['\"],\\s*['\"][^'\"]*['\"]\\))+)$");
+   private static final Pattern WHERE_EDGE_COUNT_IS_PATTERN = Pattern.compile("^(outE|inE|bothE)\\(['\"]([^'\"]+)['\"]\\)((?:\\.has\\(['\"][^'\"]+['\"],\\s*['\"][^'\"]*['\"]\\))*)\\s*\\.count\\(\\)\\.is\\((?:(eq|neq|gt|gte|lt|lte)\\(([^)]+)\\)|(-?\\d+))\\)$");
+   private static final Pattern WHERE_OUT_NEIGHBOR_HAS_PATTERN = Pattern.compile("^(out|in)\\(['\"]([^'\"]+)['\"]\\)((?:\\.has\\(['\"][^'\"]+['\"],\\s*['\"][^'\"]*['\"]\\))*)$");
    private static final Pattern HAS_PREDICATE_PATTERN = Pattern.compile("^(gt|gte|lt|lte|neq|eq)\\((.+)\\)$");
    private static final Pattern CHOOSE_VALUES_IS_CONSTANT_PATTERN = Pattern.compile("^choose\\(\\s*values\\(['\"]([^'\"]+)['\"]\\)\\.is\\((gt|gte|lt|lte|eq|neq)\\(([^)]+)\\)\\)\\s*,\\s*constant\\(([^)]+)\\)\\s*,\\s*constant\\(([^)]+)\\)\\s*\\)$");
    private static final Pattern GROUP_COUNT_SELECT_BY_PATTERN = Pattern.compile("^select\\(['\"]([^'\"]+)['\"]\\)\\.by\\(['\"]([^'\"]+)['\"]\\)$");
@@ -234,6 +235,28 @@ public class GremlinSqlTranslator {
          return this.buildHopTraversalSql(parsed, mappingConfig, vertexMapping);
       } else if (!parsed.projections().isEmpty()) {
          return this.buildVertexProjectionSql(parsed, mappingConfig, vertexMapping);
+      } else if (parsed.valueMapRequested()) {
+         StringJoiner selectCols = new StringJoiner(", ");
+         for (Map.Entry<String, String> entry : vertexMapping.properties().entrySet()) {
+            selectCols.add(entry.getValue() + " AS " + this.quoteAlias(entry.getKey()));
+         }
+
+         List<Object> params = new ArrayList<>();
+         StringBuilder sql = (new StringBuilder("SELECT "))
+               .append(parsed.dedupRequested() ? "DISTINCT " : "")
+               .append(selectCols)
+               .append(" FROM ")
+               .append(vertexMapping.table());
+         this.appendWhereClauseForVertex(sql, params, parsed.filters(), vertexMapping);
+         if (parsed.whereClause() != null) {
+            if (this.isStructuredWherePredicate(parsed.whereClause())) {
+               this.appendStructuredWherePredicate(sql, params, parsed.whereClause(), mappingConfig, vertexMapping, null, !parsed.filters().isEmpty());
+            }
+         }
+
+         appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
+         appendLimit(sql, effectiveLimit);
+         return new TranslationResult(sql.toString(), params);
       } else if (parsed.countRequested() && parsed.sumRequested()) {
          throw new IllegalArgumentException("count() cannot be combined with sum()");
       } else {
@@ -275,15 +298,10 @@ public class GremlinSqlTranslator {
          StringBuilder sql = (new StringBuilder("SELECT ")).append(selectClause).append(" FROM ").append(vertexMapping.table());
          this.appendWhereClauseForVertex(sql, params, parsed.filters(), vertexMapping);
          if (parsed.whereClause() != null) {
-            if (parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.EDGE_EXISTS && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
+            if (!this.isStructuredWherePredicate(parsed.whereClause())) {
                throw new IllegalArgumentException("Unsupported where() predicate for g.V(): " + parsed.whereClause().kind());
             }
-
-            if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-               this.appendEdgeExistsPredicate(sql, params, parsed.whereClause(), mappingConfig, vertexMapping, null, !parsed.filters().isEmpty());
-            } else {
-               this.appendNeighborHasPredicate(sql, params, parsed.whereClause(), mappingConfig, vertexMapping, null, !parsed.filters().isEmpty());
-            }
+            this.appendStructuredWherePredicate(sql, params, parsed.whereClause(), mappingConfig, vertexMapping, null, !parsed.filters().isEmpty());
          }
 
          appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
@@ -304,11 +322,17 @@ public class GremlinSqlTranslator {
          } else {
             StringBuilder sql = new StringBuilder();
             int hopCount = parsed.hops().size();
+            HopStep terminalHop = parsed.hops().get(hopCount - 1);
+            boolean terminalEdgeHop = "outE".equals(terminalHop.direction()) || "inE".equals(terminalHop.direction()) || "bothE".equals(terminalHop.direction());
             String finalVertexAlias = "v" + hopCount;
+            String finalEdgeAlias = "e" + hopCount;
             String idCol = startVertexMapping.idColumn();
+            EdgeMapping finalEdgeMapping = terminalEdgeHop ? this.resolveEdgeMapping(terminalHop.singleLabel(), mappingConfig) : null;
             if (parsed.countRequested()) {
                if (parsed.dedupRequested()) {
-                  sql.append("SELECT COUNT(DISTINCT ").append(finalVertexAlias).append('.').append(idCol).append(") AS count");
+                  String distinctAlias = terminalEdgeHop ? finalEdgeAlias : finalVertexAlias;
+                  String distinctColumn = terminalEdgeHop ? finalEdgeMapping.idColumn() : idCol;
+                  sql.append("SELECT COUNT(DISTINCT ").append(distinctAlias).append('.').append(distinctColumn).append(") AS count");
                } else {
                   sql.append("SELECT COUNT(*) AS count");
                }
@@ -317,25 +341,50 @@ public class GremlinSqlTranslator {
             } else if (parsed.meanRequested()) {
                sql.append("SELECT ").append(this.buildHopMeanExpression(parsed, mappingConfig, startVertexMapping, finalVertexAlias)).append(" AS mean");
             } else if (!parsed.projections().isEmpty()) {
+               VertexMapping finalVertexMapping = terminalEdgeHop
+                     ? null
+                     : this.resolveFinalHopVertexMapping(parsed.hops(), mappingConfig, startVertexMapping);
                StringJoiner projectionSelect = new StringJoiner(", ");
 
                for(ProjectionField projection : parsed.projections()) {
+                  if (projection.kind() == GremlinSqlTranslator.ProjectionKind.IDENTITY) {
+                     String alias = terminalEdgeHop ? finalEdgeAlias : finalVertexAlias;
+                     String idColumn = terminalEdgeHop ? finalEdgeMapping.idColumn() : idCol;
+                     projectionSelect.add(alias + "." + idColumn + " AS " + this.quoteAlias(projection.alias()));
+                     continue;
+                  }
                   if (projection.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
-                     throw new IllegalArgumentException("Hop projection currently supports by('property') only");
+                     throw new IllegalArgumentException("Hop projection currently supports by('property') or by(identity()) only");
                   }
 
-                  String mappedColumn = this.mapVertexProperty(startVertexMapping, projection.property());
-                  projectionSelect.add(finalVertexAlias + "." + mappedColumn + " AS " + this.quoteAlias(projection.alias()));
+                  String mappedColumn = terminalEdgeHop
+                        ? this.mapEdgeProperty(finalEdgeMapping, projection.property())
+                        : this.mapVertexProperty(finalVertexMapping, projection.property());
+                  String alias = terminalEdgeHop ? finalEdgeAlias : finalVertexAlias;
+                  projectionSelect.add(alias + "." + mappedColumn + " AS " + this.quoteAlias(projection.alias()));
                }
 
                sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(projectionSelect);
             } else if (parsed.pathSeen() && !parsed.pathByProperties().isEmpty()) {
                sql.append(this.buildPathSelectClause(parsed.pathByProperties(), hopCount, mappingConfig, startVertexMapping, parsed.hops()));
+            } else if (parsed.valueMapRequested()) {
+               if (terminalEdgeHop) {
+                  sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(this.buildAliasValueMapSelectForEdge(finalEdgeMapping, finalEdgeAlias));
+               } else {
+                  VertexMapping finalVm = this.resolveFinalHopVertexMapping(parsed.hops(), mappingConfig, startVertexMapping);
+                  sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(this.buildAliasValueMapSelectForVertex(finalVm, finalVertexAlias));
+               }
             } else if (parsed.valueProperty() != null) {
-               String mappedColumn = this.mapVertexProperty(startVertexMapping, parsed.valueProperty());
-               sql.append("SELECT ").append(parsed.dedupRequested() ? "DISTINCT " : "").append(finalVertexAlias).append('.').append(mappedColumn).append(" AS ").append(parsed.valueProperty());
+               if (terminalEdgeHop) {
+                  String mappedColumn = this.mapEdgeProperty(finalEdgeMapping, parsed.valueProperty());
+                  sql.append("SELECT ").append(parsed.dedupRequested() ? "DISTINCT " : "").append(finalEdgeAlias).append('.').append(mappedColumn).append(" AS ").append(parsed.valueProperty());
+               } else {
+                  VertexMapping finalVertexMapping = this.resolveFinalHopVertexMapping(parsed.hops(), mappingConfig, startVertexMapping);
+                  String mappedColumn = this.mapVertexProperty(finalVertexMapping, parsed.valueProperty());
+                  sql.append("SELECT ").append(parsed.dedupRequested() ? "DISTINCT " : "").append(finalVertexAlias).append('.').append(mappedColumn).append(" AS ").append(parsed.valueProperty());
+               }
             } else {
-               sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(finalVertexAlias).append(".*");
+               sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(terminalEdgeHop ? finalEdgeAlias : finalVertexAlias).append(".*");
             }
 
             boolean useStartSubquery = parsed.preHopLimit() != null;
@@ -344,15 +393,10 @@ public class GremlinSqlTranslator {
                List<Object> subParams = new ArrayList<>();
                this.appendWhereClauseForVertex(startSubquery, subParams, parsed.filters(), startVertexMapping);
                if (parsed.whereClause() != null) {
-                  if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-                     this.appendEdgeExistsPredicate(startSubquery, subParams, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
-                  } else {
-                     if (parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
-                        throw new IllegalArgumentException("Unsupported where() predicate for hop traversal: " + parsed.whereClause().kind());
-                     }
-
-                     this.appendNeighborHasPredicate(startSubquery, subParams, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
+                  if (!this.isStructuredWherePredicate(parsed.whereClause())) {
+                     throw new IllegalArgumentException("Unsupported where() predicate for hop traversal: " + parsed.whereClause().kind());
                   }
+                  this.appendStructuredWherePredicate(startSubquery, subParams, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
                }
 
                startSubquery.append(" LIMIT ").append(parsed.preHopLimit()).append(")");
@@ -373,13 +417,15 @@ public class GremlinSqlTranslator {
                String edgeOut = edgeAlias + "." + edgeMapping.outColumn();
                String edgeIn = edgeAlias + "." + edgeMapping.inColumn();
                sql.append(" JOIN ").append(edgeMapping.table()).append(' ').append(edgeAlias);
-               if ("out".equals(hop.direction()) || "outE".equals(hop.direction())) {
+               if ("bothE".equals(hop.direction())) {
+                  sql.append(" ON (").append(edgeOut).append(" = ").append(fromId).append(" OR ").append(edgeIn).append(" = ").append(fromId).append(")");
+               } else if ("out".equals(hop.direction()) || "outE".equals(hop.direction())) {
                   sql.append(" ON ").append(edgeOut).append(" = ").append(fromId);
                } else {
                   sql.append(" ON ").append(edgeIn).append(" = ").append(fromId);
                }
 
-               if (!"outE".equals(hop.direction()) && !"inE".equals(hop.direction())) {
+               if (!"outE".equals(hop.direction()) && !"inE".equals(hop.direction()) && !"bothE".equals(hop.direction())) {
                   VertexMapping toVertexMapping = this.resolveHopTargetVertexMapping(mappingConfig, edgeMapping, "out".equals(hop.direction()), startVertexMapping);
                   sql.append(" JOIN ").append(toVertexMapping.table()).append(' ').append(toVertexAlias);
                   if ("out".equals(hop.direction())) {
@@ -397,9 +443,9 @@ public class GremlinSqlTranslator {
                }
 
                if (parsed.whereClause() != null) {
-                  if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-                     this.appendEdgeExistsPredicate(sql, params, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
-                  } else if (parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
+                  if (this.isStructuredWherePredicate(parsed.whereClause())) {
+                     this.appendStructuredWherePredicate(sql, params, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
+                  } else {
                      if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EQ_ALIAS) {
                         this.appendEqAliasPredicate(sql, parsed.whereClause(), parsed.asAliases(), finalVertexAlias, idCol, hasWhere);
                      } else {
@@ -409,8 +455,6 @@ public class GremlinSqlTranslator {
 
                         this.appendNeqAliasPredicate(sql, parsed.whereClause(), parsed.asAliases(), parsed.whereByProperty(), parsed.hops(), mappingConfig, startVertexMapping, idCol, hasWhere);
                      }
-                  } else {
-                     this.appendNeighborHasPredicate(sql, params, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
                   }
 
                   hasWhere = true;
@@ -532,18 +576,27 @@ public class GremlinSqlTranslator {
          String finalVertexAlias = "v" + hopCount;
          if (parsed.countRequested()) {
             sql.append(parsed.dedupRequested() ? "SELECT COUNT(DISTINCT " + finalVertexAlias + "." + idCol + ") AS count" : "SELECT COUNT(*) AS count");
-         } else if (!parsed.projections().isEmpty()) {
-            StringJoiner pj = new StringJoiner(", ");
+          } else if (!parsed.projections().isEmpty()) {
+             // Determine the final vertex mapping after all hops
+             VertexMapping finalVertexMapping = startVertexMapping;
+             for(HopStep hop : parsed.hops()) {
+                if (!hop.labels().isEmpty()) {
+                   EdgeMapping em = this.resolveEdgeMapping(hop.labels().get(0), mappingConfig);
+                   finalVertexMapping = this.resolveHopTargetVertexMapping(mappingConfig, em, "out".equals(hop.direction()), finalVertexMapping);
+                }
+             }
 
-            for(ProjectionField pf : parsed.projections()) {
-               if (pf.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
-                  throw new IllegalArgumentException("Hop projection currently supports by('property') only");
-               }
+             StringJoiner pj = new StringJoiner(", ");
 
-               pj.add(finalVertexAlias + "." + this.mapVertexProperty(startVertexMapping, pf.property()) + " AS " + this.quoteAlias(pf.alias()));
-            }
+             for(ProjectionField pf : parsed.projections()) {
+                if (pf.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
+                   throw new IllegalArgumentException("Hop projection currently supports by('property') only");
+                }
 
-            sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(pj);
+                pj.add(finalVertexAlias + "." + this.mapVertexProperty(finalVertexMapping, pf.property()) + " AS " + this.quoteAlias(pf.alias()));
+             }
+
+             sql.append(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ").append(pj);
          } else if (parsed.pathSeen() && !parsed.pathByProperties().isEmpty()) {
             sql.append(this.buildPathSelectClause(parsed.pathByProperties(), hopCount, mappingConfig, startVertexMapping, parsed.hops()));
          } else if (parsed.valueProperty() != null) {
@@ -581,10 +634,8 @@ public class GremlinSqlTranslator {
             List<Object> sqp = new ArrayList<>();
             this.appendWhereClauseForVertex(sq, sqp, parsed.filters(), startVertexMapping);
             if (parsed.whereClause() != null) {
-               if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-                  this.appendEdgeExistsPredicate(sq, sqp, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
-               } else if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS || parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
-                  this.appendNeighborHasPredicate(sq, sqp, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
+               if (this.isStructuredWherePredicate(parsed.whereClause())) {
+                  this.appendStructuredWherePredicate(sq, sqp, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
                }
             }
 
@@ -634,10 +685,8 @@ public class GremlinSqlTranslator {
             }
 
             if (parsed.whereClause() != null) {
-               if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-                  this.appendEdgeExistsPredicate(sql, params, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
-               } else if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS || parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
-                  this.appendNeighborHasPredicate(sql, params, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
+               if (this.isStructuredWherePredicate(parsed.whereClause())) {
+                  this.appendStructuredWherePredicate(sql, params, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
                }
 
                hasWhere = true;
@@ -677,24 +726,42 @@ public class GremlinSqlTranslator {
       String selectClause;
       if (parsed.countRequested()) {
          selectClause = finalVertexAlias + "." + idCol;
-      } else if (!parsed.projections().isEmpty()) {
-         StringJoiner projectionSelect = new StringJoiner(", ");
+       } else if (!parsed.projections().isEmpty()) {
+          // Determine the final vertex mapping after all hops
+          VertexMapping finalVertexMapping = startVertexMapping;
+          for(HopStep hop : parsed.hops()) {
+             if (!hop.labels().isEmpty()) {
+                EdgeMapping em = this.resolveEdgeMapping(hop.labels().get(0), mappingConfig);
+                finalVertexMapping = this.resolveHopTargetVertexMapping(mappingConfig, em, "out".equals(hop.direction()), finalVertexMapping);
+             }
+          }
 
-         for(ProjectionField projection : parsed.projections()) {
-            if (projection.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
-               throw new IllegalArgumentException("both() projection currently supports by('property') only");
-            }
+          StringJoiner projectionSelect = new StringJoiner(", ");
 
-            String mappedColumn = this.mapVertexProperty(startVertexMapping, projection.property());
-            projectionSelect.add(finalVertexAlias + "." + mappedColumn + " AS " + this.quoteAlias(projection.alias()));
-         }
+          for(ProjectionField projection : parsed.projections()) {
+             if (projection.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
+                throw new IllegalArgumentException("both() projection currently supports by('property') only");
+             }
 
-         selectClause = projectionSelect.toString();
+             String mappedColumn = this.mapVertexProperty(finalVertexMapping, projection.property());
+             projectionSelect.add(finalVertexAlias + "." + mappedColumn + " AS " + this.quoteAlias(projection.alias()));
+          }
+
+          selectClause = projectionSelect.toString();
       } else if (parsed.pathSeen() && !parsed.pathByProperties().isEmpty()) {
          selectClause = this.buildPathSelectClause(parsed.pathByProperties(), hopCount, mappingConfig, startVertexMapping, parsed.hops()).substring("SELECT ".length());
-      } else if (parsed.valueProperty() != null) {
-         String mappedColumn = this.mapVertexProperty(startVertexMapping, parsed.valueProperty());
-         selectClause = finalVertexAlias + "." + mappedColumn + " AS " + parsed.valueProperty();
+       } else if (parsed.valueProperty() != null) {
+          // Determine the final vertex mapping after all hops
+          VertexMapping finalVertexMapping = startVertexMapping;
+          for(HopStep hop : parsed.hops()) {
+             if (!hop.labels().isEmpty()) {
+                EdgeMapping em = this.resolveEdgeMapping(hop.labels().get(0), mappingConfig);
+                finalVertexMapping = this.resolveHopTargetVertexMapping(mappingConfig, em, "out".equals(hop.direction()), finalVertexMapping);
+             }
+          }
+
+          String mappedColumn = this.mapVertexProperty(finalVertexMapping, parsed.valueProperty());
+          selectClause = finalVertexAlias + "." + mappedColumn + " AS " + parsed.valueProperty();
       } else {
          selectClause = finalVertexAlias + ".*";
       }
@@ -706,10 +773,8 @@ public class GremlinSqlTranslator {
          StringBuilder startSubquery = (new StringBuilder("(SELECT * FROM ")).append(startVertexMapping.table());
          this.appendWhereClauseForVertex(startSubquery, sharedStartParams, parsed.filters(), startVertexMapping);
          if (parsed.whereClause() != null) {
-            if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-               this.appendEdgeExistsPredicate(startSubquery, sharedStartParams, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
-            } else if (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS || parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
-               this.appendNeighborHasPredicate(startSubquery, sharedStartParams, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
+            if (this.isStructuredWherePredicate(parsed.whereClause())) {
+               this.appendStructuredWherePredicate(startSubquery, sharedStartParams, parsed.whereClause(), mappingConfig, startVertexMapping, null, !parsed.filters().isEmpty());
             }
          }
 
@@ -751,9 +816,9 @@ public class GremlinSqlTranslator {
             hasWhere = true;
          }
 
-         if (parsed.whereClause() != null && parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-            this.appendEdgeExistsPredicate(outBranch, outParams, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
-            this.appendEdgeExistsPredicate(inBranch, inParams, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
+         if (parsed.whereClause() != null && this.isStructuredWherePredicate(parsed.whereClause())) {
+            this.appendStructuredWherePredicate(outBranch, outParams, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
+            this.appendStructuredWherePredicate(inBranch, inParams, parsed.whereClause(), mappingConfig, startVertexMapping, "v0", hasWhere);
          }
       }
 
@@ -821,10 +886,26 @@ public class GremlinSqlTranslator {
          return this.buildEdgeAliasSelectSql(parsed, mappingConfig, edgeMapping);
       } else if (parsed.groupCountProperty() != null) {
          return this.buildEdgeGroupCountSql(parsed, edgeMapping);
-      } else if (!parsed.projections().isEmpty()) {
-         return this.buildEdgeProjectionSql(parsed, mappingConfig, edgeMapping);
       } else if (!parsed.hops().isEmpty()) {
          return this.buildEdgeToVertexSql(parsed, mappingConfig, edgeMapping);
+      } else if (!parsed.projections().isEmpty()) {
+         return this.buildEdgeProjectionSql(parsed, mappingConfig, edgeMapping);
+      } else if (parsed.valueMapRequested()) {
+         StringJoiner selectCols = new StringJoiner(", ");
+         for (Map.Entry<String, String> entry : edgeMapping.properties().entrySet()) {
+            selectCols.add(entry.getValue() + " AS " + this.quoteAlias(entry.getKey()));
+         }
+
+         List<Object> params = new ArrayList<>();
+         StringBuilder sql = (new StringBuilder("SELECT "))
+               .append(parsed.dedupRequested() ? "DISTINCT " : "")
+               .append(selectCols)
+               .append(" FROM ")
+               .append(edgeMapping.table());
+         this.appendWhereClauseForEdge(sql, params, parsed.filters(), edgeMapping);
+         appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
+         appendLimit(sql, parsed.limit() != null ? parsed.limit() : parsed.preHopLimit());
+         return new TranslationResult(sql.toString(), params);
       } else if (parsed.countRequested() && parsed.sumRequested()) {
          throw new IllegalArgumentException("count() cannot be combined with sum()");
       } else {
@@ -873,22 +954,99 @@ public class GremlinSqlTranslator {
 
    private TranslationResult buildEdgeToVertexSql(ParsedTraversal parsed, MappingConfig mappingConfig, EdgeMapping edgeMapping) {
       if (parsed.hops().size() != 1) {
-         throw new IllegalArgumentException("Only a single outV() or inV() hop is supported after g.E()");
+         throw new IllegalArgumentException("Only a single outV(), inV(), or bothV() hop is supported after g.E()");
       } else {
          HopStep hop = parsed.hops().get(0);
-         if (!"outV".equals(hop.direction()) && !"inV".equals(hop.direction())) {
-            throw new IllegalArgumentException("Only outV() or inV() hops are supported after g.E()");
+         if (!"outV".equals(hop.direction()) && !"inV".equals(hop.direction()) && !"bothV".equals(hop.direction())) {
+            throw new IllegalArgumentException("Only outV(), inV(), or bothV() hops are supported after g.E()");
          } else {
-            VertexMapping vertexMapping = Optional.ofNullable(this.resolveVertexMappingForEdgeProjection(mappingConfig)).orElseThrow(() -> new IllegalArgumentException("outV()/inV() traversal requires exactly one vertex mapping to be present"));
-            String joinColumn = "outV".equals(hop.direction()) ? edgeMapping.outColumn() : edgeMapping.inColumn();
+            VertexMapping outVertexMapping = this.resolveTargetVertexMapping(mappingConfig, edgeMapping, false);
+            VertexMapping inVertexMapping = this.resolveTargetVertexMapping(mappingConfig, edgeMapping, true);
+            VertexMapping fallbackVertexMapping = this.resolveVertexMappingForEdgeProjection(mappingConfig);
+            if (outVertexMapping == null) {
+               outVertexMapping = fallbackVertexMapping;
+            }
+            if (inVertexMapping == null) {
+               inVertexMapping = fallbackVertexMapping;
+            }
+            if (outVertexMapping == null || inVertexMapping == null) {
+               throw new IllegalArgumentException("outV()/inV()/bothV() traversal requires resolvable endpoint vertex mappings");
+            }
+            if ("bothV".equals(hop.direction())) {
+               List<Object> outParams = new ArrayList<>();
+               String outSelectClause = this.buildEdgeEndpointSelectClause(parsed, outVertexMapping, "v");
+               StringBuilder outSql = (new StringBuilder("SELECT ")).append(outSelectClause).append(" FROM ").append(outVertexMapping.table()).append(" v").append(" JOIN ").append(edgeMapping.table()).append(" e").append(" ON v.").append(outVertexMapping.idColumn()).append(" = e.").append(edgeMapping.outColumn());
+               this.appendWhereClauseForEdgeAlias(outSql, outParams, parsed.filters(), edgeMapping, "e");
+
+               List<Object> inParams = new ArrayList<>();
+               String inSelectClause = this.buildEdgeEndpointSelectClause(parsed, inVertexMapping, "v");
+               StringBuilder inSql = (new StringBuilder("SELECT ")).append(inSelectClause).append(" FROM ").append(inVertexMapping.table()).append(" v").append(" JOIN ").append(edgeMapping.table()).append(" e").append(" ON v.").append(inVertexMapping.idColumn()).append(" = e.").append(edgeMapping.inColumn());
+               this.appendWhereClauseForEdgeAlias(inSql, inParams, parsed.filters(), edgeMapping, "e");
+
+               StringBuilder union = new StringBuilder("SELECT DISTINCT * FROM (").append(outSql).append(" UNION ALL ").append(inSql).append(") _uv");
+               appendOrderBy(union, parsed.orderByProperty(), parsed.orderDirection());
+               appendLimit(union, parsed.limit() != null ? parsed.limit() : parsed.preHopLimit());
+               List<Object> params = new ArrayList<>();
+               params.addAll(outParams);
+               params.addAll(inParams);
+               return new TranslationResult(union.toString(), params);
+            }
+
+            boolean isOutEndpoint = "outV".equals(hop.direction());
+            VertexMapping endpointMapping = isOutEndpoint ? outVertexMapping : inVertexMapping;
+            String joinColumn = isOutEndpoint ? edgeMapping.outColumn() : edgeMapping.inColumn();
             List<Object> params = new ArrayList<>();
-            StringBuilder sql = (new StringBuilder("SELECT DISTINCT v.*")).append(" FROM ").append(vertexMapping.table()).append(" v").append(" JOIN ").append(edgeMapping.table()).append(" e").append(" ON v.").append(vertexMapping.idColumn()).append(" = e.").append(joinColumn);
+            String selectClause = this.buildEdgeEndpointSelectClause(parsed, endpointMapping, "v");
+            StringBuilder sql = (new StringBuilder("SELECT DISTINCT ")).append(selectClause).append(" FROM ").append(endpointMapping.table()).append(" v").append(" JOIN ").append(edgeMapping.table()).append(" e").append(" ON v.").append(endpointMapping.idColumn()).append(" = e.").append(joinColumn);
             this.appendWhereClauseForEdgeAlias(sql, params, parsed.filters(), edgeMapping, "e");
             appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
             appendLimit(sql, parsed.limit() != null ? parsed.limit() : parsed.preHopLimit());
             return new TranslationResult(sql.toString(), params);
          }
       }
+   }
+
+   private String buildEdgeEndpointSelectClause(ParsedTraversal parsed, VertexMapping endpointMapping, String endpointAlias) {
+      if (!parsed.projections().isEmpty()) {
+         StringJoiner projectionSelect = new StringJoiner(", ");
+         for (ProjectionField projection : parsed.projections()) {
+            String alias = this.quoteAlias(projection.alias());
+            if (projection.kind() == GremlinSqlTranslator.ProjectionKind.IDENTITY) {
+               projectionSelect.add(endpointAlias + "." + endpointMapping.idColumn() + " AS " + alias);
+               continue;
+            }
+            if (projection.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
+               throw new IllegalArgumentException("outV()/inV()/bothV() projection supports by('property') and by(identity()) only");
+            }
+            String column = this.mapVertexProperty(endpointMapping, projection.property());
+            projectionSelect.add(endpointAlias + "." + column + " AS " + alias);
+         }
+         return projectionSelect.toString();
+      }
+      if (parsed.valueMapRequested()) {
+         return this.buildAliasValueMapSelectForVertex(endpointMapping, endpointAlias);
+      }
+      if (parsed.valueProperty() != null) {
+         String column = this.mapVertexProperty(endpointMapping, parsed.valueProperty());
+         return endpointAlias + "." + column + " AS " + parsed.valueProperty();
+      }
+      return endpointAlias + ".*";
+   }
+
+   private String buildAliasValueMapSelectForVertex(VertexMapping vertexMapping, String alias) {
+      StringJoiner selectCols = new StringJoiner(", ");
+      for (Map.Entry<String, String> entry : vertexMapping.properties().entrySet()) {
+         selectCols.add(alias + "." + entry.getValue() + " AS " + this.quoteAlias(entry.getKey()));
+      }
+      return selectCols.toString();
+   }
+
+   private String buildAliasValueMapSelectForEdge(EdgeMapping edgeMapping, String alias) {
+      StringJoiner selectCols = new StringJoiner(", ");
+      for (Map.Entry<String, String> entry : edgeMapping.properties().entrySet()) {
+         selectCols.add(alias + "." + entry.getValue() + " AS " + this.quoteAlias(entry.getKey()));
+      }
+      return selectCols.toString();
    }
 
    private String resolveEdgeLabelFromFilters(List<HasFilter> filters, MappingConfig mappingConfig) {
@@ -1052,7 +1210,9 @@ public class GremlinSqlTranslator {
 
          for(ProjectionField projection : parsed.projections()) {
             String alias = this.quoteAlias(projection.alias());
-            if (projection.kind() == GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
+            if (projection.kind() == GremlinSqlTranslator.ProjectionKind.IDENTITY) {
+               selectJoiner.add("e." + edgeMapping.idColumn() + " AS " + alias);
+            } else if (projection.kind() == GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
                String column = this.mapEdgeProperty(edgeMapping, projection.property());
                selectJoiner.add("e." + column + " AS " + alias);
             } else if (projection.kind() == GremlinSqlTranslator.ProjectionKind.OUT_VERTEX_PROPERTY) {
@@ -1093,6 +1253,10 @@ public class GremlinSqlTranslator {
 
          for(ProjectionField projection : parsed.projections()) {
             String alias = this.quoteAlias(projection.alias());
+            if (projection.kind() == GremlinSqlTranslator.ProjectionKind.IDENTITY) {
+               selectJoiner.add("v." + vertexMapping.idColumn() + " AS " + alias);
+               continue;
+            }
             if (projection.kind() != GremlinSqlTranslator.ProjectionKind.EDGE_PROPERTY) {
                if (projection.kind() == GremlinSqlTranslator.ProjectionKind.CHOOSE_VALUES_IS_CONSTANT) {
                   ChooseProjectionSpec chooseSpec = this.parseChooseProjection(projection.property());
@@ -1206,15 +1370,13 @@ public class GremlinSqlTranslator {
 
          StringBuilder baseSql = (new StringBuilder(parsed.dedupRequested() ? "SELECT DISTINCT " : "SELECT ")).append(selectJoiner).append(" FROM ").append(vertexMapping.table()).append(" v");
          this.appendWhereClauseForVertexAlias(baseSql, params, parsed.filters(), vertexMapping, "v");
-         if (parsed.whereClause() != null && parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.EDGE_EXISTS) {
-            this.appendEdgeExistsPredicate(baseSql, params, parsed.whereClause(), mappingConfig, vertexMapping, "v", !parsed.filters().isEmpty());
-         } else if (parsed.whereClause() != null && (parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS || parsed.whereClause().kind() == GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS)) {
-            this.appendNeighborHasPredicate(baseSql, params, parsed.whereClause(), mappingConfig, vertexMapping, "v", !parsed.filters().isEmpty());
+         if (parsed.whereClause() != null && this.isStructuredWherePredicate(parsed.whereClause())) {
+            this.appendStructuredWherePredicate(baseSql, params, parsed.whereClause(), mappingConfig, vertexMapping, "v", !parsed.filters().isEmpty());
          }
 
          if (parsed.whereClause() != null) {
             if (parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.PROJECT_GT && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.PROJECT_GTE) {
-               if (parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.EDGE_EXISTS && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.OUT_NEIGHBOR_HAS && parsed.whereClause().kind() != GremlinSqlTranslator.WhereKind.IN_NEIGHBOR_HAS) {
+               if (!this.isStructuredWherePredicate(parsed.whereClause())) {
                   throw new IllegalArgumentException("Only where(select('alias').is(gt/gte(n))) or where(outE/inE/bothE(...)) or where(out/in('label').has(...)) is supported with project(...)");
                } else {
                   appendOrderBy(baseSql, parsed.orderByProperty(), parsed.orderDirection());
@@ -1305,31 +1467,107 @@ public class GremlinSqlTranslator {
    }
 
    private void appendEdgeExistsPredicate(StringBuilder sql, List<Object> params, WhereClause whereClause, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, boolean hasExistingWhere) {
-      EdgeMapping edgeMapping = this.resolveEdgeMapping(whereClause.right(), mappingConfig);
-      String edgeAlias = "we";
-      String idRef = vertexAlias == null ? vertexMapping.idColumn() : vertexAlias + "." + vertexMapping.idColumn();
-      String correlation;
-      if ("outE".equals(whereClause.left())) {
-         correlation = edgeAlias + "." + edgeMapping.outColumn() + " = " + idRef;
-      } else if ("inE".equals(whereClause.left())) {
-         correlation = edgeAlias + "." + edgeMapping.inColumn() + " = " + idRef;
-      } else {
-         correlation = "(" + edgeAlias + "." + edgeMapping.outColumn() + " = " + idRef + " OR " + edgeAlias + "." + edgeMapping.inColumn() + " = " + idRef + ")";
-      }
-
-      StringBuilder existsSql = (new StringBuilder("EXISTS (SELECT 1 FROM ")).append(edgeMapping.table()).append(' ').append(edgeAlias).append(" WHERE ").append(correlation);
-
-      for(HasFilter filter : whereClause.filters()) {
-         String column = this.mapEdgeFilterProperty(edgeMapping, filter.property());
-         existsSql.append(" AND ").append(edgeAlias).append('.').append(column).append(" ").append(filter.operator()).append(" ?");
-         params.add(filter.value());
-      }
-
-      existsSql.append(")");
+      String existsSql = this.buildEdgeExistsPredicateSql(whereClause, mappingConfig, vertexMapping, vertexAlias, params);
       sql.append(hasExistingWhere ? " AND " : " WHERE ").append(existsSql);
    }
 
    private void appendNeighborHasPredicate(StringBuilder sql, List<Object> params, WhereClause whereClause, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, boolean hasExistingWhere) {
+      String existsSql = this.buildNeighborHasPredicateSql(whereClause, mappingConfig, vertexMapping, vertexAlias, params);
+      sql.append(hasExistingWhere ? " AND " : " WHERE ").append(existsSql);
+   }
+
+   private boolean isStructuredWherePredicate(WhereClause whereClause) {
+      return whereClause != null && switch (whereClause.kind()) {
+         case EDGE_EXISTS, OUT_NEIGHBOR_HAS, IN_NEIGHBOR_HAS, AND, OR, NOT -> true;
+         default -> false;
+      };
+   }
+
+   private void appendStructuredWherePredicate(StringBuilder sql, List<Object> params, WhereClause whereClause, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, boolean hasExistingWhere) {
+      String predicate = this.buildStructuredWherePredicateSql(whereClause, mappingConfig, vertexMapping, vertexAlias, params);
+      sql.append(hasExistingWhere ? " AND " : " WHERE ").append(predicate);
+   }
+
+   private String buildStructuredWherePredicateSql(WhereClause whereClause, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, List<Object> params) {
+      return switch (whereClause.kind()) {
+         case EDGE_EXISTS -> this.buildEdgeExistsPredicateSql(whereClause, mappingConfig, vertexMapping, vertexAlias, params);
+         case OUT_NEIGHBOR_HAS, IN_NEIGHBOR_HAS -> this.buildNeighborHasPredicateSql(whereClause, mappingConfig, vertexMapping, vertexAlias, params);
+         case AND -> this.joinStructuredPredicates(whereClause.clauses(), " AND ", mappingConfig, vertexMapping, vertexAlias, params);
+         case OR -> this.joinStructuredPredicates(whereClause.clauses(), " OR ", mappingConfig, vertexMapping, vertexAlias, params);
+         case NOT -> {
+            if (whereClause.clauses().size() != 1) {
+               throw new IllegalArgumentException("where(not(...)) requires exactly one inner predicate");
+            }
+            yield "NOT (" + this.buildStructuredWherePredicateSql(whereClause.clauses().get(0), mappingConfig, vertexMapping, vertexAlias, params) + ")";
+         }
+         default -> throw new IllegalArgumentException("Unsupported structured where() predicate: " + whereClause.kind());
+      };
+   }
+
+   private String joinStructuredPredicates(List<WhereClause> clauses, String delimiter, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, List<Object> params) {
+      if (clauses == null || clauses.isEmpty()) {
+         throw new IllegalArgumentException("Compound where() predicate requires inner predicates");
+      }
+      StringJoiner joiner = new StringJoiner(delimiter);
+      for (WhereClause clause : clauses) {
+         joiner.add("(" + this.buildStructuredWherePredicateSql(clause, mappingConfig, vertexMapping, vertexAlias, params) + ")");
+      }
+      return "(" + joiner + ")";
+   }
+
+    private String buildEdgeExistsPredicateSql(WhereClause whereClause, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, List<Object> params) {
+       EdgeMapping edgeMapping = this.resolveEdgeMapping(whereClause.right(), mappingConfig);
+       String edgeAlias = "we";
+       String idRef = vertexAlias == null ? vertexMapping.idColumn() : vertexAlias + "." + vertexMapping.idColumn();
+       String correlation;
+       if ("outE".equals(whereClause.left())) {
+          correlation = edgeAlias + "." + edgeMapping.outColumn() + " = " + idRef;
+       } else if ("inE".equals(whereClause.left())) {
+          correlation = edgeAlias + "." + edgeMapping.inColumn() + " = " + idRef;
+       } else {
+          correlation = "(" + edgeAlias + "." + edgeMapping.outColumn() + " = " + idRef + " OR " + edgeAlias + "." + edgeMapping.inColumn() + " = " + idRef + ")";
+       }
+
+       // Check if this is a count comparison like outE('LABEL').count().is(0) or outE('LABEL').count().is(gt(5))
+       HasFilter countFilter = whereClause.filters().stream().filter(f -> "count".equals(f.property())).findFirst().orElse(null);
+       if (countFilter != null) {
+          // For count comparisons: COUNT(*) operator value
+          StringBuilder countSql = new StringBuilder("(SELECT COUNT(*) FROM ");
+          countSql.append(edgeMapping.table()).append(' ').append(edgeAlias).append(" WHERE ").append(correlation);
+          
+          // Add any non-count filters
+          for (HasFilter filter : whereClause.filters()) {
+             if (!"count".equals(filter.property())) {
+                String column = this.mapEdgeFilterProperty(edgeMapping, filter.property());
+                if ("IS NULL".equals(filter.operator())) {
+                   countSql.append(" AND ").append(edgeAlias).append('.').append(column).append(" IS NULL");
+                } else {
+                   countSql.append(" AND ").append(edgeAlias).append('.').append(column).append(" ").append(filter.operator()).append(" ?");
+                   params.add(filter.value());
+                }
+             }
+          }
+          countSql.append(") ").append(this.toSqlOperator(countFilter.operator())).append(" ?");
+          params.add(countFilter.value());
+          return countSql.toString();
+       }
+
+       // Standard EXISTS clause
+       StringBuilder existsSql = (new StringBuilder("EXISTS (SELECT 1 FROM ")).append(edgeMapping.table()).append(' ').append(edgeAlias).append(" WHERE ").append(correlation);
+
+       for (HasFilter filter : whereClause.filters()) {
+          String column = this.mapEdgeFilterProperty(edgeMapping, filter.property());
+          if ("IS NULL".equals(filter.operator())) {
+             existsSql.append(" AND ").append(edgeAlias).append('.').append(column).append(" IS NULL");
+          } else {
+             existsSql.append(" AND ").append(edgeAlias).append('.').append(column).append(" ").append(filter.operator()).append(" ?");
+             params.add(filter.value());
+          }
+       }
+       return existsSql.append(")").toString();
+    }
+
+   private String buildNeighborHasPredicateSql(WhereClause whereClause, MappingConfig mappingConfig, VertexMapping vertexMapping, String vertexAlias, List<Object> params) {
       EdgeMapping edgeMapping = this.resolveEdgeMapping(whereClause.right(), mappingConfig);
       boolean isOut = "out".equals(whereClause.left());
       String anchorCol = isOut ? edgeMapping.outColumn() : edgeMapping.inColumn();
@@ -1361,12 +1599,16 @@ public class GremlinSqlTranslator {
 
       for(HasFilter filter : whereClause.filters()) {
          String column = this.mapVertexProperty(neighborVertexMapping, filter.property());
-         existsSql.append(" AND _wv.").append(column).append(" ").append(filter.operator()).append(" ?");
-         params.add(filter.value());
+         if ("IS NULL".equals(filter.operator())) {
+            existsSql.append(" AND _wv.").append(column).append(" IS NULL");
+         } else {
+            existsSql.append(" AND _wv.").append(column).append(" ").append(filter.operator()).append(" ?");
+            params.add(filter.value());
+         }
       }
 
       existsSql.append(")");
-      sql.append(hasExistingWhere ? " AND " : " WHERE ").append(existsSql);
+      return existsSql.toString();
    }
 
    private void appendWhereClauseForVertex(StringBuilder sql, List<Object> params, List<HasFilter> filters, VertexMapping mapping) {
@@ -1380,8 +1622,12 @@ public class GremlinSqlTranslator {
          for(HasFilter filter : filters) {
             String column = "id".equals(filter.property()) ? mapping.idColumn() : this.mapVertexProperty(mapping, filter.property());
             String qualifiedColumn = alias != null ? alias + "." + column : column;
-            whereJoiner.add(qualifiedColumn + " " + filter.operator() + " ?");
-            params.add(filter.value());
+            if ("IS NULL".equals(filter.operator())) {
+               whereJoiner.add(qualifiedColumn + " IS NULL");
+            } else {
+               whereJoiner.add(qualifiedColumn + " " + filter.operator() + " ?");
+               params.add(filter.value());
+            }
          }
 
          sql.append(" WHERE ").append(whereJoiner);
@@ -1409,8 +1655,12 @@ public class GremlinSqlTranslator {
             }
 
             String qualifiedColumn = alias == null ? column : alias + "." + column;
-            whereJoiner.add(qualifiedColumn + " " + filter.operator() + " ?");
-            params.add(filter.value());
+            if ("IS NULL".equals(filter.operator())) {
+               whereJoiner.add(qualifiedColumn + " IS NULL");
+            } else {
+               whereJoiner.add(qualifiedColumn + " " + filter.operator() + " ?");
+               params.add(filter.value());
+            }
          }
 
          sql.append(" WHERE ").append(whereJoiner);
@@ -1424,13 +1674,15 @@ public class GremlinSqlTranslator {
 
    }
 
-   private void appendOrderBy(StringBuilder sql, String orderByProperty, String orderDirection) {
-      if (orderByProperty != null) {
-         String direction = orderDirection != null ? orderDirection : "ASC";
-         sql.append(" ORDER BY ").append(this.dialect.quoteIdentifier(orderByProperty)).append(" ").append(direction);
-      }
+    private void appendOrderBy(StringBuilder sql, String orderByProperty, String orderDirection) {
+       if (orderByProperty != null) {
+          String direction = orderDirection != null ? orderDirection : "ASC";
+          // When ordering by projected aliases, don't apply dialect quoting
+          // as the alias name already matches the AS clause exactly.
+          sql.append(" ORDER BY ").append(orderByProperty).append(" ").append(direction);
+       }
 
-   }
+    }
 
    private void appendEqAliasPredicate(StringBuilder sql, WhereClause whereClause, List<AsAlias> asAliases, String currentAlias, String idCol, boolean hasExistingWhere) {
       String targetAlias = whereClause.left();
@@ -1656,7 +1908,7 @@ public class GremlinSqlTranslator {
    }
 
    private ParsedTraversal withHops(ParsedTraversal parsed, List<HopStep> newHops) {
-      return new ParsedTraversal(parsed.label(), parsed.filters(), parsed.valueProperty(), parsed.limit(), parsed.preHopLimit(), newHops, parsed.countRequested(), parsed.sumRequested(), parsed.meanRequested(), parsed.projections(), parsed.groupCountProperty(), parsed.orderByProperty(), parsed.orderDirection(), parsed.asAliases(), parsed.selectFields(), parsed.whereClause(), parsed.dedupRequested(), parsed.pathSeen(), parsed.pathByProperties(), parsed.whereByProperty(), parsed.simplePathRequested(), parsed.groupCountKeySpec(), parsed.orderByCountDesc());
+      return new ParsedTraversal(parsed.label(), parsed.filters(), parsed.valueProperty(), parsed.valueMapRequested(), parsed.limit(), parsed.preHopLimit(), newHops, parsed.countRequested(), parsed.sumRequested(), parsed.meanRequested(), parsed.projections(), parsed.groupCountProperty(), parsed.orderByProperty(), parsed.orderDirection(), parsed.asAliases(), parsed.selectFields(), parsed.whereClause(), parsed.dedupRequested(), parsed.pathSeen(), parsed.pathByProperties(), parsed.whereByProperty(), parsed.simplePathRequested(), parsed.groupCountKeySpec(), parsed.orderByCountDesc());
    }
 
    private boolean appendHopFiltersWithTargetFallback(StringBuilder sql, List<Object> params, List<HasFilter> filters, VertexMapping startVertexMapping, String finalVertexAlias, VertexMapping finalVertexMapping, ParsedTraversal parsed, MappingConfig mappingConfig, boolean hasWhere) {
@@ -1664,7 +1916,7 @@ public class GremlinSqlTranslator {
       HopStep lastHop = parsed.hops().isEmpty() ? null : parsed.hops().get(parsed.hops().size() - 1);
       EdgeMapping terminalEdgeMapping = null;
       String terminalEdgeAlias = null;
-      if (lastHop != null && ("outE".equals(lastHop.direction()) || "inE".equals(lastHop.direction()))) {
+      if (lastHop != null && ("outE".equals(lastHop.direction()) || "inE".equals(lastHop.direction()) || "bothE".equals(lastHop.direction()))) {
          terminalEdgeMapping = this.resolveEdgeMapping(lastHop.singleLabel(), mappingConfig);
          terminalEdgeAlias = "e" + parsed.hops().size();
       }
@@ -1689,8 +1941,13 @@ public class GremlinSqlTranslator {
             }
          }
 
-         sql.append(where ? " AND " : " WHERE ").append(alias).append('.').append(mappedColumn).append(" ").append(filter.operator()).append(" ?");
-         params.add(filter.value());
+         sql.append(where ? " AND " : " WHERE ").append(alias).append('.').append(mappedColumn);
+         if ("IS NULL".equals(filter.operator())) {
+            sql.append(" IS NULL");
+         } else {
+            sql.append(" ").append(filter.operator()).append(" ?");
+            params.add(filter.value());
+         }
          where = true;
       }
 
@@ -1701,7 +1958,7 @@ public class GremlinSqlTranslator {
       VertexMapping current = startVertexMapping;
       for (HopStep hop : hops) {
          if (!"outV".equals(hop.direction()) && !"inV".equals(hop.direction())
-               && !"outE".equals(hop.direction()) && !"inE".equals(hop.direction())) {
+               && !"outE".equals(hop.direction()) && !"inE".equals(hop.direction()) && !"bothE".equals(hop.direction())) {
             EdgeMapping edgeMapping = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
             boolean outDirection = "out".equals(hop.direction());
             current = this.resolveHopTargetVertexMapping(mappingConfig, edgeMapping, outDirection, current);
@@ -1722,7 +1979,7 @@ public class GremlinSqlTranslator {
          }
          if (hopIndex != null && hopIndex > 0 && hopIndex <= parsed.hops().size()) {
             HopStep hop = parsed.hops().get(hopIndex - 1);
-            if ("outE".equals(hop.direction()) || "inE".equals(hop.direction())
+            if ("outE".equals(hop.direction()) || "inE".equals(hop.direction()) || "bothE".equals(hop.direction())
                   || "out".equals(hop.direction()) || "in".equals(hop.direction())) {
                EdgeMapping em = this.resolveEdgeMapping(hop.singleLabel(), mappingConfig);
                return "SUM(e" + hopIndex + "." + this.mapEdgeProperty(em, parsed.valueProperty()) + ")";
@@ -1863,23 +2120,99 @@ public class GremlinSqlTranslator {
    }
 
    private WhereClause parseWhere(String rawWhere) {
-      Matcher neqMatcher = WHERE_NEQ_PATTERN.matcher(rawWhere);
+      String expression = rawWhere == null ? "" : rawWhere.trim();
+      if (expression.startsWith("and(") && expression.endsWith(")")) {
+         String inner = expression.substring(4, expression.length() - 1).trim();
+         List<String> args = this.splitTopLevelPredicateArgs(inner);
+         if (args.size() < 2) {
+            throw new IllegalArgumentException("where(and(...)) requires at least two predicates");
+         }
+         List<WhereClause> clauses = args.stream().map(this::parseWhere).toList();
+         return new WhereClause(WhereKind.AND, null, null, List.of(), clauses);
+      }
+      if (expression.startsWith("or(") && expression.endsWith(")")) {
+         String inner = expression.substring(3, expression.length() - 1).trim();
+         List<String> args = this.splitTopLevelPredicateArgs(inner);
+         if (args.size() < 2) {
+            throw new IllegalArgumentException("where(or(...)) requires at least two predicates");
+         }
+         List<WhereClause> clauses = args.stream().map(this::parseWhere).toList();
+         return new WhereClause(WhereKind.OR, null, null, List.of(), clauses);
+      }
+      if (expression.startsWith("not(") && expression.endsWith(")")) {
+         String inner = expression.substring(4, expression.length() - 1).trim();
+         if (inner.isBlank()) {
+            throw new IllegalArgumentException("where(not(...)) requires one predicate");
+         }
+         return new WhereClause(WhereKind.NOT, null, null, List.of(), List.of(this.parseWhere(inner)));
+      }
+
+      Matcher neqMatcher = WHERE_NEQ_PATTERN.matcher(expression);
       if (neqMatcher.matches()) return new WhereClause(WhereKind.NEQ_ALIAS, neqMatcher.group(1), neqMatcher.group(2), List.of());
-      Matcher eqAliasMatcher = WHERE_EQ_ALIAS_PATTERN.matcher(rawWhere);
+      Matcher eqAliasMatcher = WHERE_EQ_ALIAS_PATTERN.matcher(expression);
       if (eqAliasMatcher.matches()) return new WhereClause(WhereKind.EQ_ALIAS, eqAliasMatcher.group(1), null, List.of());
-      Matcher gtMatcher = WHERE_SELECT_IS_GT_PATTERN.matcher(rawWhere);
+      Matcher gtMatcher = WHERE_SELECT_IS_GT_PATTERN.matcher(expression);
       if (gtMatcher.matches()) {
-         boolean isGte = rawWhere.contains(".is(gte(");
+         boolean isGte = expression.contains(".is(gte(");
          return new WhereClause(isGte ? WhereKind.PROJECT_GTE : WhereKind.PROJECT_GT, gtMatcher.group(1), gtMatcher.group(2).trim(), List.of());
       }
-      Matcher edgeExistsMatcher = WHERE_EDGE_EXISTS_PATTERN.matcher(rawWhere);
+      Matcher edgeExistsMatcher = WHERE_EDGE_EXISTS_PATTERN.matcher(expression);
       if (edgeExistsMatcher.matches()) return new WhereClause(WhereKind.EDGE_EXISTS, edgeExistsMatcher.group(1), edgeExistsMatcher.group(2), this.parseHasChain(edgeExistsMatcher.group(3)));
-      Matcher neighborMatcher = WHERE_OUT_NEIGHBOR_HAS_PATTERN.matcher(rawWhere);
+      Matcher neighborMatcher = WHERE_OUT_NEIGHBOR_HAS_PATTERN.matcher(expression);
       if (neighborMatcher.matches()) {
          WhereKind kind = "out".equals(neighborMatcher.group(1)) ? WhereKind.OUT_NEIGHBOR_HAS : WhereKind.IN_NEIGHBOR_HAS;
          return new WhereClause(kind, neighborMatcher.group(1), neighborMatcher.group(2), this.parseHasChain(neighborMatcher.group(3)));
       }
-      throw new IllegalArgumentException("Unsupported where() predicate: " + rawWhere);
+      Matcher edgeCountIsMatcher = WHERE_EDGE_COUNT_IS_PATTERN.matcher(expression);
+      if (edgeCountIsMatcher.matches()) {
+         String direction = edgeCountIsMatcher.group(1);
+         String edgeLabel = edgeCountIsMatcher.group(2);
+         String opGroup = edgeCountIsMatcher.group(4);
+         String opValueGroup = edgeCountIsMatcher.group(5);
+         String bareNumericGroup = edgeCountIsMatcher.group(6);
+         String operator = opGroup != null ? opGroup : "eq";
+         String rightValue = opValueGroup != null ? opValueGroup.trim() : bareNumericGroup;
+         return new WhereClause(WhereKind.EDGE_EXISTS, direction, edgeLabel, List.of(new HasFilter("count", rightValue, operator)));
+      }
+      throw new IllegalArgumentException("Unsupported where() predicate: " + expression);
+   }
+
+   private List<String> splitTopLevelPredicateArgs(String text) {
+      List<String> args = new ArrayList<>();
+      StringBuilder current = new StringBuilder();
+      boolean inSingleQuote = false;
+      boolean inDoubleQuote = false;
+      int depth = 0;
+
+      for (int i = 0; i < text.length(); i++) {
+         char c = text.charAt(i);
+         if (c == '\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+            current.append(c);
+            continue;
+         }
+         if (c == '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+            current.append(c);
+            continue;
+         }
+         if (!inSingleQuote && !inDoubleQuote) {
+            if (c == '(') {
+               depth++;
+            } else if (c == ')') {
+               depth--;
+            } else if (c == ',' && depth == 0) {
+               args.add(current.toString().trim());
+               current.setLength(0);
+               continue;
+            }
+         }
+         current.append(c);
+      }
+      if (!current.isEmpty()) {
+         args.add(current.toString().trim());
+      }
+      return args;
    }
 
    private static void ensureArgCount(String step, List<String> args, int expected) {
@@ -1974,6 +2307,9 @@ public class GremlinSqlTranslator {
          ProjectionKind kind = "outV".equals(endpoint) ? ProjectionKind.OUT_VERTEX_PROPERTY : ProjectionKind.IN_VERTEX_PROPERTY;
          return new ProjectionField(alias, kind, property);
       }
+      if ("identity()".equals(expression) || "__.identity()".equals(expression)) {
+         return new ProjectionField(alias, ProjectionKind.IDENTITY, "id");
+      }
       if (expression.contains("(")) throw new IllegalArgumentException("Unsupported by() projection expression: " + expression);
       String property = this.unquote(expression);
       if (property.isBlank()) throw new IllegalArgumentException("by(...) property must be non-empty");
@@ -1983,6 +2319,7 @@ public class GremlinSqlTranslator {
    private ParsedTraversal parseSteps(List<com.graphqueryengine.query.parser.model.GremlinStep> stepNodes, String rootIdFilter) {
       String label = null;
       String valuesProperty = null;
+      boolean valueMapRequested = false;
       String groupCountProperty = null;
       GroupCountKeySpec groupCountKeySpec = null;
       boolean groupCountSeen = false;
@@ -2027,18 +2364,42 @@ public class GremlinSqlTranslator {
                ensureArgCount(stepName, args, 2);
                filters.add(this.parseHasArgument(this.unquote(args.get(0)), args.get(1).trim()));
             }
+            case "hasId" -> {
+               ensureArgCount(stepName, args, 1);
+               filters.add(new HasFilter("id", this.unquote(args.get(0))));
+            }
+            case "hasNot" -> {
+               ensureArgCount(stepName, args, 1);
+               filters.add(new HasFilter(this.unquote(args.get(0)), null, "IS NULL"));
+            }
             case "values" -> { ensureArgCount(stepName, args, 1); valuesProperty = this.unquote(args.get(0)); }
+            case "is" -> {
+               ensureArgCount(stepName, args, 1);
+               if (valuesProperty == null || valuesProperty.isBlank()) {
+                  throw new IllegalArgumentException("is(...) is only supported after values('property')");
+               }
+               filters.add(this.parseHasArgument(valuesProperty, args.get(0).trim()));
+            }
+            case "valueMap" -> {
+               if (!args.isEmpty()) throw new IllegalArgumentException("valueMap() currently supports zero arguments only");
+               valueMapRequested = true;
+            }
             case "out" -> {
                if (args.isEmpty()) throw new IllegalArgumentException("out expects at least 1 argument");
                hopsSeen = true;
                hops.add(new HopStep("out", args.stream().map(this::unquote).toList()));
             }
-            case "in" -> {
-               if (args.isEmpty()) throw new IllegalArgumentException("in expects at least 1 argument");
-               hopsSeen = true;
-               hops.add(new HopStep("in", args.stream().map(this::unquote).toList()));
-            }
-            case "outV" -> {
+             case "in" -> {
+                if (args.isEmpty()) throw new IllegalArgumentException("in expects at least 1 argument");
+                hopsSeen = true;
+                hops.add(new HopStep("in", args.stream().map(this::unquote).toList()));
+             }
+             case "both" -> {
+                if (args.isEmpty()) throw new IllegalArgumentException("both expects at least 1 argument");
+                hopsSeen = true;
+                hops.add(new HopStep("both", args.stream().map(this::unquote).toList()));
+             }
+             case "outV" -> {
                ensureArgCount(stepName, args, 0);
                hopsSeen = true;
                if (this.normalizeEndpointHop("outV", hops)) hops.add(new HopStep("outV", List.of()));
@@ -2048,10 +2409,26 @@ public class GremlinSqlTranslator {
                hopsSeen = true;
                if (this.normalizeEndpointHop("inV", hops)) hops.add(new HopStep("inV", List.of()));
             }
-            case "both" -> {
-               if (args.size() > 1) throw new IllegalArgumentException("both expects 0 or 1 argument(s)");
+            case "bothV" -> {
+               ensureArgCount(stepName, args, 0);
                hopsSeen = true;
-               hops.add(new HopStep("both", args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)))));
+               hops.add(new HopStep("bothV", List.of()));
+            }
+            case "otherV" -> {
+               ensureArgCount(stepName, args, 0);
+               hopsSeen = true;
+               if (hops.isEmpty()) {
+                  throw new IllegalArgumentException("otherV() must follow outE() or inE()");
+               }
+
+               HopStep previous = hops.get(hops.size() - 1);
+               if ("outE".equals(previous.direction())) {
+                  if (this.normalizeEndpointHop("inV", hops)) hops.add(new HopStep("inV", List.of()));
+               } else if ("inE".equals(previous.direction())) {
+                  if (this.normalizeEndpointHop("outV", hops)) hops.add(new HopStep("outV", List.of()));
+               } else {
+                  throw new IllegalArgumentException("otherV() must follow outE() or inE()");
+               }
             }
             case "repeat" -> {
                if (rawStepArgs.isBlank()) throw new IllegalArgumentException("repeat() requires an argument");
@@ -2110,6 +2487,11 @@ public class GremlinSqlTranslator {
                hopsSeen = true;
                hops.add(new HopStep("inE", args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)))));
             }
+            case "bothE" -> {
+               if (args.size() > 1) throw new IllegalArgumentException("bothE expects 0 or 1 argument(s)");
+               hopsSeen = true;
+               hops.add(new HopStep("bothE", args.isEmpty() ? List.of() : List.of(this.unquote(args.get(0)))));
+            }
             case "as" -> {
                ensureArgCount(stepName, args, 1);
                String aliasName = this.unquote(args.get(0));
@@ -2128,6 +2510,7 @@ public class GremlinSqlTranslator {
                whereByPending = whereClause.kind() == WhereKind.NEQ_ALIAS;
             }
             case "dedup" -> { ensureArgCount(stepName, args, 0); dedupRequested = true; }
+            case "identity" -> ensureArgCount(stepName, args, 0);
             case "path" -> { ensureArgCount(stepName, args, 0); pathSeen = true; }
             case "by" -> {
                if (args.isEmpty()) throw new IllegalArgumentException("by(...) expects at least 1 argument");
@@ -2138,21 +2521,26 @@ public class GremlinSqlTranslator {
                } else if (selectSeen) {
                   if (selectByExpressions.size() >= selectAliases.size()) throw new IllegalArgumentException("select(...) has more by(...) modulators than selected aliases");
                   selectByExpressions.add(rawStepArgs);
-               } else if (orderSeen && orderByProperty == null && !orderByCountDesc) {
-                  List<String> byArgsTrimmed = args.stream().map(String::trim).toList();
-                  if (byArgsTrimmed.size() == 2 && ("values".equals(byArgsTrimmed.get(0)) || "__.values()".equals(byArgsTrimmed.get(0)))) {
-                     String dirToken = byArgsTrimmed.get(1).toLowerCase();
-                     orderByCountDesc = true;
-                     orderDirection = (dirToken.equals("desc") || dirToken.equals("order.desc")) ? "DESC" : "ASC";
-                  } else if (rawStepArgs.contains("select(") && rawStepArgs.contains("Order.")) {
-                     int selectStart = rawStepArgs.indexOf("select(") + 7;
-                     int selectEnd = rawStepArgs.indexOf(")", selectStart);
-                     orderByProperty = this.unquote(rawStepArgs.substring(selectStart, selectEnd));
-                     orderDirection = rawStepArgs.contains("Order.desc") ? "DESC" : "ASC";
-                  } else {
-                     orderByProperty = this.unquote(rawStepArgs);
-                     orderDirection = "ASC";
-                  }
+                } else if (orderSeen && orderByProperty == null && !orderByCountDesc) {
+                   List<String> byArgsTrimmed = args.stream().map(String::trim).toList();
+                   if (byArgsTrimmed.size() == 2 && ("values".equals(byArgsTrimmed.get(0)) || "__.values()".equals(byArgsTrimmed.get(0)))) {
+                      String dirToken = byArgsTrimmed.get(1).toLowerCase();
+                      orderByCountDesc = true;
+                      orderDirection = (dirToken.equals("desc") || dirToken.equals("order.desc")) ? "DESC" : "ASC";
+                   } else if (byArgsTrimmed.size() == 2 && !byArgsTrimmed.get(0).contains("(")) {
+                      // Handle .by(propertyName, Order.desc) or .by(propertyName, Order.asc)
+                      orderByProperty = this.unquote(byArgsTrimmed.get(0));
+                      String dirToken = byArgsTrimmed.get(1).toLowerCase();
+                      orderDirection = (dirToken.contains("desc") || dirToken.equals("order.desc")) ? "DESC" : "ASC";
+                   } else if (rawStepArgs.contains("select(") && rawStepArgs.contains("Order.")) {
+                      int selectStart = rawStepArgs.indexOf("select(") + 7;
+                      int selectEnd = rawStepArgs.indexOf(")", selectStart);
+                      orderByProperty = this.unquote(rawStepArgs.substring(selectStart, selectEnd));
+                      orderDirection = rawStepArgs.contains("Order.desc") ? "DESC" : "ASC";
+                   } else {
+                      orderByProperty = this.unquote(rawStepArgs);
+                      orderDirection = "ASC";
+                   }
                } else if (groupCountSeen && groupCountProperty == null && groupCountKeySpec == null) {
                   GroupCountKeySpec parsedKey = this.tryParseGroupCountSelectKey(rawStepArgs);
                   if (parsedKey != null) { groupCountKeySpec = parsedKey; }
@@ -2211,7 +2599,7 @@ public class GremlinSqlTranslator {
             throw new IllegalArgumentException((meanRequested ? "mean()" : "sum()") + " requires values('property') before aggregation");
       }
 
-      return new ParsedTraversal(label, filters, valuesProperty, limit, preHopLimit, hops, countRequested, sumRequested, meanRequested, projections, groupCountProperty, orderByProperty, orderDirection, asAliases, selectFields, whereClause, dedupRequested, pathSeen, pathByProperties, whereByProperty, simplePathRequested, groupCountKeySpec, orderByCountDesc);
+      return new ParsedTraversal(label, filters, valuesProperty, valueMapRequested, limit, preHopLimit, hops, countRequested, sumRequested, meanRequested, projections, groupCountProperty, orderByProperty, orderDirection, asAliases, selectFields, whereClause, dedupRequested, pathSeen, pathByProperties, whereByProperty, simplePathRequested, groupCountKeySpec, orderByCountDesc);
    }
 
    // ── Inner types ───────────────────────────────────────────────────────────
@@ -2230,7 +2618,7 @@ public class GremlinSqlTranslator {
    }
 
    private record ParsedTraversal(
-         String label, List<HasFilter> filters, String valueProperty,
+         String label, List<HasFilter> filters, String valueProperty, boolean valueMapRequested,
          Integer limit, Integer preHopLimit, List<HopStep> hops,
          boolean countRequested, boolean sumRequested, boolean meanRequested,
          List<ProjectionField> projections, String groupCountProperty,
@@ -2247,7 +2635,7 @@ public class GremlinSqlTranslator {
    private enum ProjectionKind {
       EDGE_PROPERTY, OUT_VERTEX_PROPERTY, IN_VERTEX_PROPERTY,
       EDGE_DEGREE, OUT_VERTEX_COUNT, IN_VERTEX_COUNT,
-      OUT_NEIGHBOR_PROPERTY, IN_NEIGHBOR_PROPERTY, CHOOSE_VALUES_IS_CONSTANT
+      OUT_NEIGHBOR_PROPERTY, IN_NEIGHBOR_PROPERTY, CHOOSE_VALUES_IS_CONSTANT, IDENTITY
    }
 
    private record ProjectionField(String alias, ProjectionKind kind, String property) {}
@@ -2256,9 +2644,13 @@ public class GremlinSqlTranslator {
 
    private record SelectField(String alias, String property) {}
 
-   private record WhereClause(WhereKind kind, String left, String right, List<HasFilter> filters) {}
+   private record WhereClause(WhereKind kind, String left, String right, List<HasFilter> filters, List<WhereClause> clauses) {
+      WhereClause(WhereKind kind, String left, String right, List<HasFilter> filters) {
+         this(kind, left, right, filters, List.of());
+      }
+   }
 
    private enum WhereKind {
-      NEQ_ALIAS, EQ_ALIAS, PROJECT_GT, PROJECT_GTE, EDGE_EXISTS, OUT_NEIGHBOR_HAS, IN_NEIGHBOR_HAS
+      NEQ_ALIAS, EQ_ALIAS, PROJECT_GT, PROJECT_GTE, EDGE_EXISTS, OUT_NEIGHBOR_HAS, IN_NEIGHBOR_HAS, AND, OR, NOT
    }
 }

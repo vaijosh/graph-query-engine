@@ -4,6 +4,7 @@ import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.GraphQueryTranslator;
+import com.graphqueryengine.query.api.QueryPlan;
 import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.parser.GremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
@@ -48,6 +49,17 @@ public class SqlGraphQueryTranslator implements GraphQueryTranslator {
         return switch (mode) {
             case ICEBERG -> translateIcebergWithPlan(parsed, mappingConfig);
             case STANDARD -> translateStandardWithPlan(parsed, mappingConfig);
+        };
+    }
+
+    @Override
+    public QueryPlan plan(String gremlin, MappingConfig mappingConfig) {
+        GremlinParseResult parsed = parser.parse(gremlin);
+        return switch (mode) {
+            case ICEBERG -> delegate.planFromParsed(parsed, mappingConfig);
+            case STANDARD -> looksLikeCatalogQualifiedMapping(mappingConfig)
+                    ? icebergFallbackDelegate.planFromParsed(parsed, mappingConfig)
+                    : delegate.planFromParsed(parsed, mappingConfig);
         };
     }
 

@@ -243,35 +243,53 @@ try {{
             bankMap[toBankId] = toBank
         }}
 
-        def fromKey = fromBankId + ':' + fromAcctId
-        def toKey = toBankId + ':' + toAcctId
-        def suspicious = '1'.equals(laundering)
+         def fromKey = fromBankId + ':' + fromAcctId
+         def toKey = toBankId + ':' + toAcctId
+         def suspicious = '1'.equals(laundering)
 
-        Vertex fromAcct = accountMap[fromKey]
-        if (fromAcct == null) {{
-            fromAcct = g.addV('Account')
-                .property('accountId', fromAcctId)
-                .property('bankId', fromBankId)
-                .property('accountType', Math.floorMod(fromAcctId.hashCode(), 2) == 0 ? 'CORPORATE' : 'PERSONAL')
-                .property('riskScore', suspicious ? '0.85' : '0.15')
-                .property('isBlocked', 'false')
-                .property('openedDate', '2020-01-01')
-                .next()
-            accountMap[fromKey] = fromAcct
-        }}
+         // Create diverse risk scores (10-95 range) and blocked status based on hash.
+         // Keep riskScore numeric so gt()/lt() predicates work in Gremlin execution.
+         def fromRiskHash = Math.floorMod(fromAcctId.hashCode() * 7, 100)
+         def fromBlocked = (fromRiskHash < 10) ? 'true' : 'false'
+         def fromRiskScore = (fromRiskHash < 50) ? (10 + fromRiskHash) : (70 + (fromRiskHash - 50) * 2)
 
-        Vertex toAcct = accountMap[toKey]
-        if (toAcct == null) {{
-            toAcct = g.addV('Account')
-                .property('accountId', toAcctId)
-                .property('bankId', toBankId)
-                .property('accountType', Math.floorMod(toAcctId.hashCode(), 2) == 0 ? 'CORPORATE' : 'PERSONAL')
-                .property('riskScore', suspicious ? '0.75' : '0.10')
-                .property('isBlocked', 'false')
-                .property('openedDate', '2020-01-01')
-                .next()
-            accountMap[toKey] = toAcct
-        }}
+         def toRiskHash = Math.floorMod(toAcctId.hashCode() * 13, 100)
+         def toBlocked = (toRiskHash < 10) ? 'true' : 'false'
+         def toRiskScore = (toRiskHash < 50) ? (15 + toRiskHash) : (75 + (toRiskHash - 50) * 2)
+
+         // ~30% of accounts have no openedDate (will be NULL in SQL)
+         def fromHasOpenedDate = Math.floorMod(fromAcctId.hashCode() * 11, 100) >= 30
+         def toHasOpenedDate = Math.floorMod(toAcctId.hashCode() * 17, 100) >= 30
+
+         Vertex fromAcct = accountMap[fromKey]
+         if (fromAcct == null) {{
+             def fromBuilder = g.addV('Account')
+                 .property('accountId', fromAcctId)
+                 .property('bankId', fromBankId)
+                 .property('accountType', Math.floorMod(fromAcctId.hashCode(), 2) == 0 ? 'CORPORATE' : 'PERSONAL')
+                 .property('riskScore', fromRiskScore)
+                 .property('isBlocked', fromBlocked)
+             if (fromHasOpenedDate) {{
+                 fromBuilder.property('openedDate', '2020-01-01')
+             }}
+             fromAcct = fromBuilder.next()
+             accountMap[fromKey] = fromAcct
+         }}
+
+         Vertex toAcct = accountMap[toKey]
+         if (toAcct == null) {{
+             def toBuilder = g.addV('Account')
+                 .property('accountId', toAcctId)
+                 .property('bankId', toBankId)
+                 .property('accountType', Math.floorMod(toAcctId.hashCode(), 2) == 0 ? 'CORPORATE' : 'PERSONAL')
+                 .property('riskScore', toRiskScore)
+                 .property('isBlocked', toBlocked)
+             if (toHasOpenedDate) {{
+                 toBuilder.property('openedDate', '2020-01-01')
+             }}
+             toAcct = toBuilder.next()
+             accountMap[toKey] = toAcct
+         }}
 
         Vertex txVertex = txMap[txId]
         if (txVertex == null) {{
@@ -325,7 +343,10 @@ try {{
                 'routedAt', ts)
         }}
 
-        if (suspicious) {{
+        // Flag only a subset of suspicious accounts so notebook demos can show
+        // both suspicious-and-flagged and suspicious-but-unflagged patterns.
+        def shouldFlag = suspicious && (Math.floorMod((fromAcctId + ':' + txId).hashCode(), 100) < 35)
+        if (shouldFlag) {{
             def severity = amount > 50000 ? 'HIGH' : 'MEDIUM'
             Vertex alert = g.addV('Alert')
                 .property('alertId', 'ALERT-' + txId)

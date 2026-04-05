@@ -20,6 +20,14 @@ public interface GraphQueryTranslator {
     default TranslationResult translateWithPlan(String gremlin, MappingConfig mappingConfig) {
         return translate(gremlin, mappingConfig);
     }
+
+    /**
+     * Build planner-stage debug output without requiring callers to request SQL rendering first.
+     * Implementations that do not support planning may return {@code null}.
+     */
+    default QueryPlan plan(String gremlin, MappingConfig mappingConfig) {
+        return null;
+    }
 }
 
 
