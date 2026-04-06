@@ -235,6 +235,15 @@ python3 scripts/benchmark_lsqb.py \
 
 See `BENCHMARKING.md` for full options and workload file format.
 
+## Testing
+
+### Unit Tests
+
+Run all tests:
+```bash
+mvn test
+```
+
 ## Project layout
 
 ```
