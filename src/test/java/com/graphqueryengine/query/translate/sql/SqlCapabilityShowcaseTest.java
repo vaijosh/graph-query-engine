@@ -6,6 +6,7 @@ import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.TranslationResult;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -299,6 +300,34 @@ class SqlCapabilityShowcaseTest {
         assertTrue(sql.contains("EXISTS"));
         assertTrue(sql.contains("COUNT(*)"));
         assertTrue(sql.contains("LIMIT 10"));
+    }
+
+    @Test
+    void test_exact_suspicious_but_unflagged_projection() {
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').where(and(outE('TRANSFER').has('isLaundering','1'), outE('FLAGGED_BY').count().is(0))).project('accountId','bankId').by('accountId').by('bankId').limit(10)",
+                amlMapping()
+        );
+
+        assertEquals(
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\" FROM aml_accounts v WHERE ((EXISTS (SELECT 1 FROM aml_transfers we WHERE we.from_account_id = v.id AND we.is_laundering = ?)) AND ((SELECT COUNT(*) FROM aml_account_alert we WHERE we.account_id = v.id) = ?)) LIMIT 10",
+                result.sql()
+        );
+        assertEquals(List.of("1", 0), result.parameters());
+    }
+
+    @Test
+    void test_exact_suspicious_but_unflagged_with_degree_projection() {
+        TranslationResult result = translator.translate(
+                "g.V().hasLabel('Account').where(and(outE('TRANSFER').has('isLaundering','1'), outE('FLAGGED_BY').count().is(0))).project('accountId','bankId','riskScore','suspiciousOut','totalOut').by('accountId').by('bankId').by('riskScore').by(outE('TRANSFER').has('isLaundering','1').count()).by(outE('TRANSFER').count()).order().by(select('suspiciousOut'), Order.desc).limit(20)",
+                amlMapping()
+        );
+
+        assertEquals(
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", v.risk_score AS \"riskScore\", (SELECT COUNT(*) FROM aml_transfers WHERE from_account_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE from_account_id = v.id) AS \"totalOut\" FROM aml_accounts v WHERE ((EXISTS (SELECT 1 FROM aml_transfers we WHERE we.from_account_id = v.id AND we.is_laundering = ?)) AND ((SELECT COUNT(*) FROM aml_account_alert we WHERE we.account_id = v.id) = ?)) ORDER BY suspiciousOut DESC LIMIT 20",
+                result.sql()
+        );
+        assertEquals(List.of("1", 0), result.parameters());
     }
 
     @Test

@@ -326,7 +326,7 @@ class GremlinSqlTranslatorTest {
                 "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\" FROM aml_accounts v WHERE (SELECT COUNT(*) FROM aml_transfers we WHERE we.out_id = v.id) = ? LIMIT 10",
                 result.sql()
         );
-        assertEquals(List.of("0"), result.parameters());
+        assertEquals(List.of(0), result.parameters());
     }
 
     @Test

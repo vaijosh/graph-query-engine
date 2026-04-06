@@ -6,7 +6,7 @@ Accepts a graph mapping file and Gremlin traversal strings, translates supported
 
 ```bash
 mvn exec:java   # start service on port 7000
-mvn test                   # run all tests
+mvn test        # run all tests
 ```
 
 ## Configuration
@@ -14,11 +14,22 @@ mvn test                   # run all tests
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `7000` | HTTP port |
-| `DB_URL` | `jdbc:h2:mem:graph;DB_CLOSE_DELAY=-1` | JDBC connection URL |
+| `DB_URL` | `jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE` | JDBC connection URL for SQL translation/execution state (persistent file-based H2) |
 | `DB_USER` | `sa` | Database user |
 | `DB_PASSWORD` | _(empty)_ | Database password |
 | `DB_DRIVER` | `org.h2.Driver` | JDBC driver class |
 | `GRAPH_PROVIDER` | `tinkergraph` | Gremlin execution backend |
+| `TINKERGRAPH_LOCATION` | `./data/graph.gryo` | Path to persisted TinkerGraph data file (loaded on startup, saved after mutating Gremlin calls) |
+
+For a temporary in-memory SQL DB, set `DB_URL=jdbc:h2:mem:graph;DB_CLOSE_DELAY=-1`.
+
+Run with explicit persistence paths:
+
+```bash
+DB_URL="jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE" \
+TINKERGRAPH_LOCATION="./data/graph.gryo" \
+mvn exec:java
+```
 
 ## Endpoints
 

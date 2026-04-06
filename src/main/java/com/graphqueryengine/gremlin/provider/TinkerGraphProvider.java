@@ -8,25 +8,44 @@ import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
+import org.apache.tinkerpop.gremlin.structure.io.gryo.GryoIo;
 import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
 
 import javax.script.Bindings;
 import javax.script.ScriptException;
 import javax.script.SimpleBindings;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Logger;
 
 public class TinkerGraphProvider implements GraphProvider {
+    private static final Logger LOG = Logger.getLogger(TinkerGraphProvider.class.getName());
+
+    /** Default path for the persisted graph file (Gryo binary format). */
+    private static final String DEFAULT_GRAPH_LOCATION = "./data/graph.gryo";
+
     private final GremlinGroovyScriptEngine scriptEngine = new GremlinGroovyScriptEngine();
+    private final String graphLocation;
 
     private TinkerGraph graph;
     private GraphTraversalSource traversal;
     private GraphTransactionApi transactionApi;
 
     public TinkerGraphProvider() {
+        this(resolveGraphLocation());
+    }
+
+    public TinkerGraphProvider(String graphLocation) {
+        this.graphLocation = graphLocation;
         initializeIfNeeded();
+    }
+
+    private static String resolveGraphLocation() {
+        String env = System.getenv("TINKERGRAPH_LOCATION");
+        return (env != null && !env.isBlank()) ? env : DEFAULT_GRAPH_LOCATION;
     }
 
     @Override
@@ -56,6 +75,7 @@ public class TinkerGraphProvider implements GraphProvider {
         try {
             GraphTransactionApi.TransactionExecution<GremlinExecutionResult> txExecution = transactionApi.execute(() -> execute(gremlin));
             GremlinExecutionResult result = txExecution.value();
+            persistGraph();
             return new GremlinTransactionalExecutionResult(
                     result.gremlin(),
                     result.results(),
@@ -89,14 +109,51 @@ public class TinkerGraphProvider implements GraphProvider {
         return traversal;
     }
 
+    @SuppressWarnings("DataFlowIssue")
     private void initializeIfNeeded() {
         if (graph != null && traversal != null && transactionApi != null) {
             return;
         }
 
         graph = TinkerGraph.open();
+
+        File graphFile = new File(graphLocation);
+        if (graphFile.exists()) {
+            try {
+                graph.io(GryoIo.build()).readGraph(graphLocation);
+                long vertexCount = graph.traversal().V().count().next();
+                long edgeCount = graph.traversal().E().count().next();
+                LOG.info("Loaded persistent graph from " + graphLocation
+                        + " (" + vertexCount + " vertices, " + edgeCount + " edges)");
+            } catch (Exception e) {
+                LOG.warning("Failed to load graph from " + graphLocation + ": " + e.getMessage()
+                        + " — starting with empty graph.");
+                graph.close();
+                graph = TinkerGraph.open();
+            }
+        } else {
+            LOG.info("No existing graph file at " + graphLocation + " — starting with empty in-memory graph.");
+        }
+
         traversal = graph.traversal();
         transactionApi = new TinkerGraphTransactionApi(graph);
+    }
+
+    /** Write the current graph state to the configured file location. */
+    @SuppressWarnings("DataFlowIssue")
+    private void persistGraph() {
+        if (graphLocation == null || graphLocation.isBlank()) {
+            return;
+        }
+        try {
+            File parent = new File(graphLocation).getParentFile();
+            if (parent != null && !parent.exists()) {
+                boolean ignored = parent.mkdirs();
+            }
+            graph.io(GryoIo.build()).writeGraph(graphLocation);
+        } catch (Exception e) {
+            LOG.warning("Failed to persist graph to " + graphLocation + ": " + e.getMessage());
+        }
     }
 
     private List<Object> normalizeResult(Object raw) {
