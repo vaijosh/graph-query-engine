@@ -108,6 +108,7 @@ FROM prod.aml.accounts
 Sample mappings in `mappings/`.
 For Iceberg examples, see `mappings/iceberg-mapping.json`.
 For local container testing with Trino, use `mappings/iceberg-local-mapping.json`.
+For a full mapping reference (including `outColumn`/`inColumn` and FK-style relationships), see `MAPPINGS-README.md`.
 
 ## Local Iceberg container test
 
