@@ -12,8 +12,176 @@ The service is designed for a mapping-driven model where vertex/edge labels are 
 This document describes the current implementation in `src/main/java/com/graphqueryengine` and the current behavior covered by tests.
 
 ---
-
 ## 2) Top-Level Architecture
+
+---
+### Architecture Diagram
+
+```text
+┌───────────────────────────────────┐
+│        GREMLIN REST CLIENT        │
+│  (Notebooks / curl / demo_app.py) │
+└────────────────┬──────────────────┘
+                 │  HTTP  (port 7000)
+                 ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                         REST SERVER — App.java  (Javalin)                              │
+│                                                                                        │
+│  ┌────────────────┐  ┌────────────────────────┐  ┌───────────────────────────────────┐ │
+│  │ GET /health    │  │  Mapping Endpoints     │  │  Gremlin / Query Endpoints        │ │
+│  │                │  │  POST /mapping/upload  │  │  POST /gremlin/query   (execute)  │ │
+│  │                │  │  GET  /mapping         │  │  POST /gremlin/query/tx  (tx)     │ │
+│  │                │  │  GET  /mappings        │  │  GET  /gremlin/provider           │ │
+│  │                │  │  POST /mapping/active  │  │  POST /query/explain  (SQL)       │ │
+│  │                │  │  DELETE /mapping       │  │  POST /query  ─► 307 redirect     │ │
+│  │                │  │  GET  /mapping/status  │  │                                   │ │
+│  └────────────────┘  └───────────┬────────────┘  └──────────────────┬────────────────┘ │
+└──────────────────────────────────┼──────────────────────────────────┼─────────────────-┘
+                                   │                                  │
+               ┌───────────────────┘                                  │
+               ▼                                                      ▼
+┌──────────────────────────────┐       ┌────────────────────────────────────────────────────┐
+│      MAPPING SUBSYSTEM       │       │              TRANSLATION PIPELINE                  │
+│                              │       │                                                    │
+│  ┌──────────────────────┐    │       │  ┌─────────────────────────────────────────────┐   │
+│  │   MappingStore       │    │       │  │  GraphQueryTranslatorFactory (interface)    │   │
+│  │  (in-memory +        │    │       │  │    DefaultGraphQueryTranslatorFactory       │   │
+│  │   file-persisted)    │    │       │  │    env: QUERY_TRANSLATOR_BACKEND            │   │
+│  │  StoredMapping       │    │       │  │         QUERY_PARSER                        │   │
+│  │  activeMappingId     │    │       │  └──────────────────┬──────────────────────────┘   │
+│  └──────────┬───────────┘    │       │                     │ creates                      │
+│             │                │       │                     ▼                              │
+│  ┌──────────▼───────────┐    │       │  ┌─────────────────────────────────────────────┐   │
+│  │   MappingConfig      │◄───┼───────┤  │  GraphQueryTranslator (interface)           │   │
+│  │   (vertices, edges)  │    │       │  │  ┌─────────────────────┐ ┌─────────────────┐│   │
+│  └──────────────────────┘    │       │  │  │StandardSqlGraph     │ │IcebergSqlGraph  ││   │
+│                              │       │  │  │QueryTranslator      │ │QueryTranslator  ││   │
+│  ┌──────────────────────┐    │       │  │  │(STANDARD mode)      │ │(ICEBERG mode)   ││   │
+│  │   VertexMapping      │    │       │  └──┤─────────────────────┴─┴─────────────────┤│   │
+│  │   table, idColumn    │    │       │     │  SqlGraphQueryTranslator (base class)   │    │
+│  │   properties{}       │    │       │     │  ┌───────────────────────────────────┐  │    │
+│  └──────────────────────┘    │       │     │  │  GremlinSqlTranslator (facade)    │  │    │
+│                              │       │     │  │  • dialect: Standard / Iceberg    │  │    │
+│  ┌──────────────────────┐    │       │     │  │  • stepParser: GremlinStepParser  │  │    │
+│  │   EdgeMapping        │    │       │     │  └───────────────────────────────────┘  │    │
+│  │   table, out/inCol   │    │       │     └─────────────────────────────────────────┘    │
+│  │   out/inVertexLabel  │    │       │                                                    │
+│  └──────────────────────┘    │       └────────────────────────────────────────────────────┘   
+│                              │                                                            
+│  ┌──────────────────────┐    │                                                            
+│  │  TableReference      │    │                                                            
+│  │  Resolver            │    │                                                            
+│  │  (iceberg: prefix,   │    │                                                            
+│  │   DuckDB scan, etc.) │    │                                                            
+└──┴──────────────────────┴────┘
+
+
+
+
+
+
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│              TRANSLATION PIPELINE — INTERNAL STAGES                                    │
+│                                                                                        │
+│  Gremlin String                                                                        │
+│       │                                                                                │
+│       ▼  STAGE 1: PARSING                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  GremlinTraversalParser (interface)                                              │  │
+│  │  ┌─────────────────────────────────┐  ┌─────────────────────────────────────┐    │  │
+│  │  │  AntlrGremlinTraversalParser    │  │  LegacyGremlinTraversalParser       │    │  │
+│  │  │  (Gremlin.g4 grammar)           │  │  (hand-written tokenizer)           │    │  │
+│  │  └─────────────────────────────────┘  └─────────────────────────────────────┘    │  │
+│  │                    │  GremlinParseResult { vertexQuery, rootIdFilter, steps }    │  │
+│  └────────────────────┼─────────────────────────────────────────────────────────────┘  │
+│                       │                                                                │
+│       ▼  STAGE 2: STEP PARSING                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  GremlinStepParser  →  ParsedTraversal                                           │  │
+│  │  { label, filters, hops, limit, whereClause, projections,                        │  │
+│  │    pathByProperties, asAliases, selectFields, aggregations }                     │  │
+│  └────────────────────┬─────────────────────────────────────────────────────────────┘  │
+│                       │                                                                │
+│       ▼  STAGE 3: MAPPING RESOLUTION                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  SqlMappingResolver  (label / property  →  table / column)                       │  │
+│  └───────┬──────────────────┬────────────────────┬──────────────────────────────────┘  │
+│          │                  │                    │                                     │
+│       ▼  STAGE 4a: SQL RENDERING          ▼  STAGE 4b: QUERY PLAN (optional)           │
+│  ┌───────────────────────┐         ┌──────────────────────────────────────────────┐    │
+│  │  VertexSqlBuilder     │ g.V()   │  QueryPlanBuilder  →  QueryPlan              │    │
+│  │  HopSqlBuilder        │ hops    │  { rootType, rootLabel, rootTable, dialect,  │    │
+│  │  EdgeSqlBuilder       │ g.E()   │    filters, hops, aggregation, projections,  │    │
+│  │  WhereClauseBuilder   │ WHERE   │    whereClause, limit … }                    │    │
+│  │  SqlRenderHelper      │ utils   └──────────────────────────────────────────────┘    │
+│  └───────────────────────┘                                                             │
+│          │                                                                             │
+│       SqlDialect (interface)                                                           │
+│  ┌───────────────────────────────────────┐                                             │
+│  │  StandardSqlDialect  STRING_AGG()     │                                             │
+│  │  IcebergSqlDialect   ARRAY_JOIN(      │                                             │
+│  │                        ARRAY_AGG())   │                                             │
+│  └───────────────────────────────────────┘                                             │
+│          │                                                                             │
+│       Constants                                                                        │
+│  ┌───────────────────────────────────────┐                                             │
+│  │  GremlinToken  (step names, dirs)     │                                             │
+│  │  SqlKeyword    (SELECT/FROM/JOIN/…)   │                                             │
+│  └───────────────────────────────────────┘                                             │
+│                                                                                        │
+│  Output: TranslationResult { sql, parameters, plan? }                                  │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│              GREMLIN EXECUTION ENGINE  (Native Graph Execution)                        │
+│                                                                                        │
+│  GremlinExecutionService                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│  │  GraphProvider (interface)     GraphProviderFactory  env: GRAPH_PROVIDER        │   │
+│  │  ┌──────────────────────────────────────────────────────────────────────────┐   │   │
+│  │  │  TinkerGraphProvider                                                     │   │   │
+│  │  │  • GremlinGroovyScriptEngine  (evaluates Gremlin traversals)             │   │   │
+│  │  │  • TinkerGraph  (in-memory graph, loaded from ./data/graph.gryo)         │   │   │
+│  │  │  • GraphTraversalSource  (g = graph.traversal())                         │   │   │
+│  │  │  • TinkerGraphTransactionApi                                             │   │   │
+│  │  └──────────────────────────────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────────────────────────┘   │
+│  Returns: GremlinExecutionResult { gremlin, results, resultCount }                     │
+│           GremlinTransactionalExecutionResult { … + mode, status }                     │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│              DATABASE ACCESS LAYER  (SQL Execution side)                               │
+│                                                                                        │
+│  DatabaseConfig  env: DB_URL · DB_USER · DB_PASSWORD · DB_DRIVER                       │
+│  DatabaseManager  (JDBC DriverManager wrapper)  →  java.sql.Connection                 │
+│                                                                                        │
+│  ┌────────────────────────┐   ┌──────────────────────────────────────────────────┐     │
+│  │  H2  (embedded, dev)   │   │  Trino + Iceberg Catalog  (production)           │     │
+│  │  jdbc:h2:file:./data/  │   │  infra/iceberg/docker-compose.yml                │     │
+│  └────────────────────────┘   └──────────────────────────────────────────────────┘     │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+
+```
+
+### Architecture difference with leading Zero ETL Graph engine
+```Text
+
+THIS ENGINE:
+  Gremlin  →  SQL text (translator)  →  JDBC  →  [Trino]  →  Iceberg REST  →  Parquet/S3
+                                                     ↑
+                                           separate process, must be running
+
+PUPPYGRAPH:
+  Gremlin  →  internal traversal plan  →  [embedded Spark]  →  Iceberg/Delta/Hudi  →  S3
+                                                ↑
+                                      built-in, no separate SQL server
+
+
+```
+
 
 ### Runtime Components
 
@@ -30,23 +198,28 @@ This document describes the current implementation in `src/main/java/com/graphqu
 ### High-Level Data Flow
 
 ```text
-Client Request
-  -> Javalin route (App)
-     -> Mapping resolution (active or X-Mapping-Id)
-     -> Translator factory product (GraphQueryTranslator)
-        -> Parser (ANTLR or legacy)
-        -> GremlinSqlTranslator (dialect aware)
-     -> JSON response with translated SQL + parameters
-```
+ SQL Translation path (POST /query/explain) ──────────────────────────────────────────
+Client  →  App (Javalin)
+           └─ resolveMappingForRequest()  →  MappingStore  →  MappingConfig
+           └─ GraphQueryTranslator.translate(gremlin, mappingConfig)
+                 └─ GremlinTraversalParser.parse()      →  GremlinParseResult
+                 └─ GremlinStepParser.parse()           →  ParsedTraversal
+                 └─ GremlinSqlTranslator.buildSql()
+                       SqlMappingResolver  (label → table/column)
+                       WhereClauseBuilder  (WHERE fragments)
+                       VertexSqlBuilder / HopSqlBuilder / EdgeSqlBuilder
+                       SqlRenderHelper + SqlDialect
+                 └─ TranslationResult { sql, params, plan? }
+           └─ QueryExplanation JSON  →  Client
 
-For native execution endpoints:
-
-```text
-Client Request
-  -> Javalin route (App)
-     -> GremlinExecutionService
-        -> GraphProvider (TinkerGraph by default)
-     -> JSON response with traversal results
+── Native Gremlin path (POST /gremlin/query) ───────────────────────────────────────────
+Client  →  App (Javalin)
+           └─ GremlinExecutionService.execute(gremlin)
+                 └─ TinkerGraphProvider
+                       GremlinGroovyScriptEngine.eval(gremlin, bindings{g})
+                       TinkerGraph  (in-memory, optionally persisted .gryo)
+                 └─ GremlinExecutionResult { gremlin, results, resultCount }
+           └─ JSON  →  Client
 ```
 
 ---
@@ -774,7 +947,3 @@ Both engines treat graph algorithms as out-of-band from the Gremlin step pipelin
 | Projections | `by(outV/inV/edgeDegree/neighborFold/choose)`, `path().by(p)`, `sum/mean` | — | `project.by(p)`, `by(identity())`, `valueMap()`, `by(out.count)`, `as/select`, `dedup`, `count`, `order`, `limit` |
 | Utilities | — | `profile()` | `path()`, `identity()` |
 
-**Key remaining gaps for commercial zero-ETL graph DB parity:**
-1. Standalone filter steps `and(t1,t2)` / `or(t1,t2)` / `not(traversal)` outside `where(...)`
-2. Full standalone/general `is(predicate)` forms beyond `values(...).is(...)` and `where(select(...).is(...))`
-3. `profile()` equivalent in SQL-mode explain output
