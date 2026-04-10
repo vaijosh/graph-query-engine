@@ -1,0 +1,102 @@
+{
+  "vertices": {
+    "Person": {
+      "table": "sn_persons",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "age":      "age",
+        "email":    "email",
+        "city":     "city"
+      }
+    },
+    "Company": {
+      "table": "sn_companies",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "industry": "industry",
+        "country":  "country"
+      }
+    },
+    "City": {
+      "table": "sn_cities",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "country":  "country",
+        "timezone": "timezone"
+      }
+    },
+    "Skill": {
+      "table": "sn_skills",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "category": "category"
+      }
+    }
+  },
+  "edges": {
+    "KNOWS": {
+      "table": "sn_knows",
+      "idColumn": "id",
+      "outColumn": "person_a_id",
+      "inColumn":  "person_b_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Person",
+      "properties": {
+        "since":    "since",
+        "strength": "strength"
+      }
+    },
+    "WORKS_AT": {
+      "table": "sn_works_at",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "company_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Company",
+      "properties": {
+        "role":      "role",
+        "since":     "since",
+        "isCurrent": "is_current"
+      }
+    },
+    "LIVES_IN": {
+      "table": "sn_lives_in",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "city_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "City",
+      "properties": {
+        "since":    "since"
+      }
+    },
+    "HAS_SKILL": {
+      "table": "sn_has_skill",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "skill_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Skill",
+      "properties": {
+        "level":     "level",
+        "yearsExp":  "years_exp"
+      }
+    },
+    "LOCATED_IN": {
+      "table": "sn_company_city",
+      "idColumn": "id",
+      "outColumn": "company_id",
+      "inColumn":  "city_id",
+      "outVertexLabel": "Company",
+      "inVertexLabel":  "City",
+      "properties": {
+        "isHQ": "is_hq"
+      }
+    }
+  }
+}
+

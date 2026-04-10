@@ -15,7 +15,18 @@ public class DatabaseManager {
     }
 
     public Connection connection() throws SQLException {
-        return DriverManager.getConnection(databaseConfig.url(), databaseConfig.user(), databaseConfig.password());
+        String url  = databaseConfig.url();
+        String user = databaseConfig.user();
+        // If the URL already contains the "user" property (e.g. Trino ?user=admin),
+        // avoid passing it again as a separate argument — Trino's JDBC driver throws
+        // "Connection property user is passed both by URL and properties" otherwise.
+        boolean userInUrl = url != null && url.contains("user=");
+        if (userInUrl || user == null || user.isBlank()) {
+            assert url != null;
+            return DriverManager.getConnection(url);
+        }
+        assert url != null;
+        return DriverManager.getConnection(url, user, databaseConfig.password());
     }
 
     private static void loadDriver(String driverClass) {

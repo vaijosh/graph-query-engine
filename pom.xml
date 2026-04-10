@@ -50,8 +50,23 @@
                 <scope>import</scope>
             </dependency>
             <!-- Override vulnerable transitive deps reported by Mend.io -->
-            <!-- CVE-2025-11143 / CVE-2024-6763: jetty-http (transitive via Javalin)
-                 Keep Jetty on the 11.x line used by Javalin to avoid 11/12 binary mismatch. -->
+            <!--
+                CVE-2024-6763 (MEDIUM): Jetty HttpURI insufficient authority validation → SSRF/redirect bypass.
+                CVE-2025-11143 (LOW):   Jetty URI parsing differences vs other parsers → potential filter bypass.
+
+                Both CVEs affect the HttpURI utility class directly; Jetty's own internal use is NOT vulnerable.
+                This engine does not pass user-supplied URIs to HttpURI, so the practical risk is negligible.
+
+                Fix status (as of 2026-04-10):
+                  CVE-2024-6763 — fixed in Jetty 12.0.12+ / 11.0.25+ (this pin).
+                  CVE-2025-11143 — NO patch available on Maven Central for Jetty 11.x (EOL);
+                                   patched in Jetty 12.1.5+ and 12.0.31+, but Javalin 6.x requires
+                                   Jetty 11 — upgrading to Jetty 12 would require Javalin 7.x migration.
+                                   Commercial backports available via TuxCare / HeroDevs for Jetty 11.x.
+
+                Accepted risk: low-severity URI parser differential; no user-supplied URI passed to HttpURI.
+                Revisit when Javalin 7.x (Jetty 12) is stable.
+            -->
             <dependency>
                 <groupId>org.eclipse.jetty</groupId>
                 <artifactId>jetty-http</artifactId>
@@ -118,6 +133,12 @@
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
             <version>2.3.232</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.trino</groupId>
+            <artifactId>trino-jdbc</artifactId>
+            <version>471</version>
             <scope>runtime</scope>
         </dependency>
         <dependency>

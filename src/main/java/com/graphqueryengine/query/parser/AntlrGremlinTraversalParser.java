@@ -66,7 +66,14 @@ public class AntlrGremlinTraversalParser implements GremlinTraversalParser {
                         args.add(argumentCtx.getText());
                     }
                 }
-                allSteps.add(new GremlinStep(stepName, List.copyOf(args), String.join(",", args)));
+                // For steps whose arguments may contain complex nested expressions that the
+                // token-level grammar flattens incorrectly (e.g. where(and(...)), where(not(...))),
+                // we compute rawArgs by extracting the verbatim text between the outer parentheses
+                // of this step from the original query string — exactly as the legacy parser does.
+                // This ensures GremlinStepParser.parseWhere() receives the full nested expression.
+                String rawArgs = extractRawArgs(gremlin, stepCtx);
+                if (rawArgs == null) rawArgs = String.join(",", args);
+                allSteps.add(new GremlinStep(stepName, List.copyOf(args), rawArgs));
             }
 
             if (allSteps.isEmpty()) {
@@ -120,6 +127,38 @@ public class AntlrGremlinTraversalParser implements GremlinTraversalParser {
             return trimmed.substring(1, trimmed.length() - 1);
         }
         return trimmed;
+    }
+
+    /**
+     * Extracts the verbatim text between the outer parentheses of a step context,
+     * using the start/stop token character-index positions to slice the original query.
+     *
+     * <p>This is necessary for steps like {@code where(and(outE('X').count().is(gt(0)), ...))}
+     * where the ANTLR token-level grammar flattens nested expressions. By reading the raw
+     * source text we preserve the full nested expression for {@code GremlinStepParser}.
+     *
+     * @param original  the original gremlin query string
+     * @param stepCtx   the ANTLR ParseRuleContext object for the step
+     * @return the verbatim argument text (between the outer parens), or {@code null} if
+     *         the positions cannot be determined via reflection
+     */
+    private static String extractRawArgs(String original, Object stepCtx) {
+        try {
+            // stepCtx is a ParserRuleContext; we need the start/stop token offsets
+            Object startToken = stepCtx.getClass().getMethod("getStart").invoke(stepCtx);
+            Object stopToken  = stepCtx.getClass().getMethod("getStop").invoke(stepCtx);
+            int startIdx = (int) startToken.getClass().getMethod("getStartIndex").invoke(startToken);
+            int stopIdx  = (int) stopToken.getClass().getMethod("getStopIndex").invoke(stopToken);
+            if (startIdx < 0 || stopIdx < 0 || stopIdx >= original.length()) return null;
+            // The step text looks like "stepName(rawArgs)" — find the first '(' and last ')'
+            String stepText = original.substring(startIdx, stopIdx + 1);
+            int firstParen = stepText.indexOf('(');
+            int lastParen  = stepText.lastIndexOf(')');
+            if (firstParen < 0 || lastParen <= firstParen) return null;
+            return stepText.substring(firstParen + 1, lastParen).trim();
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static final class ThrowingErrorListener extends BaseErrorListener {

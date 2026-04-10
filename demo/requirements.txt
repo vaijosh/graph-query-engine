@@ -1,0 +1,28 @@
+# Python dependencies for the graph-query-engine demo notebooks and seed scripts
+#
+# Install with:
+#   pip install -r demo/requirements.txt
+#
+# Core notebook / HTTP dependencies (required)
+requests>=2.28
+pandas>=1.5
+ipython>=8.0
+notebook>=7.0
+
+# Kaggle dataset download (required for AML demo data)
+# Used by prepare_aml_data.py to download the IBM AML dataset.
+#
+# One-time setup:
+#   Go to https://www.kaggle.com/settings → API → Create New Token
+#   Save the token to ~/.kaggle/access_token  (chmod 600)
+#   Accept the dataset rules at:
+#   https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml
+kaggle>=1.6
+
+# Fast Iceberg bulk-load (optional but highly recommended)
+# Used by seed_iceberg_from_csv.py for uploading CSVs to MinIO
+#   and executing INSERT SELECT via the Trino Python client
+boto3>=1.26          # MinIO/S3 CSV upload — first choice
+minio>=7.0           # MinIO Python SDK   — second choice (fallback)
+trino>=0.325         # Trino SQL client    (falls back to docker exec if absent)
+

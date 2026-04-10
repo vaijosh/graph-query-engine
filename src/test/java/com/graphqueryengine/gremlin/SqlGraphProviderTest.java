@@ -1,25 +1,31 @@
 package com.graphqueryengine.gremlin;
+
 import com.graphqueryengine.config.BackendConfig;
 import com.graphqueryengine.db.DatabaseManager;
 import com.graphqueryengine.gremlin.provider.BackendRegistry;
 import com.graphqueryengine.gremlin.provider.SqlGraphProvider;
-import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.MappingStore;
 import com.graphqueryengine.mapping.VertexMapping;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
 import javax.script.ScriptException;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.util.List;
 import java.util.Map;
-import static org.junit.jupiter.api.Assertions.*;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 /**
  * Integration-style tests for {@link SqlGraphProvider}.
- *
  * Uses an in-memory H2 database — no external infrastructure required.
  */
+@SuppressWarnings("resource")
 class SqlGraphProviderTest {
     private static final String H2_URL =
             "jdbc:h2:mem:sql-provider-test;DB_CLOSE_DELAY=-1";

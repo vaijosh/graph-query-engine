@@ -3,7 +3,8 @@ package com.graphqueryengine.query.translate.sql;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.query.api.QueryPlan;
 import com.graphqueryengine.query.api.TranslationResult;
-import com.graphqueryengine.query.parser.LegacyGremlinTraversalParser;
+import com.graphqueryengine.query.parser.AntlrGremlinTraversalParser;
+import com.graphqueryengine.query.parser.GremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
 import com.graphqueryengine.query.translate.sql.dialect.SqlDialect;
 import com.graphqueryengine.query.translate.sql.dialect.StandardSqlDialect;
@@ -42,13 +43,10 @@ import com.graphqueryengine.query.translate.sql.where.WhereClauseBuilder;
 public class GremlinSqlTranslator {
 
     private final SqlDialect dialect;
+    private final GremlinTraversalParser stringParser;
 
     // ── Collaborators ─────────────────────────────────────────────────────────
     private final GremlinStepParser stepParser;
-
-    // Render builders are created lazily per mapping config (stateless wrt config);
-    // they are stored here as they are stateless and re-entrant.
-    // (MappingConfig arrives at call time, so builders that need it receive it as an argument.)
 
     // ── Constructors ──────────────────────────────────────────────────────────
 
@@ -57,16 +55,29 @@ public class GremlinSqlTranslator {
         this(new StandardSqlDialect());
     }
 
-    /** Constructs a translator using the given SQL dialect. */
+    /** Constructs a translator using the given SQL dialect.
+     *  The string-based overloads use the same parser mode as the top-level
+     *  {@code QUERY_PARSER} env var (defaults to {@code antlr}).
+     */
     public GremlinSqlTranslator(SqlDialect dialect) {
-        this.dialect    = dialect;
-        this.stepParser = new GremlinStepParser();
+        this(dialect, resolveDefaultParser());
+    }
+
+    /** Constructs a translator with an explicit parser for string-based overloads. */
+    public GremlinSqlTranslator(SqlDialect dialect, GremlinTraversalParser stringParser) {
+        this.dialect      = dialect;
+        this.stringParser = stringParser;
+        this.stepParser   = new GremlinStepParser();
+    }
+
+    private static GremlinTraversalParser resolveDefaultParser() {
+        return new AntlrGremlinTraversalParser();
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     public TranslationResult translate(String gremlin, MappingConfig mappingConfig) {
-        GremlinParseResult parsed = new LegacyGremlinTraversalParser().parse(gremlin);
+        GremlinParseResult parsed = stringParser.parse(gremlin);
         return translate(parsed, mappingConfig);
     }
 
@@ -81,7 +92,7 @@ public class GremlinSqlTranslator {
      * capturing every mapping decision made during translation.
      */
     public TranslationResult translateWithPlan(String gremlin, MappingConfig mappingConfig) {
-        GremlinParseResult parsed = new LegacyGremlinTraversalParser().parse(gremlin);
+        GremlinParseResult parsed = stringParser.parse(gremlin);
         return translateWithPlan(parsed, mappingConfig);
     }
 
@@ -96,7 +107,7 @@ public class GremlinSqlTranslator {
 
     /** Builds a {@link QueryPlan} without producing SQL. */
     public QueryPlan plan(String gremlin, MappingConfig mappingConfig) {
-        GremlinParseResult parsed = new LegacyGremlinTraversalParser().parse(gremlin);
+        GremlinParseResult parsed = stringParser.parse(gremlin);
         return planFromParsed(parsed, mappingConfig);
     }
 
@@ -112,7 +123,7 @@ public class GremlinSqlTranslator {
     private TranslationResult buildSql(boolean vertexQuery, ParsedTraversal traversal,
                                         MappingConfig mappingConfig) {
         SqlMappingResolver resolver = new SqlMappingResolver(mappingConfig);
-        WhereClauseBuilder where    = new WhereClauseBuilder(resolver);
+        WhereClauseBuilder where    = new WhereClauseBuilder(resolver, dialect);
         SqlRenderHelper    helper   = new SqlRenderHelper(dialect, resolver, stepParser);
 
         if (vertexQuery) {

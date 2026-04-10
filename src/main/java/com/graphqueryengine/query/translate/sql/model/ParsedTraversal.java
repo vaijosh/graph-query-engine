@@ -15,6 +15,7 @@ public record ParsedTraversal(
         List<HasFilter> filters,
         String valueProperty,
         boolean valueMapRequested,
+        List<String> valueMapKeys,
         Integer limit,
         Integer preHopLimit,
         List<HopStep> hops,
@@ -43,7 +44,7 @@ public record ParsedTraversal(
     public ParsedTraversal withHops(List<HopStep> newHops) {
         return new ParsedTraversal(
                 label, filters, valueProperty, valueMapRequested,
-                limit, preHopLimit, newHops,
+                valueMapKeys, limit, preHopLimit, newHops,
                 countRequested, sumRequested, meanRequested,
                 projections, groupCountProperty,
                 orderByProperty, orderDirection,

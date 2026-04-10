@@ -4,7 +4,7 @@ import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.TranslationResult;
-import com.graphqueryengine.query.parser.LegacyGremlinTraversalParser;
+import com.graphqueryengine.query.parser.AntlrGremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Disabled;
@@ -180,7 +180,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT currency AS \"currency\", COUNT(*) AS count FROM aml_transfers GROUP BY currency ORDER BY currency DESC",
+                "SELECT currency AS \"currency\", COUNT(*) AS count FROM aml_transfers GROUP BY currency ORDER BY \"currency\" DESC",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -196,7 +196,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"outDegree\" FROM aml_accounts v ORDER BY outDegree DESC LIMIT 15",
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"outDegree\" FROM aml_accounts v ORDER BY \"outDegree\" DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -212,7 +212,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", (SELECT COUNT(*) FROM aml_transfers WHERE in_id = v.id) AS \"inDegree\" FROM aml_accounts v ORDER BY inDegree DESC LIMIT 10",
+                "SELECT v.account_id AS \"accountId\", (SELECT COUNT(*) FROM aml_transfers WHERE in_id = v.id) AS \"inDegree\" FROM aml_accounts v ORDER BY \"inDegree\" DESC LIMIT 10",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -259,7 +259,7 @@ class GremlinSqlTranslatorTest {
                 "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", " +
                 "(SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", " +
                 "(SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" " +
-                "FROM aml_accounts v ORDER BY suspiciousOut DESC LIMIT 15",
+                "FROM aml_accounts v ORDER BY \"suspiciousOut\" DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -307,7 +307,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT * FROM (SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" FROM aml_accounts v) p WHERE p.\"suspiciousOut\" > 0 ORDER BY suspiciousOut DESC LIMIT 15",
+                "SELECT * FROM (SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" FROM aml_accounts v) p WHERE p.\"suspiciousOut\" > 0 ORDER BY \"suspiciousOut\" DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -326,7 +326,7 @@ class GremlinSqlTranslatorTest {
                 "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\" FROM aml_accounts v WHERE (SELECT COUNT(*) FROM aml_transfers we WHERE we.out_id = v.id) = ? LIMIT 10",
                 result.sql()
         );
-        assertEquals(List.of(0), result.parameters());
+        assertEquals(List.of("0"), result.parameters());
     }
 
     @Test
@@ -466,7 +466,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT COUNT(DISTINCT v2.id) AS count FROM (SELECT * FROM aml_accounts WHERE EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?) LIMIT 1) v0 JOIN aml_transfers e1 ON e1.out_id = v0.id JOIN aml_accounts v1 ON v1.id = e1.in_id JOIN aml_transfers e2 ON e2.out_id = v1.id JOIN aml_accounts v2 ON v2.id = e2.in_id",
+                "WITH _start AS (SELECT * FROM aml_accounts WHERE EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?) LIMIT 1) SELECT COUNT(DISTINCT v2.id) AS count FROM _start v0 JOIN aml_transfers e1 ON e1.out_id = v0.id JOIN aml_accounts v1 ON v1.id = e1.in_id JOIN aml_transfers e2 ON e2.out_id = v1.id JOIN aml_accounts v2 ON v2.id = e2.in_id",
                 result.sql()
         );
         assertEquals(List.of("1"), result.parameters());
@@ -478,7 +478,7 @@ class GremlinSqlTranslatorTest {
         String gremlin = "g.V(1).hasLabel('Person').has('name','Alice').values('age').limit(1)";
 
         TranslationResult fromString = translator.translate(gremlin, mappingConfig);
-        GremlinParseResult parsed = new LegacyGremlinTraversalParser().parse(gremlin);
+        GremlinParseResult parsed = new AntlrGremlinTraversalParser().parse(gremlin);
         TranslationResult fromParsed = translator.translate(parsed, mappingConfig);
 
         assertEquals(fromString.sql(), fromParsed.sql());
@@ -757,9 +757,11 @@ class GremlinSqlTranslatorTest {
 
         String sql = result.sql();
         assertTrue(sql.contains("UNION"), "both() must produce a UNION");
-        // v0 must be wrapped: the LIMIT 1 should appear inside a subquery, not before any WHERE
-        assertTrue(sql.contains("(SELECT * FROM aml_accounts LIMIT 1) v0"),
-                "preHopLimit must be inside a subquery even without where/filter");
+        // v0 must be wrapped: the LIMIT 1 should appear inside a CTE or subquery, not as a bare LIMIT
+        assertTrue(
+                sql.contains("(SELECT * FROM aml_accounts LIMIT 1) v0")
+                || sql.contains("WITH _start AS (SELECT * FROM aml_accounts LIMIT 1)"),
+                "preHopLimit must be inside a CTE or subquery even without where/filter");
         assertTrue(result.parameters().isEmpty(), "no params (hasLabel resolves table only)");
     }
 
@@ -863,7 +865,7 @@ class GremlinSqlTranslatorTest {
                 "SELECT v0.account_id AS accountId0, e1.amount AS amount1 FROM aml_accounts v0 JOIN aml_transfers e1 ON e1.out_id = v0.id WHERE v0.risk_score > ? AND e1.amount > ? LIMIT 10",
                 result.sql()
         );
-        assertEquals(List.of("0.8", "1000000"), result.parameters());
+        assertEquals(List.of(0.8, 1000000L), result.parameters());
     }
 
     @Test
@@ -908,7 +910,7 @@ class GremlinSqlTranslatorTest {
                 "SELECT v0.account_id AS accountId0, e1.amount AS amount1 FROM aml_accounts v0 JOIN aml_transfers e1 ON e1.from_account_id = v0.id WHERE e1.amount > ? LIMIT 5",
                 result.sql()
         );
-        assertEquals(List.of("100"), result.parameters());
+        assertEquals(List.of(100L), result.parameters());
     }
 
     @Test
@@ -1017,7 +1019,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals("SELECT age AS age FROM people WHERE age > ? LIMIT 2", result.sql());
-        assertEquals(List.of("30"), result.parameters());
+        assertEquals(List.of(30L), result.parameters());
     }
 
     @Test
@@ -1094,7 +1096,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT risk_score AS riskScore FROM aml_accounts ORDER BY riskScore DESC LIMIT 10",
+                "SELECT risk_score AS riskScore FROM aml_accounts ORDER BY \"riskScore\" DESC LIMIT 10",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());

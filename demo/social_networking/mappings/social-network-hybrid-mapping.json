@@ -1,0 +1,120 @@
+{
+  "_comment": [
+    "Hybrid Social Network mapping: hot/transactional data (Person relationships) in H2,",
+    "reference/analytical data (Company, City, Skill lookup tables) in Iceberg.",
+    "Both backends must be registered:",
+    "  BACKENDS='[{\"id\":\"h2\",\"url\":\"jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE\"},{\"id\":\"iceberg\",\"url\":\"jdbc:trino://localhost:8080/iceberg/social_network\",\"user\":\"admin\"}]'"
+  ],
+  "defaultDatasource": "h2",
+  "vertices": {
+    "Person": {
+      "datasource": "h2",
+      "table": "sn_persons",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "age":      "age",
+        "email":    "email",
+        "city":     "city",
+        "country":  "country",
+        "joinedAt": "joined_at"
+      }
+    },
+    "Company": {
+      "datasource": "iceberg",
+      "table": "iceberg:iceberg.social_network.companies",
+      "idColumn": "id",
+      "properties": {
+        "name":      "name",
+        "industry":  "industry",
+        "country":   "country",
+        "founded":   "founded",
+        "employees": "employees"
+      }
+    },
+    "City": {
+      "datasource": "iceberg",
+      "table": "iceberg:iceberg.social_network.cities",
+      "idColumn": "id",
+      "properties": {
+        "name":       "name",
+        "country":    "country",
+        "population": "population",
+        "timezone":   "timezone"
+      }
+    },
+    "Skill": {
+      "datasource": "iceberg",
+      "table": "iceberg:iceberg.social_network.skills",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "category": "category"
+      }
+    }
+  },
+  "edges": {
+    "KNOWS": {
+      "datasource": "h2",
+      "table": "sn_knows",
+      "idColumn": "id",
+      "outColumn": "person_a_id",
+      "inColumn":  "person_b_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Person",
+      "properties": {
+        "since":    "since",
+        "strength": "strength"
+      }
+    },
+    "WORKS_AT": {
+      "datasource": "h2",
+      "table": "sn_works_at",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "company_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Company",
+      "properties": {
+        "role":      "role",
+        "startYear": "start_year"
+      }
+    },
+    "LIVES_IN": {
+      "datasource": "h2",
+      "table": "sn_lives_in",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "city_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "City",
+      "properties": {
+        "since": "since"
+      }
+    },
+    "HAS_SKILL": {
+      "datasource": "h2",
+      "table": "sn_has_skill",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "skill_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Skill",
+      "properties": {
+        "level":      "level",
+        "yearsOfExp": "years_of_exp"
+      }
+    },
+    "LOCATED_IN": {
+      "datasource": "iceberg",
+      "table": "iceberg:iceberg.social_network.company_city",
+      "idColumn": "id",
+      "outColumn": "company_id",
+      "inColumn":  "city_id",
+      "outVertexLabel": "Company",
+      "inVertexLabel":  "City",
+      "properties": {}
+    }
+  }
+}
+

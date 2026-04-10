@@ -7,7 +7,6 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 /**
  * Unit tests for {@link BackendRegistry}.
- *
  * Uses an in-memory H2 database so no external infrastructure is required.
  */
 class BackendRegistryTest {

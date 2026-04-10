@@ -6,6 +6,8 @@ import com.graphqueryengine.db.DatabaseManager;
 import com.graphqueryengine.gremlin.GremlinExecutionResult;
 import com.graphqueryengine.gremlin.GremlinExecutionService;
 import com.graphqueryengine.gremlin.GremlinTransactionalExecutionResult;
+import com.graphqueryengine.gremlin.provider.BackendRegistry;
+import com.graphqueryengine.gremlin.provider.GraphProviderFactory;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.MappingStore;
 import com.graphqueryengine.query.api.GraphQueryTranslator;
@@ -35,8 +37,9 @@ import javax.script.ScriptException;
 
 public class App {
     private static final Logger LOG = LoggerFactory.getLogger(App.class);
-    private static final String SQL_TRACE_HEADER = "X-SQL-Trace";
-    private static final String MAPPING_ID_HEADER = "X-Mapping-Id";
+    private static final String SQL_TRACE_HEADER   = "X-SQL-Trace";
+    private static final String MAPPING_ID_HEADER  = "X-Mapping-Id";
+    private static final String BACKEND_ID_HEADER  = "X-Backend-Id";
     private static final String ACTIVE_MAPPING_FILE = ".active-mapping";
 
     public static void main(String[] args) {
@@ -46,6 +49,36 @@ public class App {
 
     public static Javalin start(int port) {
         return start(port, (app, svc) -> {}, new DefaultGraphQueryTranslatorFactory());
+    }
+
+    /**
+     * Test-friendly overload: starts the engine using an explicit provider name,
+     * bypassing the {@code GRAPH_PROVIDER} environment variable.
+     * Use {@code "tinkergraph"} in tests that don't need a database.
+     */
+    public static Javalin start(int port, String providerName) {
+        return start(port, providerName, (app, svc) -> {}, new DefaultGraphQueryTranslatorFactory());
+    }
+
+    public static Javalin start(int port,
+                                String providerName,
+                                java.util.function.BiConsumer<Javalin, GremlinExecutionService> extensions,
+                                GraphQueryTranslatorFactory translatorFactory) {
+        // Explicit provider name (e.g. "tinkergraph" in tests) — bypass BackendRegistry.
+        MappingStore mappingStore = new MappingStore();
+        GraphQueryTranslator translator = translatorFactory.create();
+        if ("tinkergraph".equals(providerName)) {
+            GremlinExecutionService gremlinExecutionService = new GremlinExecutionService(
+                    GraphProviderFactory.fromProviderName(providerName, null, mappingStore));
+            return buildAndStartApp(port, gremlinExecutionService, null, translator, extensions, mappingStore,
+                    new DatabaseConfig("(tinkergraph)", "", "", ""));
+        }
+        DatabaseConfig databaseConfig = DatabaseConfig.fromEnvironment();
+        DatabaseManager databaseManager = new DatabaseManager(databaseConfig);
+        ensureDatabaseFileInitialized(databaseManager, databaseConfig);
+        GremlinExecutionService gremlinExecutionService = new GremlinExecutionService(
+                GraphProviderFactory.fromProviderName(providerName, databaseManager, mappingStore));
+        return buildAndStartApp(port, gremlinExecutionService, null, translator, extensions, mappingStore, databaseConfig);
     }
 
     /**
@@ -60,12 +93,57 @@ public class App {
     public static Javalin start(int port,
                                 java.util.function.BiConsumer<Javalin, GremlinExecutionService> extensions,
                                 GraphQueryTranslatorFactory translatorFactory) {
-        DatabaseConfig databaseConfig = DatabaseConfig.fromEnvironment();
-        DatabaseManager databaseManager = new DatabaseManager(databaseConfig);
-        ensureDatabaseFileInitialized(databaseManager, databaseConfig);
         MappingStore mappingStore = new MappingStore();
         GraphQueryTranslator translator = translatorFactory.create();
-        GremlinExecutionService gremlinExecutionService = new GremlinExecutionService();
+
+        String configuredProvider = System.getenv().getOrDefault("GRAPH_PROVIDER", "sql").trim().toLowerCase();
+        if ("tinkergraph".equals(configuredProvider)) {
+            GremlinExecutionService gremlinExecutionService = new GremlinExecutionService(
+                    GraphProviderFactory.fromProviderName("tinkergraph", null, mappingStore));
+            return buildAndStartApp(port, gremlinExecutionService, null, translator, extensions, mappingStore,
+                    new DatabaseConfig("(tinkergraph)", "", "", ""));
+        }
+
+        // WCOJ path: uses its own DatabaseManager + AdjacencyIndexRegistry (disk-backed).
+        // Does NOT use BackendRegistry — WCOJ manages its own JDBC connection pool.
+        if ("wcoj".equals(configuredProvider)) {
+            DatabaseConfig databaseConfig = DatabaseConfig.fromEnvironment();
+            DatabaseManager databaseManager = new DatabaseManager(databaseConfig);
+            ensureDatabaseFileInitialized(databaseManager, databaseConfig);
+            GremlinExecutionService gremlinExecutionService = new GremlinExecutionService(
+                    GraphProviderFactory.fromProviderName("wcoj", databaseManager, mappingStore));
+            return buildAndStartApp(port, gremlinExecutionService, null, translator, extensions, mappingStore,
+                    databaseConfig);
+        }
+
+        // SQL path: build multi-backend registry.
+        BackendRegistry backendRegistry = BackendRegistry.fromEnvironment(mappingStore);
+        // Validate all backends can connect.
+        for (BackendRegistry.Entry entry : backendRegistry.listEntries()) {
+            LOG.info("Backend verified: id={} url={}", entry.id(), entry.url());
+        }
+        // Create a registry-aware SqlGraphProvider that routes queries to the correct
+        // backend based on the mapping's datasource field. This is the provider used
+        // for all requests that don't carry an explicit X-Backend-Id header.
+        com.graphqueryengine.gremlin.provider.SqlGraphProvider registryAwareProvider =
+                new com.graphqueryengine.gremlin.provider.SqlGraphProvider(backendRegistry, mappingStore);
+        GremlinExecutionService registryAwareService = new GremlinExecutionService(registryAwareProvider);
+        return buildAndStartApp(port, registryAwareService, backendRegistry, translator, extensions, mappingStore,
+                new DatabaseConfig(entry(backendRegistry).url(), "", "", ""));
+    }
+
+    /** Returns the first entry of the registry (avoids field access boilerplate). */
+    private static BackendRegistry.Entry entry(BackendRegistry r) {
+        return r.listEntries().get(0);
+    }
+
+    private static Javalin buildAndStartApp(int port,
+                                            GremlinExecutionService gremlinExecutionService,
+                                            BackendRegistry backendRegistry,
+                                            GraphQueryTranslator translator,
+                                            java.util.function.BiConsumer<Javalin, GremlinExecutionService> extensions,
+                                            MappingStore mappingStore,
+                                            DatabaseConfig databaseConfig) {
         ObjectMapper objectMapper = new ObjectMapper();
 
         Javalin app = Javalin.create(config -> {
@@ -76,7 +154,20 @@ public class App {
         Path mappingStoreDir = resolveMappingStoreDir();
         preloadMappingsOnStartup(mappingStore, objectMapper, mappingStoreDir);
 
-        app.get("/health", ctx -> ctx.json(Map.of("status", "ok", "service", "graph-query-engine")));
+        app.get("/health", ctx -> {
+            Map<String, Object> health = new LinkedHashMap<>();
+            health.put("status", "ok");
+            health.put("service", "graph-query-engine");
+            health.put("dbUrl", databaseConfig.url());
+            health.put("provider", gremlinExecutionService.providerId());
+            if (backendRegistry != null) {
+                health.put("backends", backendRegistry.listEntries().stream()
+                        .map(e -> Map.of("id", e.id(), "url", e.url()))
+                        .toList());
+                health.put("defaultBackend", backendRegistry.defaultId());
+            }
+            ctx.json(health);
+        });
 
         app.post("/mapping/upload", ctx -> {
             UploadedFile file = ctx.uploadedFile("file");
@@ -104,15 +195,32 @@ public class App {
                     persistActiveMappingId(stored.id(), mappingStoreDir);
                 }
 
-                ctx.status(201).json(Map.of(
-                        "message", "Mapping loaded",
-                        "mappingId", stored.id(),
-                        "mappingName", stored.name(),
-                        "active", Objects.equals(mappingStore.activeMappingId().orElse(null), stored.id()),
-                        "vertexLabels", mappingConfig.vertices().keySet(),
-                        "edgeLabels", mappingConfig.edges().keySet(),
-                        "createdAt", stored.createdAt()
-                ));
+                // Auto-register any backends declared in the mapping file.
+                List<String> autoRegistered = new ArrayList<>();
+                if (backendRegistry != null && !mappingConfig.backends().isEmpty()) {
+                    mappingConfig.backends().forEach((id, cfg) -> {
+                        try {
+                            backendRegistry.register(id, cfg.url(), cfg.user(), cfg.password(), mappingStore);
+                            autoRegistered.add(id);
+                            LOG.info("Auto-registered backend from mapping: id={} url={}", id, cfg.url());
+                        } catch (Exception ex) {
+                            LOG.warn("Failed to auto-register backend '{}' from mapping: {}", id, ex.getMessage());
+                        }
+                    });
+                }
+
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("message", "Mapping loaded");
+                response.put("mappingId", stored.id());
+                response.put("mappingName", stored.name());
+                response.put("active", Objects.equals(mappingStore.activeMappingId().orElse(null), stored.id()));
+                response.put("vertexLabels", mappingConfig.vertices().keySet());
+                response.put("edgeLabels", mappingConfig.edges().keySet());
+                response.put("createdAt", stored.createdAt());
+                if (!autoRegistered.isEmpty()) {
+                    response.put("autoRegisteredBackends", autoRegistered);
+                }
+                ctx.status(201).json(response);
             } catch (Exception ex) {
                 ctx.status(400).json(Map.of("error", ex.getMessage()));
             }
@@ -226,24 +334,50 @@ public class App {
             }
 
             try {
-                // Check if caller requested planner-stage output via ?plan=true query param
-                boolean includePlan = parseEnabledFlag(ctx.queryParam("plan"), false);
-                TranslationResult translationResult = includePlan
-                        ? translator.translateWithPlan(request.gremlin(), selectedMapping.config())
-                        : translator.translate(request.gremlin(), selectedMapping.config());
+                // Always include the plan — it's cheap and essential for WCOJ clients
+                TranslationResult translationResult =
+                        translator.translateWithPlan(request.gremlin(), selectedMapping.config());
 
                 if (isSqlTraceEnabledForRequest(ctx)) {
                     logSqlTranslation("/query/explain", request.gremlin(), translationResult);
                 } else {
                     LOG.debug("[SQL-TRACE] endpoint=/query/explain disabled for this request");
                 }
+
+                // Determine how this query will actually be executed
+                String activeProvider = gremlinExecutionService.providerId();
+                boolean isHopQuery = translationResult.plan() != null
+                        && translationResult.plan().hops() != null
+                        && !translationResult.plan().hops().isEmpty();
+                String execEngine;
+                String execStrategy;
+                if ("wcoj".equals(activeProvider) && isHopQuery) {
+                    execEngine   = "WCOJ";
+                    execStrategy = "1) Seed SQL: SELECT id FROM <table> WHERE … → start-vertex IDs  |  " +
+                                   "2) Leapfrog Trie Join: in-memory DFS over CSR adjacency index (no SQL JOINs)  |  " +
+                                   "3) Property-fetch SQL: SELECT id, <props> FROM <table> WHERE id IN (…)  |  " +
+                                   "The 'translatedSql' field shows the equivalent N-JOIN plan SQL mode would run — for reference only.";
+                } else if ("wcoj".equals(activeProvider)) {
+                    execEngine   = "WCOJ_FALLBACK_SQL";
+                    execStrategy = "WCOJ fell back to SQL (aggregation/projection query). " +
+                                   "The 'translatedSql' field is the exact SQL executed.";
+                } else if ("tinkergraph".equals(activeProvider)) {
+                    execEngine   = "TINKERGRAPH";
+                    execStrategy = "Native TinkerPop traversal — SQL is shown for reference only.";
+                } else {
+                    execEngine   = "SQL";
+                    execStrategy = null;  // SQL mode: translatedSql IS what runs
+                }
+
                 QueryExplanation explanation = new QueryExplanation(
                         request.gremlin(),
                         translationResult.sql(),
                         translationResult.parameters(),
-                        "SQL_EXPLAIN",
-                        "This endpoint shows SQL translation for reference. Use /gremlin/query for actual execution. mappingId=" + selectedMapping.id(),
-                        translationResult.plan()
+                        execEngine,
+                        "mappingId=" + selectedMapping.id(),
+                        translationResult.plan(),
+                        execEngine,
+                        execStrategy
                 );
                 ctx.json(explanation);
             } catch (IllegalArgumentException ex) {
@@ -260,6 +394,7 @@ public class App {
                 return;
             }
 
+            GremlinExecutionService svc = resolveServiceForRequest(ctx, backendRegistry, gremlinExecutionService);
             try {
                 logGremlinWithSqlIfAvailable(
                         "/gremlin/query",
@@ -269,7 +404,7 @@ public class App {
                         translator,
                         isSqlTraceEnabledForRequest(ctx)
                 );
-                GremlinExecutionResult response = gremlinExecutionService.execute(request.gremlin());
+                GremlinExecutionResult response = svc.execute(request.gremlin());
                 ctx.json(response);
             } catch (IllegalArgumentException | ScriptException ex) {
                 ctx.status(400).json(Map.of("error", ex.getMessage()));
@@ -285,6 +420,7 @@ public class App {
                 return;
             }
 
+            GremlinExecutionService svc = resolveServiceForRequest(ctx, backendRegistry, gremlinExecutionService);
             try {
                 logGremlinWithSqlIfAvailable(
                         "/gremlin/query/tx",
@@ -294,7 +430,7 @@ public class App {
                         translator,
                         isSqlTraceEnabledForRequest(ctx)
                 );
-                GremlinTransactionalExecutionResult response = gremlinExecutionService.executeInTransaction(request.gremlin());
+                GremlinTransactionalExecutionResult response = svc.executeInTransaction(request.gremlin());
                 ctx.json(response);
             } catch (IllegalArgumentException | ScriptException ex) {
                 ctx.status(400).json(Map.of("error", ex.getMessage()));
@@ -302,6 +438,86 @@ public class App {
         });
 
         app.get("/gremlin/provider", ctx -> ctx.json(Map.of("provider", gremlinExecutionService.providerId())));
+
+        // List all registered backends (id + url, no credentials).
+        app.get("/backends", ctx -> {
+            if (backendRegistry == null) {
+                ctx.json(Map.of(
+                        "backends", List.of(Map.of("id", "default", "url", databaseConfig.url())),
+                        "defaultBackend", "default"
+                ));
+                return;
+            }
+            ctx.json(Map.of(
+                    "backends", backendRegistry.listEntries().stream()
+                            .map(e -> Map.of("id", e.id(), "url", e.url()))
+                            .toList(),
+                    "defaultBackend", backendRegistry.defaultId()
+            ));
+        });
+
+        /*
+         * Register (or replace) a backend at runtime — no JVM restart required.
+         * Request body (JSON):
+         * <pre>
+         * {
+         *   "id":       "iceberg",                              // required
+         *   "url":      "jdbc:trino://localhost:8080/iceberg",  // required
+         *   "user":     "admin",                                // optional
+         *   "password": ""                                      // optional
+         * }
+         * </pre>
+         * Returns 200 with the registered backend id and url.
+         * Returns 400 if id or url is missing, or if the engine is in tinkergraph mode.
+         */
+        app.post("/backends/register", ctx -> {
+            if (backendRegistry == null) {
+                ctx.status(400).json(Map.of(
+                        "error", "Runtime backend registration is only supported when the engine " +
+                                 "is running in SQL mode (GRAPH_PROVIDER=sql). " +
+                                 "Current mode does not use a BackendRegistry."));
+                return;
+            }
+
+            Map<?, ?> body;
+            try {
+                body = ctx.bodyAsClass(Map.class);
+            } catch (Exception ex) {
+                ctx.status(400).json(Map.of("error", "Body must be JSON: {\"id\":\"...\",\"url\":\"...\"}"));
+                return;
+            }
+
+            String id  = body.get("id")  instanceof String s ? s.trim() : null;
+            String url = body.get("url") instanceof String s ? s.trim() : null;
+
+            if (id == null || id.isBlank()) {
+                ctx.status(400).json(Map.of("error", "Field 'id' is required"));
+                return;
+            }
+            if (url == null || url.isBlank()) {
+                ctx.status(400).json(Map.of("error", "Field 'url' is required"));
+                return;
+            }
+
+            String user     = body.get("user")     instanceof String s ? s : "";
+            String password = body.get("password") instanceof String s ? s : "";
+
+            try {
+                BackendRegistry.Entry entry = backendRegistry.register(id, url, user, password, mappingStore);
+                LOG.info("Backend registered via API: id={} url={}", entry.id(), entry.url());
+                ctx.json(Map.of(
+                        "message",  "Backend registered",
+                        "id",       entry.id(),
+                        "url",      entry.url(),
+                        "backends", backendRegistry.listEntries().stream()
+                                        .map(e -> Map.of("id", e.id(), "url", e.url()))
+                                        .toList()
+                ));
+            } catch (Exception ex) {
+                LOG.error("Failed to register backend id={} url={}: {}", id, url, ex.getMessage(), ex);
+                ctx.status(500).json(Map.of("error", "Failed to register backend: " + ex.getMessage()));
+            }
+        });
 
 
         // Allow callers (e.g. the demo module) to register additional routes.
@@ -361,6 +577,11 @@ public class App {
     }
 
     private static boolean isSqlTraceEnabledForRequest(Context ctx) {
+        // Priority: ?sql_log=  query param  >  X-SQL-Trace header  >  SQL_TRACE env var
+        String queryParam = ctx.queryParam("sql_log");
+        if (queryParam != null && !queryParam.isBlank()) {
+            return parseEnabledFlag(queryParam, isSqlTraceEnabled());
+        }
         String headerValue = ctx.header(SQL_TRACE_HEADER);
         if (headerValue == null || headerValue.isBlank()) {
             return isSqlTraceEnabled();
@@ -391,6 +612,38 @@ public class App {
             return mappingStore.getById(requestedId.trim());
         }
         return mappingStore.getActive();
+    }
+
+    /**
+     * Resolves the {@link GremlinExecutionService} for the current request.
+     *
+     * <p>When an {@code X-Backend-Id} header (or {@code backendId} query param) is present,
+     * the specific per-backend service is returned from the registry so that query is executed
+     * against that backend directly (bypassing mapping-level routing).
+     *
+     * <p>When no backend id is specified, the <em>registry-aware</em> {@code fallback} service
+     * is returned — this is the {@link com.graphqueryengine.gremlin.provider.SqlGraphProvider} that was constructed with the full
+     * {@link BackendRegistry} and therefore routes each query to the correct backend based on
+     * the {@code datasource} field in the active mapping, without any explicit header required.
+     */
+    private static GremlinExecutionService resolveServiceForRequest(
+            Context ctx,
+            BackendRegistry backendRegistry,
+            GremlinExecutionService fallback) {
+        if (backendRegistry == null) {
+            return fallback;
+        }
+        String requestedId = ctx.header(BACKEND_ID_HEADER);
+        if (requestedId == null || requestedId.isBlank()) {
+            requestedId = ctx.queryParam("backendId");
+        }
+        if (requestedId != null && !requestedId.isBlank()) {
+            // Explicit backend override — use that backend's dedicated service directly.
+            return backendRegistry.getById(requestedId.trim()).orElse(fallback);
+        }
+        // No explicit override — use the registry-aware provider so mapping datasource
+        // fields automatically route the query to the correct backend.
+        return fallback;
     }
 
     private static void preloadMappingsOnStartup(MappingStore mappingStore,

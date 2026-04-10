@@ -42,7 +42,12 @@ public class SqlRenderHelper {
     public void appendOrderBy(StringBuilder sql, String orderByProperty, String orderDirection) {
         if (orderByProperty != null) {
             String direction = orderDirection != null ? orderDirection : SqlKeyword.ASC;
-            sql.append(SqlKeyword.ORDER_BY).append(orderByProperty).append(" ").append(direction);
+            // Always quote the ORDER BY token so H2 (and other case-sensitive databases)
+            // match the double-quoted column alias emitted in the SELECT clause exactly.
+            // Raw column names are also safe to double-quote; H2 treats them case-insensitively
+            // when unquoted but matches them exactly when quoted.
+            sql.append(SqlKeyword.ORDER_BY).append(dialect.quoteIdentifier(orderByProperty))
+               .append(" ").append(direction);
         }
     }
 
@@ -94,10 +99,13 @@ public class SqlRenderHelper {
 
     // ── ValueMap select fragments ─────────────────────────────────────────────
 
-    public String buildAliasValueMapSelectForVertex(VertexMapping vertexMapping, String alias) {
+    public String buildAliasValueMapSelectForVertex(VertexMapping vertexMapping, String alias,
+                                                     java.util.List<String> keys) {
         StringJoiner selectCols = new StringJoiner(", ");
         for (Map.Entry<String, String> entry : vertexMapping.properties().entrySet()) {
-            selectCols.add(alias + "." + entry.getValue() + SqlKeyword.AS + quoteAlias(entry.getKey()));
+            if (keys.isEmpty() || keys.contains(entry.getKey())) {
+                selectCols.add(alias + "." + entry.getValue() + SqlKeyword.AS + quoteAlias(entry.getKey()));
+            }
         }
         return selectCols.toString();
     }
@@ -129,7 +137,7 @@ public class SqlRenderHelper {
             }
             return projectionSelect.toString();
         }
-        if (parsed.valueMapRequested()) return buildAliasValueMapSelectForVertex(endpointMapping, "v");
+        if (parsed.valueMapRequested()) return buildAliasValueMapSelectForVertex(endpointMapping, "v", parsed.valueMapKeys());
         if (parsed.valueProperty() != null) {
             String column = resolver.mapVertexProperty(endpointMapping, parsed.valueProperty());
             return "v." + column + SqlKeyword.AS + parsed.valueProperty();

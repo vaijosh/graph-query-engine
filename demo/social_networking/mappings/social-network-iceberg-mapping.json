@@ -1,0 +1,112 @@
+{
+  "backends": {
+    "iceberg": {
+      "url":         "jdbc:trino://localhost:8080/iceberg",
+      "user":        "admin",
+      "password":    "",
+      "driverClass": "io.trino.jdbc.TrinoDriver"
+    }
+  },
+  "defaultDatasource": "iceberg",
+  "vertices": {
+    "Person": {
+      "table": "iceberg:iceberg.social_network.persons",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "age":      "age",
+        "email":    "email",
+        "city":     "city",
+        "country":  "country",
+        "joinedAt": "joined_at"
+      }
+    },
+    "Company": {
+      "table": "iceberg:iceberg.social_network.companies",
+      "idColumn": "id",
+      "properties": {
+        "name":      "name",
+        "industry":  "industry",
+        "country":   "country",
+        "founded":   "founded",
+        "employees": "employees"
+      }
+    },
+    "City": {
+      "table": "iceberg:iceberg.social_network.cities",
+      "idColumn": "id",
+      "properties": {
+        "name":       "name",
+        "country":    "country",
+        "population": "population",
+        "timezone":   "timezone"
+      }
+    },
+    "Skill": {
+      "table": "iceberg:iceberg.social_network.skills",
+      "idColumn": "id",
+      "properties": {
+        "name":     "name",
+        "category": "category"
+      }
+    }
+  },
+  "edges": {
+    "KNOWS": {
+      "table": "iceberg:iceberg.social_network.knows",
+      "idColumn": "id",
+      "outColumn": "person_a_id",
+      "inColumn":  "person_b_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Person",
+      "properties": {
+        "since":    "since",
+        "strength": "strength"
+      }
+    },
+    "WORKS_AT": {
+      "table": "iceberg:iceberg.social_network.works_at",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "company_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Company",
+      "properties": {
+        "role":      "role",
+        "startYear": "start_year"
+      }
+    },
+    "LIVES_IN": {
+      "table": "iceberg:iceberg.social_network.lives_in",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "city_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "City",
+      "properties": {
+        "since": "since"
+      }
+    },
+    "HAS_SKILL": {
+      "table": "iceberg:iceberg.social_network.has_skill",
+      "idColumn": "id",
+      "outColumn": "person_id",
+      "inColumn":  "skill_id",
+      "outVertexLabel": "Person",
+      "inVertexLabel":  "Skill",
+      "properties": {
+        "level":      "level",
+        "yearsOfExp": "years_of_exp"
+      }
+    },
+    "LOCATED_IN": {
+      "table": "iceberg:iceberg.social_network.company_city",
+      "idColumn": "id",
+      "outColumn": "company_id",
+      "inColumn":  "city_id",
+      "outVertexLabel": "Company",
+      "inVertexLabel":  "City",
+      "properties": {}
+    }
+  }
+}

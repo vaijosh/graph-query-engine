@@ -191,10 +191,10 @@ public class EdgeSqlBuilder {
             List<HasFilter> ef = parsed.filters();
             if (!ef.isEmpty()) {
                 wj.add("e0." + resolver.mapEdgeFilterProperty(rootEdge, ef.get(0).property()) + " = ?");
-                params.add(ef.get(0).value());
+                params.add(ef.get(0).typedValue());
                 for (int i = 1; i < ef.size(); i++) {
                     wj.add("e2." + resolver.mapEdgeFilterProperty(e2, ef.get(i).property()) + " = ?");
-                    params.add(ef.get(i).value());
+                    params.add(ef.get(i).typedValue());
                 }
             }
             if (parsed.whereClause() != null) {

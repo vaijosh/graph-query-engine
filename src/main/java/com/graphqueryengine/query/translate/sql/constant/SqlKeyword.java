@@ -62,6 +62,11 @@ public final class SqlKeyword {
     public static final String ELSE            = " ELSE ";
     public static final String END             = " END";
 
+    // ── CTE ───────────────────────────────────────────────────────────────────
+    public static final String WITH            = "WITH ";
+    public static final String AS_OPEN         = " AS (";
+    public static final String CLOSE_PAREN     = ")";
+
     // ── Sort directions ───────────────────────────────────────────────────────
     public static final String ASC             = "ASC";
     public static final String DESC            = "DESC";

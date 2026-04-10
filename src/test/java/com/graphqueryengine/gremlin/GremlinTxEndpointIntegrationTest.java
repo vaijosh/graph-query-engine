@@ -27,7 +27,9 @@ class GremlinTxEndpointIntegrationTest {
 
     @BeforeAll
     static void startServer() {
-        app = App.start(0);
+        // Explicitly use tinkergraph — this test validates HTTP endpoint mechanics,
+        // not SQL translation, so it must not depend on the default GRAPH_PROVIDER env var.
+        app = App.start(0, "tinkergraph");
         port = app.port();
     }
 

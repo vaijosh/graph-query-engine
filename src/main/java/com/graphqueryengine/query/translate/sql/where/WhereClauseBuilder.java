@@ -5,6 +5,8 @@ import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.translate.sql.HasFilter;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
 import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
+import com.graphqueryengine.query.translate.sql.dialect.SqlDialect;
+import com.graphqueryengine.query.translate.sql.dialect.StandardSqlDialect;
 import com.graphqueryengine.query.translate.sql.mapping.SqlMappingResolver;
 import com.graphqueryengine.query.translate.sql.model.AsAlias;
 import com.graphqueryengine.query.translate.sql.model.HopStep;
@@ -28,9 +30,59 @@ import java.util.StringJoiner;
 public class WhereClauseBuilder {
 
     private final SqlMappingResolver resolver;
+    private final SqlDialect dialect;
 
-    public WhereClauseBuilder(SqlMappingResolver resolver) {
+    /** Construct with an explicit dialect (used to coerce parameter types). */
+    public WhereClauseBuilder(SqlMappingResolver resolver, SqlDialect dialect) {
         this.resolver = resolver;
+        this.dialect  = dialect;
+    }
+
+    /** Backwards-compatible constructor; defaults to Standard SQL dialect (no coercion). */
+    public WhereClauseBuilder(SqlMappingResolver resolver) {
+        this(resolver, new StandardSqlDialect());
+    }
+
+    // ── Convenience: add a parameter, coercing its type through the dialect ──
+
+    private void addParam(List<Object> params, Object value) {
+        params.add(dialect.coerceParamValue(value));
+    }
+
+    /**
+     * Add a parameter that is known to be bound to a BIGINT/INTEGER id column.
+     *
+     * <p>When the dialect requires explicit numeric id params (Trino/Iceberg),
+     * the value is coerced to {@link Long} regardless of whether it arrived as a String.
+     * This handles {@code hasId(1)} and {@code WHERE id = ?} without affecting
+     * VARCHAR columns like {@code is_laundering} that also store numeric-looking strings.
+     */
+    private void addIdParam(List<Object> params, Object value) {
+        if (dialect.requiresExplicitNumericIdParams()) {
+            params.add(toLong(value));
+        } else {
+            params.add(value);
+        }
+    }
+
+    /**
+     * Add a parameter that is the result of a COUNT(*) comparison ({@code count().is(n)}).
+     * COUNT always returns BIGINT in every SQL database, so this must be Long for Trino.
+     */
+    private void addCountParam(List<Object> params, Object value) {
+        if (dialect.requiresExplicitNumericIdParams()) {
+            params.add(toLong(value));
+        } else {
+            params.add(value);
+        }
+    }
+
+    /** Convert a value to Long for strict-typed id/count comparisons. */
+    private static Long toLong(Object value) {
+        if (value instanceof Long l)   return l;
+        if (value instanceof Number n) return n.longValue();
+        try { return Long.parseLong(String.valueOf(value).trim()); }
+        catch (NumberFormatException ignored) { return 0L; }
     }
 
     // ── Vertex WHERE helpers ──────────────────────────────────────────────────
@@ -46,7 +98,8 @@ public class WhereClauseBuilder {
         if (filters.isEmpty()) return;
         StringJoiner whereJoiner = new StringJoiner(SqlKeyword.AND);
         for (HasFilter filter : filters) {
-            String column = GremlinToken.PROP_ID.equals(filter.property())
+            boolean isIdColumn = GremlinToken.PROP_ID.equals(filter.property());
+            String column = isIdColumn
                     ? mapping.idColumn()
                     : resolver.mapVertexProperty(mapping, filter.property());
             String qualifiedColumn = alias != null ? alias + "." + column : column;
@@ -54,7 +107,12 @@ public class WhereClauseBuilder {
                 whereJoiner.add(qualifiedColumn + SqlKeyword.IS_NULL);
             } else {
                 whereJoiner.add(qualifiedColumn + " " + filter.operator() + " " + SqlKeyword.PLACEHOLDER);
-                params.add(filter.value());
+                // ID columns are always BIGINT → use addIdParam for strict dialects (Trino)
+                if (isIdColumn) {
+                    addIdParam(params, filter.typedValue());
+                } else {
+                    addParam(params, filter.typedValue());
+                }
             }
         }
         sql.append(SqlKeyword.WHERE).append(whereJoiner);
@@ -79,7 +137,7 @@ public class WhereClauseBuilder {
                 whereJoiner.add(qualifiedColumn + SqlKeyword.IS_NULL);
             } else {
                 whereJoiner.add(qualifiedColumn + " " + filter.operator() + " " + SqlKeyword.PLACEHOLDER);
-                params.add(filter.value());
+                addParam(params, filter.typedValue());
             }
         }
         sql.append(SqlKeyword.WHERE).append(whereJoiner);
@@ -167,13 +225,13 @@ public class WhereClauseBuilder {
                     } else {
                         countSql.append(SqlKeyword.AND).append(edgeAlias).append('.').append(column)
                                 .append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
-                        params.add(filter.value());
+                        addParam(params, filter.typedValue());
                     }
                 }
             }
             countSql.append(") ").append(toSqlOperator(countFilter.operator())).append(" ").append(SqlKeyword.PLACEHOLDER);
-            try { params.add(Integer.parseInt(countFilter.value())); }
-            catch (NumberFormatException e) { params.add(countFilter.value()); }
+            // COUNT(*) always returns BIGINT — use addCountParam for strict dialects (Trino)
+            addCountParam(params, countFilter.typedValue());
             return countSql.toString();
         }
 
@@ -189,7 +247,7 @@ public class WhereClauseBuilder {
             } else {
                 existsSql.append(SqlKeyword.AND).append(edgeAlias).append('.').append(column)
                         .append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
-                params.add(filter.value());
+                addParam(params, filter.typedValue());
             }
         }
         return existsSql.append(")").toString();
@@ -236,7 +294,7 @@ public class WhereClauseBuilder {
             } else {
                 existsSql.append(SqlKeyword.AND).append("_wv.").append(column)
                         .append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
-                params.add(filter.value());
+                addParam(params, filter.typedValue());
             }
         }
         existsSql.append(")");
@@ -301,11 +359,31 @@ public class WhereClauseBuilder {
         HopStep lastHop = parsed.hops().isEmpty() ? null : parsed.hops().get(parsed.hops().size() - 1);
         EdgeMapping terminalEdgeMapping = null;
         String terminalEdgeAlias = null;
-        if (lastHop != null && (GremlinToken.OUT_E.equals(lastHop.direction())
-                || GremlinToken.IN_E.equals(lastHop.direction())
-                || GremlinToken.BOTH_E.equals(lastHop.direction()))) {
-            terminalEdgeMapping = resolver.resolveEdgeMapping(lastHop.singleLabel());
-            terminalEdgeAlias = "e" + parsed.hops().size();
+
+        // Determine which hop carries the edge (handles outE().has().inV() where lastHop is IN_V)
+        HopStep edgeCarryingHop = lastHop;
+        int edgeCarryingHopIndex = parsed.hops().size();
+        if (lastHop != null && (GremlinToken.IN_V.equals(lastHop.direction())
+                || GremlinToken.OUT_V.equals(lastHop.direction()))
+                && parsed.hops().size() >= 2) {
+            edgeCarryingHop = parsed.hops().get(parsed.hops().size() - 2);
+            edgeCarryingHopIndex = parsed.hops().size() - 1;
+        }
+        if (edgeCarryingHop != null && (GremlinToken.OUT_E.equals(edgeCarryingHop.direction())
+                || GremlinToken.IN_E.equals(edgeCarryingHop.direction())
+                || GremlinToken.BOTH_E.equals(edgeCarryingHop.direction()))) {
+            terminalEdgeMapping = resolver.resolveEdgeMapping(edgeCarryingHop.singleLabel());
+            terminalEdgeAlias = "e" + edgeCarryingHopIndex;
+        }
+        // Also try edge mapping for the last normalized hop (handles outE().has().inV() normalized to out())
+        if (terminalEdgeMapping == null && lastHop != null && !lastHop.labels().isEmpty()) {
+            try {
+                terminalEdgeMapping = resolver.resolveEdgeMapping(lastHop.singleLabel());
+                terminalEdgeAlias = "e" + parsed.hops().size();
+            } catch (IllegalArgumentException ignored) {
+                terminalEdgeMapping = null;
+                terminalEdgeAlias = null;
+            }
         }
 
         for (HasFilter filter : filters) {
@@ -332,7 +410,7 @@ public class WhereClauseBuilder {
                 sql.append(SqlKeyword.IS_NULL);
             } else {
                 sql.append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
-                params.add(filter.value());
+                addParam(params, filter.typedValue());
             }
             where = true;
         }

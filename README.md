@@ -11,15 +11,16 @@ mvn test        # run all tests
 
 ## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `7000` | HTTP port |
+| Variable | Default                                      | Description |
+|----------|----------------------------------------------|-------------|
+| `PORT` | `7000`                                       | HTTP port |
 | `DB_URL` | `jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE` | JDBC connection URL for SQL translation/execution state (persistent file-based H2) |
-| `DB_USER` | `sa` | Database user |
-| `DB_PASSWORD` | _(empty)_ | Database password |
-| `DB_DRIVER` | `org.h2.Driver` | JDBC driver class |
-| `GRAPH_PROVIDER` | `tinkergraph` | Gremlin execution backend |
-| `TINKERGRAPH_LOCATION` | `./data/graph.gryo` | Path to persisted TinkerGraph data file (loaded on startup, saved after mutating Gremlin calls) |
+| `DB_USER` | `sa`                                         | Database user |
+| `DB_PASSWORD` | _(empty)_                                    | Database password |
+| `DB_DRIVER` | `org.h2.Driver`                              | JDBC driver class |
+| `GRAPH_PROVIDER` | `sql`                                        | Gremlin execution backend: `sql` (default), `wcoj` (faster multi-hop), `tinkergraph` (native) |
+| `WCOJ_MAX_EDGES` | `5000000`                                    | Max edges per table loaded into the WCOJ in-memory index (only when `GRAPH_PROVIDER=wcoj`) |
+| `TINKERGRAPH_LOCATION` | `./data/graph.gryo`                          | Path to persisted TinkerGraph data file (loaded on startup, saved after mutating Gremlin calls) |
 
 For a temporary in-memory SQL DB, set `DB_URL=jdbc:h2:mem:graph;DB_CLOSE_DELAY=-1`.
 
@@ -33,17 +34,17 @@ mvn exec:java
 
 ## Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Service health |
-| `POST` | `/gremlin/query` | Execute Gremlin natively (TinkerGraph) |
-| `POST` | `/gremlin/query/tx` | Execute with transaction semantics |
-| `GET` | `/gremlin/provider` | Active provider info |
-| `POST` | `/query/explain` | SQL translation only (no execution) |
-| `POST` | `/mapping/upload` | Upload JSON mapping file |
-| `GET` | `/mapping/status` | Mapping store status |
-| `GET` | `/mappings` | List stored mappings |
-| `POST` | `/mapping/active` | Set active mapping (`?id=<id>`) |
+| Method | Path | Description                                       |
+|--------|------|---------------------------------------------------|
+| `GET` | `/health` | Service health                                    |
+| `POST` | `/gremlin/query` | Execute Gremlin natively (sql backend by default) |
+| `POST` | `/gremlin/query/tx` | Execute with transaction semantics                |
+| `GET` | `/gremlin/provider` | Active provider info                              |
+| `POST` | `/query/explain` | SQL translation only (no execution)               |
+| `POST` | `/mapping/upload` | Upload JSON mapping file                          |
+| `GET` | `/mapping/status` | Mapping store status                              |
+| `GET` | `/mappings` | List stored mappings                              |
+| `POST` | `/mapping/active` | Set active mapping (`?id=<id>`)                   |
 
 ## Mapping file format
 
@@ -255,15 +256,65 @@ Run all tests:
 mvn test
 ```
 
+## WCOJ — Worst-Case Optimal Join Engine
+
+For multi-hop path queries (e.g. 3-hop money trails in AML), standard SQL joins suffer
+from **intermediate result explosion** — joining Account→Transfer→Account for a 3-hop
+chain produces O(E²) intermediate rows before the final filter is applied.
+
+The `wcoj` provider replaces binary SQL joins with a
+[Leapfrog Trie Join](https://arxiv.org/abs/1210.0481) algorithm that:
+
+- Loads edge tables into a **Compressed Sparse Row (CSR) in-memory index** on first use
+- Uses **sorted `long[]` neighbour arrays** with O(log n) `seek()` for intersection
+- Enumerates paths via **factorized depth-first recursion** — only one `long[]` per complete path is ever allocated
+- Applies `simplePath()` cycle-exclusion as an O(depth) stack check (no HashSet)
+- **Automatically falls back to SQL** for aggregations, projections, ORDER BY, edge queries, and tables exceeding `WCOJ_MAX_EDGES`
+
+### Start with WCOJ
+
+```bash
+GRAPH_PROVIDER=wcoj mvn exec:java
+```
+
+### Performance comparison (5-hop chain, 80k accounts)
+
+| Approach | Intermediate rows | Complexity |
+|---|---|---|
+| SQL nested joins | Up to E⁴ ≈ billions | O(E^k) |
+| CTE / subquery | E³ pruned late | O(E^(k-1)) |
+| **WCOJ Leapfrog** | **≤ final result size** | **O(N log N)** |
+
+### When WCOJ is used vs. SQL fallback
+
+| Query shape | WCOJ | SQL |
+|---|---|---|
+| `.out()` / `.in()` / `.both()` hop traversals | ✅ | |
+| `.repeat().times(n)` path queries | ✅ | |
+| `.simplePath()` cycle exclusion | ✅ | |
+| `.count()` after multi-hop | ✅ | |
+| `.groupCount()`, `.order().by()` | | ✅ |
+| `.project().by()` projections | | ✅ |
+| `g.E()` edge-root queries | | ✅ |
+| Tables > `WCOJ_MAX_EDGES` (5M rows) | | ✅ |
+
 ## Project layout
 
 ```
 src/main/java/com/graphqueryengine/
 ├── App.java                          # HTTP routes
+├── engine/
+│   └── wcoj/
+│       ├── AdjacencyIndex.java       # CSR in-memory edge index
+│       ├── AdjacencyIndexRegistry.java  # lazy-load registry with size guard
+│       ├── LeapfrogIterator.java     # sorted iterator with seek()
+│       ├── LeapfrogTrieJoin.java     # WCOJ multi-hop path enumeration
+│       └── WcojGraphProvider.java   # GraphProvider using WCOJ + SQL fallback
 ├── gremlin/
 │   ├── GremlinExecutionService.java
 │   └── provider/
 │       ├── GraphProvider.java        # Provider SPI
+│       ├── SqlGraphProvider.java     # SQL translation + JDBC execution
 │       ├── TinkerGraphProvider.java
 │       └── TinkerGraphTransactionApi.java
 ├── query/

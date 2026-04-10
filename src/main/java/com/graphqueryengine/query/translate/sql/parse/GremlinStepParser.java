@@ -104,6 +104,7 @@ public class GremlinStepParser {
         boolean simplePathRequested = false;
         String whereByProperty = null;
         boolean whereByPending = false;
+        List<String> valueMapKeys = new ArrayList<>();
 
         if (rootIdFilter != null) filters.add(new HasFilter("id", rootIdFilter));
 
@@ -135,8 +136,10 @@ public class GremlinStepParser {
                     filters.add(parseHasArgument(valuesProperty, args.get(0).trim()));
                 }
                 case "valueMap" -> {
-                    if (!args.isEmpty()) throw new IllegalArgumentException("valueMap() currently supports zero arguments only");
                     valueMapRequested = true;
+                    if (!args.isEmpty()) {
+                        valueMapKeys = args.stream().map(this::unquote).toList();
+                    }
                 }
                 case "out" -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("out expects at least 1 argument");
@@ -365,7 +368,7 @@ public class GremlinStepParser {
 
         return new ParsedTraversal(
                 label, filters, valuesProperty, valueMapRequested,
-                limit, preHopLimit, hops,
+                valueMapKeys, limit, preHopLimit, hops,
                 countRequested, sumRequested, meanRequested,
                 projections, groupCountProperty,
                 orderByProperty, orderDirection,

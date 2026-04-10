@@ -12,6 +12,7 @@ import com.graphqueryengine.query.translate.sql.model.WhereKind;
 import com.graphqueryengine.query.translate.sql.where.WhereClauseBuilder;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
 import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
+import com.graphqueryengine.query.translate.sql.dialect.SqlDialect;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
@@ -33,12 +34,20 @@ public class HopSqlBuilder {
     private final SqlMappingResolver resolver;
     private final WhereClauseBuilder whereBuilder;
     private final SqlRenderHelper helper;
+    private final SqlDialect dialect;
 
     public HopSqlBuilder(SqlMappingResolver resolver, WhereClauseBuilder whereBuilder,
-                          SqlRenderHelper helper) {
+                          SqlRenderHelper helper, SqlDialect dialect) {
         this.resolver     = resolver;
         this.whereBuilder = whereBuilder;
         this.helper       = helper;
+        this.dialect      = dialect;
+    }
+
+    /** Legacy constructor — assumes CTE support (H2 / standard SQL). */
+    public HopSqlBuilder(SqlMappingResolver resolver, WhereClauseBuilder whereBuilder,
+                          SqlRenderHelper helper) {
+        this(resolver, whereBuilder, helper, new com.graphqueryengine.query.translate.sql.dialect.StandardSqlDialect());
     }
 
     // ── Entry point ───────────────────────────────────────────────────────────
@@ -113,7 +122,7 @@ public class HopSqlBuilder {
             } else {
                 VertexMapping finalVm = resolver.resolveFinalHopVertexMapping(parsed.hops(), startVertexMapping);
                 sql.append(parsed.dedupRequested() ? SqlKeyword.SELECT_DISTINCT : SqlKeyword.SELECT)
-                        .append(helper.buildAliasValueMapSelectForVertex(finalVm, finalVertexAlias));
+                        .append(helper.buildAliasValueMapSelectForVertex(finalVm, finalVertexAlias, parsed.valueMapKeys()));
             }
         } else if (parsed.valueProperty() != null) {
             if (terminalEdgeHop) {
@@ -382,29 +391,37 @@ public class HopSqlBuilder {
             selectClause = finalVertexAlias + ".*";
         }
 
-        // Shared start FROM
+        // Shared start FROM — use CTE when available to avoid correlated-subquery trap
         List<Object> sharedStartParams = new ArrayList<>();
-        StringBuilder startFrom = new StringBuilder();
+        StringBuilder ctePreamble = new StringBuilder();
+        String startFromRef;
         if (parsed.preHopLimit() != null) {
-            StringBuilder startSubquery = new StringBuilder("(")
+            StringBuilder inner = new StringBuilder()
                     .append(SqlKeyword.SELECT).append(SqlKeyword.STAR)
                     .append(SqlKeyword.FROM).append(startVertexMapping.table());
-            whereBuilder.appendWhereClauseForVertex(startSubquery, sharedStartParams, parsed.filters(), startVertexMapping);
+            whereBuilder.appendWhereClauseForVertex(inner, sharedStartParams, parsed.filters(), startVertexMapping);
             if (parsed.whereClause() != null && whereBuilder.isStructuredWherePredicate(parsed.whereClause())) {
                 whereBuilder.appendStructuredWherePredicate(
-                        startSubquery, sharedStartParams, parsed.whereClause(), startVertexMapping, null,
+                        inner, sharedStartParams, parsed.whereClause(), startVertexMapping, null,
                         !parsed.filters().isEmpty());
             }
-            startSubquery.append(SqlKeyword.LIMIT).append(parsed.preHopLimit()).append(")");
-            startFrom.append(startSubquery).append(" v0");
+            inner.append(SqlKeyword.LIMIT).append(parsed.preHopLimit());
+            if (dialect.supportsCte()) {
+                ctePreamble.append(SqlKeyword.WITH).append("_start")
+                           .append(SqlKeyword.AS_OPEN).append(inner)
+                           .append(SqlKeyword.CLOSE_PAREN).append(" ");
+                startFromRef = "_start v0";
+            } else {
+                startFromRef = "(" + inner + ") v0";
+            }
         } else {
-            startFrom.append(startVertexMapping.table()).append(" v0");
+            startFromRef = startVertexMapping.table() + " v0";
         }
 
         List<Object> outParams = new ArrayList<>();
         List<Object> inParams  = new ArrayList<>();
-        StringBuilder outBranch = new StringBuilder(SqlKeyword.SELECT).append(selectClause).append(SqlKeyword.FROM).append(startFrom);
-        StringBuilder inBranch  = new StringBuilder(SqlKeyword.SELECT).append(selectClause).append(SqlKeyword.FROM).append(startFrom);
+        StringBuilder outBranch = new StringBuilder(SqlKeyword.SELECT).append(selectClause).append(SqlKeyword.FROM).append(startFromRef);
+        StringBuilder inBranch  = new StringBuilder(SqlKeyword.SELECT).append(selectClause).append(SqlKeyword.FROM).append(startFromRef);
 
         for (int i = 0; i < hopCount; i++) {
             HopStep hop = parsed.hops().get(i);
@@ -436,23 +453,24 @@ public class HopSqlBuilder {
             }
         }
 
+        boolean branchHasWhere = false;
         if (parsed.preHopLimit() == null) {
-            boolean hasWhere = false;
             if (!parsed.filters().isEmpty()) {
                 whereBuilder.appendWhereClauseForVertexAlias(outBranch, outParams, parsed.filters(), startVertexMapping, "v0");
                 whereBuilder.appendWhereClauseForVertexAlias(inBranch, inParams, parsed.filters(), startVertexMapping, "v0");
-                hasWhere = true;
+                branchHasWhere = true;
             }
             if (parsed.whereClause() != null && whereBuilder.isStructuredWherePredicate(parsed.whereClause())) {
-                whereBuilder.appendStructuredWherePredicate(outBranch, outParams, parsed.whereClause(), startVertexMapping, "v0", hasWhere);
-                whereBuilder.appendStructuredWherePredicate(inBranch, inParams, parsed.whereClause(), startVertexMapping, "v0", hasWhere);
+                whereBuilder.appendStructuredWherePredicate(outBranch, outParams, parsed.whereClause(), startVertexMapping, "v0", branchHasWhere);
+                whereBuilder.appendStructuredWherePredicate(inBranch, inParams, parsed.whereClause(), startVertexMapping, "v0", branchHasWhere);
+                branchHasWhere = true;
             }
         }
 
         if (parsed.simplePathRequested() && hopCount > 0) {
             StringJoiner cc = SqlRenderHelper.buildSimplePathConditions(hopCount, idCol);
-            outBranch.append(SqlKeyword.WHERE).append(cc);
-            inBranch.append(SqlKeyword.WHERE).append(cc);
+            outBranch.append(branchHasWhere ? SqlKeyword.AND : SqlKeyword.WHERE).append(cc);
+            inBranch.append(branchHasWhere ? SqlKeyword.AND : SqlKeyword.WHERE).append(cc);
         }
 
         String unionKeyword = parsed.dedupRequested() ? SqlKeyword.UNION : SqlKeyword.UNION_ALL;
@@ -467,6 +485,11 @@ public class HopSqlBuilder {
             finalSql = new StringBuilder(SqlKeyword.SELECT_DISTINCT + SqlKeyword.STAR + " FROM (").append(unionSql).append(") _u");
         } else {
             finalSql = new StringBuilder(unionSql);
+        }
+
+        // Prepend the CTE preamble (WITH _start AS (...)) if one was generated
+        if (!ctePreamble.isEmpty()) {
+            finalSql.insert(0, ctePreamble);
         }
 
         List<Object> allParams = new ArrayList<>();
@@ -484,27 +507,75 @@ public class HopSqlBuilder {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Appends the FROM clause for the main query body.
+     *
+     * <p>When {@code preHopLimit} is set and the dialect supports CTEs, the starting-vertex
+     * subquery is emitted as a CTE ({@code WITH _start AS (...)}) instead of an inline
+     * subquery.  This avoids the "correlated subquery trap" where the database re-evaluates
+     * an EXISTS subquery for every row in the table before applying LIMIT, which causes
+     * full-table scans and query timeouts on large datasets (e.g., 80 k+ AML transfers).
+     *
+     * <p>If CTEs are not supported the previous inline-subquery form is used as a fallback.
+     *
+     * @param ctePrefix    output — any CTE preamble ({@code WITH _start AS (…) }) is appended
+     *                     here so callers can prepend it before the SELECT clause.
+     * @param sql          main SQL buffer — receives the {@code FROM} clause reference.
+     * @param params       parameter list — populated with bind values from the subquery.
+     * @param parsed       parsed traversal state.
+     * @param startVm      vertex mapping for the traversal's starting vertex type.
+     */
+    private void appendFromClause(StringBuilder ctePrefix, StringBuilder sql,
+                                   List<Object> params, ParsedTraversal parsed,
+                                   VertexMapping startVm) {
+        if (parsed.preHopLimit() == null) {
+            sql.append(SqlKeyword.FROM).append(startVm.table()).append(" v0");
+            return;
+        }
+
+        // Build the inner SELECT for the starting vertex
+        StringBuilder inner = new StringBuilder()
+                .append(SqlKeyword.SELECT).append(SqlKeyword.STAR)
+                .append(SqlKeyword.FROM).append(startVm.table());
+        List<Object> subParams = new ArrayList<>();
+        whereBuilder.appendWhereClauseForVertex(inner, subParams, parsed.filters(), startVm);
+        if (parsed.whereClause() != null) {
+            if (!whereBuilder.isStructuredWherePredicate(parsed.whereClause()))
+                throw new IllegalArgumentException(
+                        "Unsupported where() predicate for hop traversal: " + parsed.whereClause().kind());
+            whereBuilder.appendStructuredWherePredicate(
+                    inner, subParams, parsed.whereClause(), startVm, null,
+                    !parsed.filters().isEmpty());
+        }
+        inner.append(SqlKeyword.LIMIT).append(parsed.preHopLimit());
+        params.addAll(subParams);
+
+        if (dialect.supportsCte()) {
+            // CTE form: WITH _start AS (SELECT * FROM … WHERE … LIMIT n) SELECT … FROM _start v0
+            ctePrefix.append(SqlKeyword.WITH)
+                     .append("_start")
+                     .append(SqlKeyword.AS_OPEN)
+                     .append(inner)
+                     .append(SqlKeyword.CLOSE_PAREN)
+                     .append(" ");
+            sql.append(SqlKeyword.FROM).append("_start v0");
+        } else {
+            // Fallback: inline subquery (original behaviour)
+            sql.append(SqlKeyword.FROM).append("(").append(inner).append(") v0");
+        }
+    }
+
+    /**
+     * Convenience overload for callers that do not use the CTE prefix buffer
+     * (used by the both-hop builder which manages its own from-clause).
+     */
     private void appendFromClause(StringBuilder sql, List<Object> params, ParsedTraversal parsed,
                                    VertexMapping startVertexMapping) {
-        if (parsed.preHopLimit() != null) {
-            StringBuilder startSubquery = new StringBuilder("(")
-                    .append(SqlKeyword.SELECT).append(SqlKeyword.STAR)
-                    .append(SqlKeyword.FROM).append(startVertexMapping.table());
-            List<Object> subParams = new ArrayList<>();
-            whereBuilder.appendWhereClauseForVertex(startSubquery, subParams, parsed.filters(), startVertexMapping);
-            if (parsed.whereClause() != null) {
-                if (!whereBuilder.isStructuredWherePredicate(parsed.whereClause()))
-                    throw new IllegalArgumentException(
-                            "Unsupported where() predicate for hop traversal: " + parsed.whereClause().kind());
-                whereBuilder.appendStructuredWherePredicate(
-                        startSubquery, subParams, parsed.whereClause(), startVertexMapping, null,
-                        !parsed.filters().isEmpty());
-            }
-            startSubquery.append(SqlKeyword.LIMIT).append(parsed.preHopLimit()).append(")");
-            params.addAll(subParams);
-            sql.append(SqlKeyword.FROM).append(startSubquery).append(" v0");
-        } else {
-            sql.append(SqlKeyword.FROM).append(startVertexMapping.table()).append(" v0");
+        StringBuilder ctePrefix = new StringBuilder();
+        appendFromClause(ctePrefix, sql, params, parsed, startVertexMapping);
+        if (!ctePrefix.isEmpty()) {
+            // Insert the CTE prefix at position 0 of `sql` — caller's SELECT is already there
+            sql.insert(0, ctePrefix);
         }
     }
 

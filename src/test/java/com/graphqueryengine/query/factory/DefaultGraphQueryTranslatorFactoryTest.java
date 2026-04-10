@@ -16,7 +16,7 @@ class DefaultGraphQueryTranslatorFactoryTest {
 
     @Test
     void createsSqlTranslatorForDefaultBackend() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql", "legacy");
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql");
 
         GraphQueryTranslator translator = factory.create();
         TranslationResult result = translator.translate(
@@ -30,7 +30,7 @@ class DefaultGraphQueryTranslatorFactoryTest {
 
     @Test
     void createsIcebergTranslatorWhenRequested() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg", "legacy");
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg");
 
         GraphQueryTranslator translator = factory.create();
 
@@ -39,7 +39,7 @@ class DefaultGraphQueryTranslatorFactoryTest {
 
     @Test
     void icebergTranslatorUsesArrayJoinForFoldProjection() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg", "legacy");
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("iceberg");
         GraphQueryTranslator translator = factory.create();
 
         MappingConfig mapping = new MappingConfig(
@@ -63,7 +63,7 @@ class DefaultGraphQueryTranslatorFactoryTest {
 
     @Test
     void standardBackendAutoUsesIcebergDialectForCatalogQualifiedTables() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql", "legacy");
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql");
         GraphQueryTranslator translator = factory.create();
 
         MappingConfig mapping = new MappingConfig(
@@ -87,7 +87,7 @@ class DefaultGraphQueryTranslatorFactoryTest {
 
     @Test
     void rejectsUnsupportedBackend() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sparksql", "legacy");
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sparksql");
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, factory::create);
         assertTrue(ex.getMessage().contains("Unsupported query translator backend"));
@@ -95,7 +95,8 @@ class DefaultGraphQueryTranslatorFactoryTest {
 
     @Test
     void createsSqlTranslatorWithAntlrParser() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql", "antlr");
+        // parserMode arg deprecated — ANTLR is always used
+        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql");
 
         GraphQueryTranslator translator = factory.create();
         TranslationResult result = translator.translate(
@@ -107,24 +108,14 @@ class DefaultGraphQueryTranslatorFactoryTest {
     }
 
     @Test
-    void rejectsUnsupportedParserMode() {
-        DefaultGraphQueryTranslatorFactory factory = new DefaultGraphQueryTranslatorFactory("sql", "peg");
-
-        IllegalStateException ex = assertThrows(IllegalStateException.class, factory::create);
-        assertTrue(ex.getMessage().contains("Unsupported query parser mode"));
-    }
-
-    @Test
-    void antlrAndLegacyParsers_produceSameSql() {
-        GraphQueryTranslator legacyTranslator = new DefaultGraphQueryTranslatorFactory("sql", "legacy").create();
-        GraphQueryTranslator antlrTranslator = new DefaultGraphQueryTranslatorFactory("sql", "antlr").create();
+    void antlrParser_producesCorrectSql() {
+        // Legacy parser removed — ANTLR is the only parser; verify it produces correct SQL
+        GraphQueryTranslator translator = new DefaultGraphQueryTranslatorFactory("sql").create();
         String gremlin = "g.V().hasLabel('Person').values('name').limit(1)";
 
-        TranslationResult legacy = legacyTranslator.translate(gremlin, sampleMapping());
-        TranslationResult antlr = antlrTranslator.translate(gremlin, sampleMapping());
+        TranslationResult result = translator.translate(gremlin, sampleMapping());
 
-        assertEquals(legacy.sql(), antlr.sql());
-        assertEquals(legacy.parameters(), antlr.parameters());
+        assertEquals("SELECT name AS name FROM people LIMIT 1", result.sql());
     }
 
     private MappingConfig sampleMapping() {
@@ -134,5 +125,3 @@ class DefaultGraphQueryTranslatorFactoryTest {
         );
     }
 }
-
-

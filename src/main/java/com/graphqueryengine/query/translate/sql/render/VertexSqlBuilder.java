@@ -56,8 +56,11 @@ public class VertexSqlBuilder {
 
         if (parsed.valueMapRequested()) {
             StringJoiner selectCols = new StringJoiner(", ");
+            List<String> keys = parsed.valueMapKeys();
             for (Map.Entry<String, String> entry : vertexMapping.properties().entrySet()) {
-                selectCols.add(entry.getValue() + SqlKeyword.AS + helper.quoteAlias(entry.getKey()));
+                if (keys.isEmpty() || keys.contains(entry.getKey())) {
+                    selectCols.add(entry.getValue() + SqlKeyword.AS + helper.quoteAlias(entry.getKey()));
+                }
             }
             List<Object> params = new ArrayList<>();
             StringBuilder sql = new StringBuilder(SqlKeyword.SELECT)
