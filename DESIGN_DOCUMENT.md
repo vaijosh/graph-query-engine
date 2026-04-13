@@ -140,12 +140,19 @@ This document describes the current implementation in `src/main/java/com/graphqu
 │  GremlinExecutionService                                                               │
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐   │
 │  │  GraphProvider (interface)     GraphProviderFactory  env: GRAPH_PROVIDER        │   │
+│  │                                                                                 │   │
 │  │  ┌──────────────────────────────────────────────────────────────────────────┐   │   │
-│  │  │  TinkerGraphProvider                                                     │   │   │
-│  │  │  • GremlinGroovyScriptEngine  (evaluates Gremlin traversals)             │   │   │
+│  │  │  WcojGraphProvider  (DEFAULT)                                            │   │   │
+│  │  │  • AntlrGremlinTraversalParser + GremlinStepParser                       │   │   │
+│  │  │  • isWcojEligible() → LeapfrogTrieJoin  (multi-hop paths)               │   │   │
+│  │  │  • AdjacencyIndexRegistry  (two-tier: heap / disk-mapped CSR)            │   │   │
+│  │  │  • SQL fallback  (via GremlinSqlTranslator + JDBC)                       │   │   │
+│  │  └──────────────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                                 │   │
+│  │  ┌──────────────────────────────────────────────────────────────────────────┐   │   │
+│  │  │  TinkerGraphProvider  (optional, set GRAPH_PROVIDER=tinkergraph)         │   │   │
+│  │  │  • GremlinGroovyScriptEngine  (evaluates full TinkerPop traversals)      │   │   │
 │  │  │  • TinkerGraph  (in-memory graph, loaded from ./data/graph.gryo)         │   │   │
-│  │  │  • GraphTraversalSource  (g = graph.traversal())                         │   │   │
-│  │  │  • TinkerGraphTransactionApi                                             │   │   │
 │  │  └──────────────────────────────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────────────────────────────┘   │
 │  Returns: GremlinExecutionResult { gremlin, results, resultCount }                     │
@@ -170,14 +177,16 @@ This document describes the current implementation in `src/main/java/com/graphqu
 ```Text
 
 THIS ENGINE:
-  Gremlin  →  SQL text (translator)  →  JDBC  →  [Trino]  →  Iceberg REST  →  Parquet/S3
-                                                     ↑
-                                           separate process, must be running
+  Gremlin  →  GremlinStepParser  →  isWcojEligible()?
+                  YES: LeapfrogTrieJoin (adjacency index)  →  property fetch via JDBC  →  result
+                   NO: SQL text (GremlinSqlTranslator)  →  JDBC  →  [Trino]  →  Iceberg/S3
+                                                                         ↑
+                                                               separate process, must be running
 
 PUPPYGRAPH:
   Gremlin  →  internal traversal plan  →  [embedded Spark]  →  Iceberg/Delta/Hudi  →  S3
-                                                ↑
-                                      built-in, no separate SQL server
+                                                 ↑
+                                       built-in, no separate SQL server
 
 
 ```
@@ -193,6 +202,10 @@ PUPPYGRAPH:
   - SQL compiler: `GremlinSqlTranslator`
   - mode wrappers: `StandardSqlGraphQueryTranslator`, `IcebergSqlGraphQueryTranslator`
 - **Native execution subsystem**: `GremlinExecutionService` + `GraphProvider` SPI
+  - **WCOJ engine** (default): `WcojGraphProvider` → `AdjacencyIndexRegistry` → `LeapfrogTrieJoin`
+    - Two-tier index storage: in-memory `AdjacencyIndex` (heap) and `DiskBackedAdjacencyIndex` (memory-mapped CSR)
+    - Per-mapping disk quota and isolation under `wcoj-index-cache/`
+  - **TinkerGraph provider** (optional): full TinkerPop traversal via Groovy script engine
 - **Database bootstrap**: `DatabaseConfig`, `DatabaseManager`
 
 ### High-Level Data Flow
@@ -212,13 +225,25 @@ Client  →  App (Javalin)
                  └─ TranslationResult { sql, params, plan? }
            └─ QueryExplanation JSON  →  Client
 
-── Native Gremlin path (POST /gremlin/query) ───────────────────────────────────────────
+── Native Gremlin execution path (POST /gremlin/query) ─────────────────────────────────
 Client  →  App (Javalin)
            └─ GremlinExecutionService.execute(gremlin)
-                 └─ TinkerGraphProvider
-                       GremlinGroovyScriptEngine.eval(gremlin, bindings{g})
-                       TinkerGraph  (in-memory, optionally persisted .gryo)
-                 └─ GremlinExecutionResult { gremlin, results, resultCount }
+                 └─ WcojGraphProvider  (default provider)
+                       ├─ AntlrGremlinTraversalParser.parse() + GremlinStepParser.parse()
+                       │     → ParsedTraversal
+                       ├─ isWcojEligible()?
+                       │   YES:
+                       │     AdjacencyIndexRegistry.getOrLoad()
+                       │       ├─ rowCount ≤ 5M  →  AdjacencyIndex  (JVM heap HashMap)
+                       │       └─ rowCount > 5M  →  DiskBackedAdjacencyIndex  (mmap CSR)
+                       │     buildStartFilter()  →  seed IDs via SQL sub-query
+                       │     LeapfrogTrieJoin.enumerate()
+                       │       └─ depth-first DFS with seek() on sorted neighbour arrays
+                       │     fetchProperty()  →  batched IN query for vertex properties
+                       │   NO:
+                       │     GremlinSqlTranslator.translate()  →  SQL
+                       │     JDBC execute  →  ResultSet
+                       └─ GremlinExecutionResult { gremlin, results, resultCount }
            └─ JSON  →  Client
 ```
 
@@ -414,9 +439,211 @@ The service intentionally separates:
 
 `/query/explain` never executes SQL. It returns SQL + parameters for inspection.
 
-Native Gremlin execution is routed through `GremlinExecutionService` and `GraphProvider` SPI (default provider: TinkerGraph).
+Native Gremlin execution is routed through `GremlinExecutionService` and `GraphProvider` SPI.  The default provider is `WcojGraphProvider` which uses the Worst-Case Optimal Join algorithm for multi-hop path traversals and falls back to SQL for all other query shapes.
 
 This keeps SQL generation deterministic and testable while preserving full Gremlin semantics in native mode.
+
+---
+
+## 9a) Worst-Case Optimal Join (WCOJ) Engine
+
+### Motivation
+
+Standard SQL binary joins process two tables at a time.  A 3-hop chain
+`Account → Transfer → Account → Transfer → Account` can produce O(E²)
+intermediate rows even when the final result set is tiny — the classic
+**intermediate result explosion** problem.
+
+The WCOJ engine solves this by replacing the SQL join pipeline with a
+**Leapfrog Trie Join** (Veldhuizen, 2014) operating directly on sorted
+in-memory or memory-mapped adjacency lists.  The result: intermediate state
+never exceeds the theoretical worst-case bound of the final output.
+
+---
+
+### Component Overview
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         WCOJ ENGINE  (engine/wcoj/)                             │
+│                                                                                 │
+│  WcojGraphProvider  (GraphProvider SPI)                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │  1. Parse traversal (AntlrGremlinTraversalParser + GremlinStepParser)     │  │
+│  │  2. isWcojEligible() ?                                                    │  │
+│  │     YES ──► executeWcoj()         NO ──► executeSql() (SQL fallback)      │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  AdjacencyIndexRegistry  (two-tier index management)                            │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │  rowCount ≤ 5 M?                                                          │  │
+│  │    YES ──► AdjacencyIndex          (JVM heap HashMap<Long, long[]>)       │  │
+│  │    NO  ──► DiskBackedAdjacencyIndex (memory-mapped CSR files)             │  │
+│  │            within per-mapping disk quota (default 2 GB)?                  │  │
+│  │              NO ──► return null → SQL fallback                            │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  LeapfrogTrieJoin  (core algorithm)                                             │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │  indices[]: NeighbourLookup[]   one per hop                               │  │
+│  │  outDirections[]: boolean[]     true=out, false=in                        │  │
+│  │  simplePath: boolean            visited-set pruning                       │  │
+│  │  startFilter: LongPredicate     seed vertex filter (from SQL sub-query)   │  │
+│  │  limit: int                     early-termination                         │  │
+│  │                                                                           │  │
+│  │  enumerate() → List<long[]>  (each element is a complete path)           │  │
+│  │    depth-first DFS with O(log n) seek() per step                         │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  LeapfrogIterator  (primitive sorted-array cursor)                              │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │  next()          advance by 1                                             │  │
+│  │  seek(key)       binary-search jump to smallest element ≥ key — O(log n) │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Algorithm: Leapfrog Trie Join
+
+The join processes **all hop levels simultaneously** via depth-first recursion.
+At each depth it holds exactly one `long` (the current vertex ID) and a sorted
+neighbour array to iterate over.  No partial row is materialised until the full
+path depth is reached.
+
+```text
+LEAPFROG DFS  (hop count = k)
+─────────────────────────────────────────────────────────
+enumerate():
+  for each seed vertex v0 (from first index's outSources):
+    if startFilter(v0) fails → skip
+    path[0] = v0
+    dfs(path, depth=0)
+
+dfs(path, depth):
+  if depth == k  → emit path[]  (single allocation)
+  current = path[depth]
+  neighbours[] = indices[depth].outNeighbours(current)     // O(1) HashMap or O(log V) disk CSR
+  for each neighbour n in neighbours[]:
+    if simplePath && n already in path[0..depth] → skip   // O(k) visited check, no allocation
+    path[depth+1] = n
+    dfs(path, depth+1)
+─────────────────────────────────────────────────────────
+Complexity:
+  Time:   O(N · log N)   N = |output paths|   (vs O(Eᵏ) for nested-loop SQL)
+  Memory: O(k + N)       k = hop depth        (vs O(E^(k-1)) for SQL join materialisation)
+```
+
+**Leapfrog intersection** is used for multi-label pruning and `both()` hops:
+
+```text
+leapfrogIntersect(a[], b[]):  O(m + n)  — no extra allocation
+leapfrogUnion(a[], b[]):      O(m + n)  — used for both() direction expansion
+```
+
+---
+
+### Two-Tier Index Storage
+
+| Tier | Class | When used | Lookup | Notes |
+|------|-------|-----------|--------|-------|
+| **1 — JVM heap** | `AdjacencyIndex` | edge table ≤ 5 M rows | O(1) `HashMap<Long, long[]>` | Loaded lazily from JDBC on first access; cached until `invalidate()` |
+| **2 — Disk CSR** | `DiskBackedAdjacencyIndex` | edge table > 5 M rows (within quota) | O(log V) binary search in memory-mapped file | Written once, reused across restarts; OS page cache keeps hot pages in RAM |
+| **SQL fallback** | — | quota exceeded or ineligible query | via `GremlinSqlTranslator` | Transparent to the caller |
+
+#### On-disk CSR File Layout (per direction: `.out.csr` / `.in.csr`)
+
+```text
+Offset    Size       Field
+──────────────────────────────────────────────────────────
+0         8 B        vertexCount   (number of distinct source vertices)
+8         8 B        edgeCount     (total edges in this direction)
+16        8 B        reserved
+24        V × 16 B   Vertex table  [vertexId(8) | edgeOffset(8)]  — sorted by vertexId
+24+V×16   E × 8 B    Edge array    [neighbourId(8)]  — sorted within each vertex's slice
+──────────────────────────────────────────────────────────
+Lookup: binary-search vertex table for vertexId → read slice from edge array
+Thread-safe: each call uses ByteBuffer.duplicate() for an independent position cursor
+```
+
+---
+
+### Per-Mapping Disk Quota & Multi-Tenant Isolation
+
+`AdjacencyIndexRegistry` provides full isolation between concurrent client sessions
+using different mappings:
+
+```text
+wcoj-index-cache/
+  aml-iceberg/             ← mapping ID "aml-iceberg"
+    aml_transfers_out_id_in_id.out.csr
+    aml_transfers_out_id_in_id.in.csr
+  social-h2/               ← mapping ID "social-h2"
+    sn_knows_out_id_in_id.out.csr
+    …
+```
+
+- Each mapping's disk usage is tracked independently with an `AtomicLong` counter.
+- Default per-mapping quota: **2 GB** (configurable via `wcoj.disk.quota.mb` system property).
+- If a new index build would exceed the quota, `getOrLoad()` returns `null` and the
+  provider transparently falls back to SQL for that query.
+- Mapping invalidation (`invalidateMapping(id)`) deletes all index files for that mapping
+  and resets the quota counter.
+
+---
+
+### WCOJ Eligibility Check
+
+`WcojGraphProvider.isWcojEligible()` determines whether a parsed traversal can be
+accelerated.  WCOJ is used when **all** of the following hold:
+
+| Condition | Reason |
+|-----------|--------|
+| `hops.size() ≥ 1` | No hops → no join to optimise; delegate to SQL |
+| No `sum` / `mean` / `groupCount` | Aggregations require full SQL |
+| No `project(…)` projections | Complex projections resolved by SQL |
+| No `select(…)` fields | Alias-based projections require SQL context |
+| No `orderBy` | Ordering over result set is a SQL concern |
+| No `outE` / `inE` / `bothE` hops | Edge-step hops not yet supported in WCOJ |
+| All hops are single-label | Multi-label hops are a pending TODO |
+
+Everything else (path queries, `count()`, `dedup()`, `simplePath()`, `limit()`,
+`has()` filters, `values()`) is handled natively by the WCOJ engine.
+
+---
+
+### Property Resolution after WCOJ
+
+After the Leapfrog join produces a `List<long[]>` of vertex-ID paths, vertex
+properties (e.g. `accountId`, `name`) are fetched with a **single batched SQL
+query per hop position**:
+
+```sql
+SELECT id, account_id FROM aml_accounts WHERE id IN (?, ?, …)
+```
+
+This is O(|result-set|) rather than O(|path| × |table|) — the join itself never
+touches property columns.
+
+---
+
+### SQL Fallback Path
+
+For ineligible queries (aggregations, projections, ordering, edge-step hops) the
+provider delegates transparently to `GremlinSqlTranslator` → JDBC, exactly as if
+no WCOJ engine were present.  The SQL generated is identical to what `/query/explain`
+returns, and is logged when `SQL_TRACE` / `X-SQL-Trace` is enabled.
+
+---
+
+### Configuration
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `wcoj.cache.dir` | `<cwd>/wcoj-index-cache` | Root directory for disk CSR files |
+| `wcoj.disk.quota.mb` | `2048` | Per-mapping disk quota in MB |
+| `AdjacencyIndexRegistry.DEFAULT_MAX_EDGES_IN_MEMORY` | `5,000,000` | Row threshold for heap vs disk tier |
 
 ---
 

@@ -24,9 +24,6 @@ public final class GraphProviderFactory {
     public static GraphProvider fromProviderName(String configuredProvider,
                                                   DatabaseManager databaseManager,
                                                   MappingStore mappingStore) {
-        if ("tinkergraph".equals(configuredProvider)) {
-            return new TinkerGraphProvider();
-        }
 
         if ("sql".equals(configuredProvider)) {
             if (databaseManager == null || mappingStore == null) {
@@ -65,7 +62,7 @@ public final class GraphProviderFactory {
         }
 
         throw new IllegalArgumentException("Unsupported GRAPH_PROVIDER: " + configuredProvider +
-                ". Supported providers: tinkergraph, sql, wcoj");
+                ". Supported providers: sql, wcoj");
     }
 
     /**

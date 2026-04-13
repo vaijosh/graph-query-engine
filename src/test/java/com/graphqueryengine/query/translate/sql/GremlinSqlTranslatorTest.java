@@ -7,7 +7,6 @@ import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.parser.AntlrGremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.Disabled;
 
 import java.util.List;
 import java.util.Map;
@@ -1032,8 +1031,8 @@ class GremlinSqlTranslatorTest {
         );
 
         assertTrue(result.sql().contains("WHERE ("));
-        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?)"));
-        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.in_id = id AND we.currency = ?)"));
+        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = v.id AND we.is_laundering = ?)"));
+        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.in_id = v.id AND we.currency = ?)"));
         assertEquals(List.of("1", "USD"), result.parameters());
     }
 
@@ -1061,7 +1060,7 @@ class GremlinSqlTranslatorTest {
                 mapping
         );
 
-        assertTrue(result.sql().contains("WHERE NOT (EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?))"));
+        assertTrue(result.sql().contains("WHERE NOT (EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = v.id AND we.is_laundering = ?))"));
         assertEquals(List.of("1"), result.parameters());
     }
 
@@ -1143,7 +1142,6 @@ class GremlinSqlTranslatorTest {
     }
 
     @Test
-    @Disabled("Test query design issue: mean() on edge property after outE() is not supported by translator")
     void translatesMeanAfterProjectSelectAliasOnTerminalOutE() {
         MappingConfig mapping = new MappingConfig(
                 Map.of(

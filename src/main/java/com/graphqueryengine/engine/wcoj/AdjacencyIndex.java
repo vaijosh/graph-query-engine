@@ -4,9 +4,13 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
+import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
 
 /**
  * Compressed Sparse Row (CSR) adjacency index for a single edge relation.
@@ -58,7 +62,7 @@ public class AdjacencyIndex implements NeighbourLookup {
      */
     public synchronized void load(Connection conn) throws SQLException {
         LOG.info("[WCOJ] Loading adjacency index for " + table);
-        String sql = "SELECT " + outColumn + ", " + inColumn + " FROM " + table;
+        String sql = SqlKeyword.SELECT + outColumn + ", " + inColumn + SqlKeyword.FROM + table;
 
         Map<Long, List<Long>> outTmp = new HashMap<>();
         Map<Long, List<Long>> inTmp  = new HashMap<>();

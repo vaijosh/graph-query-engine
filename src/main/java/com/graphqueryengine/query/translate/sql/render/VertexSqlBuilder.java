@@ -5,7 +5,9 @@ import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
+import com.graphqueryengine.query.translate.sql.constant.SqlFragment;
 import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
+import com.graphqueryengine.query.translate.sql.constant.SqlOperator;
 import com.graphqueryengine.query.translate.sql.mapping.SqlMappingResolver;
 import com.graphqueryengine.query.translate.sql.model.AsAlias;
 import com.graphqueryengine.query.translate.sql.model.ChooseProjectionSpec;
@@ -55,7 +57,7 @@ public class VertexSqlBuilder {
         if (!parsed.projections().isEmpty())        return buildProjectionSql(parsed, mappingConfig, vertexMapping);
 
         if (parsed.valueMapRequested()) {
-            StringJoiner selectCols = new StringJoiner(", ");
+            StringJoiner selectCols = new StringJoiner(SqlFragment.COMMA_SPACE);
             List<String> keys = parsed.valueMapKeys();
             for (Map.Entry<String, String> entry : vertexMapping.properties().entrySet()) {
                 if (keys.isEmpty() || keys.contains(entry.getKey())) {
@@ -86,17 +88,27 @@ public class VertexSqlBuilder {
 
     private TranslationResult buildSimpleSelectSql(ParsedTraversal parsed, VertexMapping vertexMapping,
                                                     Integer effectiveLimit) {
+        // Always alias the table as "v" so correlated sub-queries in WHERE EXISTS can
+        // unambiguously reference "v.<idColumn>" rather than an unqualified name that
+        // may resolve to an inner-table column of the same name (e.g. "id" in an edge table).
+        boolean needsAlias = parsed.whereClause() != null
+                && whereBuilder.isStructuredWherePredicate(parsed.whereClause());
+        String tableRef = needsAlias
+                ? vertexMapping.table() + SqlFragment.SPACE + SqlFragment.ALIAS_V
+                : vertexMapping.table();
+        String vertexAlias = needsAlias ? SqlFragment.ALIAS_V : null;
+
         String selectClause = resolveSimpleSelectClause(parsed, vertexMapping);
         List<Object> params = new ArrayList<>();
         StringBuilder sql = new StringBuilder(SqlKeyword.SELECT).append(selectClause)
-                .append(SqlKeyword.FROM).append(vertexMapping.table());
-        whereBuilder.appendWhereClauseForVertex(sql, params, parsed.filters(), vertexMapping);
+                .append(SqlKeyword.FROM).append(tableRef);
+        whereBuilder.appendWhereClauseForVertexAlias(sql, params, parsed.filters(), vertexMapping, vertexAlias);
         if (parsed.whereClause() != null) {
             if (!whereBuilder.isStructuredWherePredicate(parsed.whereClause()))
                 throw new IllegalArgumentException(
                         "Unsupported where() predicate for g.V(): " + parsed.whereClause().kind());
             whereBuilder.appendStructuredWherePredicate(
-                    sql, params, parsed.whereClause(), vertexMapping, null, !parsed.filters().isEmpty());
+                    sql, params, parsed.whereClause(), vertexMapping, vertexAlias, !parsed.filters().isEmpty());
         }
         helper.appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
         SqlRenderHelper.appendLimit(sql, effectiveLimit);
@@ -106,7 +118,7 @@ public class VertexSqlBuilder {
     private String resolveSimpleSelectClause(ParsedTraversal parsed, VertexMapping vertexMapping) {
         if (parsed.countRequested()) {
             return parsed.dedupRequested()
-                    ? SqlKeyword.COUNT_DISTINCT + vertexMapping.idColumn() + ") AS count"
+                    ? SqlKeyword.COUNT_DISTINCT + vertexMapping.idColumn() + SqlFragment.CLOSE_PAREN + SqlKeyword.AS + SqlFragment.ALIAS_COUNT
                     : SqlKeyword.COUNT_STAR;
         }
         if (parsed.sumRequested()) {
@@ -134,11 +146,15 @@ public class VertexSqlBuilder {
         List<Object> params = new ArrayList<>();
         StringBuilder sql = new StringBuilder(SqlKeyword.SELECT)
                 .append(mappedColumn).append(SqlKeyword.AS).append(helper.quoteAlias(groupProperty))
-                .append(", ").append(SqlKeyword.COUNT_STAR).append(SqlKeyword.FROM).append(vertexMapping.table());
+                .append(SqlFragment.COMMA_SPACE).append(SqlKeyword.COUNT_STAR).append(SqlKeyword.FROM).append(vertexMapping.table());
         whereBuilder.appendWhereClauseForVertex(sql, params, parsed.filters(), vertexMapping);
+        return getTranslationResult(parsed, mappedColumn, params, sql, helper);
+    }
+
+    static TranslationResult getTranslationResult(ParsedTraversal parsed, String mappedColumn, List<Object> params, StringBuilder sql, SqlRenderHelper helper) {
         sql.append(SqlKeyword.GROUP_BY).append(mappedColumn);
         if (parsed.orderByCountDesc()) {
-            sql.append(SqlKeyword.ORDER_BY).append("count ").append(parsed.orderDirection() != null ? parsed.orderDirection() : SqlKeyword.DESC);
+            sql.append(SqlKeyword.ORDER_BY).append(SqlKeyword.COUNT_ALIAS).append(parsed.orderDirection() != null ? parsed.orderDirection() : SqlKeyword.DESC);
         } else {
             helper.appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
         }
@@ -175,41 +191,41 @@ public class VertexSqlBuilder {
         }
 
         String groupPropCol = resolver.mapVertexProperty(keyVertexMapping, keySpec.property());
-        String vertexAlias = "v" + aliasHopIndex;
+        String vertexAlias = SqlFragment.V_PREFIX + aliasHopIndex;
         String idCol = startVertexMapping.idColumn();
         List<Object> params = new ArrayList<>();
         StringBuilder sql = new StringBuilder(SqlKeyword.SELECT)
-                .append(vertexAlias).append(".").append(groupPropCol)
+                .append(vertexAlias).append(SqlFragment.DOT).append(groupPropCol)
                 .append(SqlKeyword.AS).append(helper.quoteAlias(keySpec.property()))
-                .append(", ").append(SqlKeyword.COUNT_STAR)
-                .append(SqlKeyword.FROM).append(startVertexMapping.table()).append(" v0");
+                .append(SqlFragment.COMMA_SPACE).append(SqlKeyword.COUNT_STAR)
+                .append(SqlKeyword.FROM).append(startVertexMapping.table()).append(SqlFragment.SPACE).append(SqlFragment.V0);
 
         for (int i = 0; i < parsed.hops().size(); i++) {
             HopStep hop = parsed.hops().get(i);
             EdgeMapping edgeMapping = resolver.resolveEdgeMapping(hop.singleLabel());
-            String edgeAlias  = "e" + (i + 1);
-            String fromAlias  = "v" + i;
-            String toAlias    = "v" + (i + 1);
-            String fromId     = fromAlias + "." + idCol;
-            String toId       = toAlias + "." + idCol;
+            String edgeAlias  = SqlFragment.E_PREFIX + (i + 1);
+            String fromAlias  = SqlFragment.V_PREFIX + i;
+            String toAlias    = SqlFragment.V_PREFIX + (i + 1);
+            String fromId     = fromAlias + SqlFragment.DOT + idCol;
+            String toId       = toAlias + SqlFragment.DOT + idCol;
             boolean outDirection = GremlinToken.OUT.equals(hop.direction()) || GremlinToken.OUT_E.equals(hop.direction());
-            sql.append(SqlKeyword.JOIN).append(edgeMapping.table()).append(" ").append(edgeAlias);
+            sql.append(SqlKeyword.JOIN).append(edgeMapping.table()).append(SqlFragment.SPACE).append(edgeAlias);
             if (outDirection)
-                sql.append(SqlKeyword.ON).append(edgeAlias).append(".").append(edgeMapping.outColumn()).append(" = ").append(fromId);
+                sql.append(SqlKeyword.ON).append(edgeAlias).append(SqlFragment.DOT).append(edgeMapping.outColumn()).append(SqlFragment.SPACE_EQ_SPACE).append(fromId);
             else
-                sql.append(SqlKeyword.ON).append(edgeAlias).append(".").append(edgeMapping.inColumn()).append(" = ").append(fromId);
+                sql.append(SqlKeyword.ON).append(edgeAlias).append(SqlFragment.DOT).append(edgeMapping.inColumn()).append(SqlFragment.SPACE_EQ_SPACE).append(fromId);
             VertexMapping toVm = resolver.resolveHopTargetVertexMapping(edgeMapping, outDirection, startVertexMapping);
-            sql.append(SqlKeyword.JOIN).append(toVm.table()).append(" ").append(toAlias);
+            sql.append(SqlKeyword.JOIN).append(toVm.table()).append(SqlFragment.SPACE).append(toAlias);
             if (outDirection)
-                sql.append(SqlKeyword.ON).append(toId).append(" = ").append(edgeAlias).append(".").append(edgeMapping.inColumn());
+                sql.append(SqlKeyword.ON).append(toId).append(SqlFragment.SPACE_EQ_SPACE).append(edgeAlias).append(SqlFragment.DOT).append(edgeMapping.inColumn());
             else
-                sql.append(SqlKeyword.ON).append(toId).append(" = ").append(edgeAlias).append(".").append(edgeMapping.outColumn());
+                sql.append(SqlKeyword.ON).append(toId).append(SqlFragment.SPACE_EQ_SPACE).append(edgeAlias).append(SqlFragment.DOT).append(edgeMapping.outColumn());
         }
 
-        whereBuilder.appendWhereClauseForVertexAlias(sql, params, parsed.filters(), startVertexMapping, "v0");
-        sql.append(SqlKeyword.GROUP_BY).append(vertexAlias).append(".").append(groupPropCol);
+        whereBuilder.appendWhereClauseForVertexAlias(sql, params, parsed.filters(), startVertexMapping, SqlFragment.V0);
+        sql.append(SqlKeyword.GROUP_BY).append(vertexAlias).append(SqlFragment.DOT).append(groupPropCol);
         if (parsed.orderByCountDesc()) {
-            sql.append(SqlKeyword.ORDER_BY).append("count ").append(parsed.orderDirection() != null ? parsed.orderDirection() : SqlKeyword.DESC);
+            sql.append(SqlKeyword.ORDER_BY).append(SqlKeyword.COUNT_ALIAS).append(parsed.orderDirection() != null ? parsed.orderDirection() : SqlKeyword.DESC);
         } else {
             helper.appendOrderBy(sql, parsed.orderByProperty(), parsed.orderDirection());
         }
@@ -227,17 +243,17 @@ public class VertexSqlBuilder {
             throw new IllegalArgumentException("values() cannot be combined with project(...)");
 
         List<Object> params = new ArrayList<>();
-        StringJoiner selectJoiner = new StringJoiner(", ");
+        StringJoiner selectJoiner = new StringJoiner(SqlFragment.COMMA_SPACE);
         int neighborJoinIdx = 0;
 
         for (ProjectionField projection : parsed.projections()) {
             String alias = helper.quoteAlias(projection.alias());
             switch (projection.kind()) {
                 case IDENTITY ->
-                    selectJoiner.add("v." + vertexMapping.idColumn() + SqlKeyword.AS + alias);
+                    selectJoiner.add(SqlFragment.PREFIX_V + vertexMapping.idColumn() + SqlKeyword.AS + alias);
                 case EDGE_PROPERTY -> {
                     String column = resolver.mapVertexProperty(vertexMapping, projection.property());
-                    selectJoiner.add("v." + column + SqlKeyword.AS + alias);
+                    selectJoiner.add(SqlFragment.PREFIX_V + column + SqlKeyword.AS + alias);
                 }
                 case CHOOSE_VALUES_IS_CONSTANT -> {
                     ChooseProjectionSpec chooseSpec = helper.parseChooseProjection(projection.property());
@@ -248,11 +264,11 @@ public class VertexSqlBuilder {
                     String threshold = helper.sanitizeNumericLiteral(chooseSpec.predicateValue());
                     String whenTrue  = helper.toSqlConstantLiteral(chooseSpec.trueConstant());
                     String whenFalse = helper.toSqlConstantLiteral(chooseSpec.falseConstant());
-                    selectJoiner.add(SqlKeyword.CASE_WHEN + "v." + column + " " + operator + " " + threshold
+                    selectJoiner.add(SqlKeyword.CASE_WHEN + SqlFragment.PREFIX_V + column + SqlFragment.SPACE + operator + SqlFragment.SPACE + threshold
                             + SqlKeyword.THEN + whenTrue + SqlKeyword.ELSE + whenFalse + SqlKeyword.END + SqlKeyword.AS + alias);
                 }
                 case EDGE_DEGREE -> {
-                    String[] parts = projection.property().split(":", -1);
+                    String[] parts = projection.property().split(SqlFragment.COLON, -1);
                     if (parts.length < 2)
                         throw new IllegalArgumentException("Invalid EDGE_DEGREE property: " + projection.property());
                     String direction  = parts[0];
@@ -260,24 +276,24 @@ public class VertexSqlBuilder {
                     EdgeMapping em    = Optional.ofNullable(mappingConfig.edges().get(edgeLabel))
                             .orElseThrow(() -> new IllegalArgumentException("No edge mapping found for label: " + edgeLabel));
                     String joinColumn = GremlinToken.OUT.equals(direction) ? em.outColumn() : em.inColumn();
-                    StringBuilder subq = new StringBuilder("(")
+                    StringBuilder subq = new StringBuilder(SqlFragment.OPEN_PAREN)
                             .append(SqlKeyword.SELECT_COUNT)
                             .append(em.table()).append(SqlKeyword.WHERE).append(joinColumn)
-                            .append(" = v.").append(vertexMapping.idColumn());
+                            .append(SqlFragment.SPACE_EQ_SPACE).append(SqlFragment.PREFIX_V).append(vertexMapping.idColumn());
                     for (int i = 2; i < parts.length; i++) {
-                        int eq = parts[i].indexOf('=');
+                        int eq = parts[i].indexOf(SqlFragment.EQUALS_SIGN);
                         if (eq >= 1) {
                             String filterProp = parts[i].substring(0, eq);
                             String filterVal  = parts[i].substring(eq + 1);
                             subq.append(SqlKeyword.AND).append(resolver.mapEdgeProperty(em, filterProp))
-                                    .append(" = '").append(filterVal.replace("'", "''")).append("'");
+                                    .append(SqlFragment.SPACE_EQ_SPACE).append(SqlFragment.SQL_QUOTE).append(filterVal.replace(SqlFragment.SQL_QUOTE, SqlFragment.SQL_QUOTE + SqlFragment.SQL_QUOTE)).append(SqlFragment.SQL_QUOTE);
                         }
                     }
-                    subq.append(")");
+                    subq.append(SqlFragment.CLOSE_PAREN);
                     selectJoiner.add(subq + SqlKeyword.AS + alias);
                 }
                 case OUT_VERTEX_COUNT, IN_VERTEX_COUNT -> {
-                    String[] parts = projection.property().split(":", -1);
+                    String[] parts = projection.property().split(SqlFragment.COLON, -1);
                     if (parts.length < 2)
                         throw new IllegalArgumentException("Invalid VERTEX_COUNT property: " + projection.property());
                     String direction  = parts[0];
@@ -288,30 +304,30 @@ public class VertexSqlBuilder {
                     String targetCol  = GremlinToken.OUT.equals(direction) ? em.inColumn() : em.outColumn();
                     VertexMapping targetVm = resolver.resolveTargetVertexMapping(em, GremlinToken.OUT.equals(direction));
                     if (targetVm == null) {
-                        selectJoiner.add("(" + SqlKeyword.SELECT_COUNT + em.table() + SqlKeyword.WHERE + anchorCol
-                                + " = v." + vertexMapping.idColumn() + ")" + SqlKeyword.AS + alias);
+                        selectJoiner.add(SqlFragment.OPEN_PAREN + SqlKeyword.SELECT_COUNT + em.table() + SqlKeyword.WHERE + anchorCol
+                                + SqlFragment.SPACE_EQ_SPACE + SqlFragment.PREFIX_V + vertexMapping.idColumn() + SqlFragment.CLOSE_PAREN + SqlKeyword.AS + alias);
                     } else {
-                        StringBuilder subq = new StringBuilder("(")
+                        StringBuilder subq = new StringBuilder(SqlFragment.OPEN_PAREN)
                                 .append(SqlKeyword.SELECT_COUNT)
-                                .append(em.table()).append(" _e")
-                                .append(SqlKeyword.JOIN).append(targetVm.table()).append(" _tv")
-                                .append(SqlKeyword.ON).append("_tv.").append(targetVm.idColumn()).append(" = _e.").append(targetCol)
-                                .append(SqlKeyword.WHERE).append("_e.").append(anchorCol).append(" = v.").append(vertexMapping.idColumn());
+                                .append(em.table()).append(SqlFragment.SPACE).append(SqlFragment.ALIAS_SUB_E)
+                                .append(SqlKeyword.JOIN).append(targetVm.table()).append(SqlFragment.SPACE).append(SqlFragment.ALIAS_SUB_TV)
+                                .append(SqlKeyword.ON).append(SqlFragment.ALIAS_SUB_TV).append(SqlFragment.DOT).append(targetVm.idColumn()).append(SqlFragment.SPACE_EQ_SPACE).append(SqlFragment.PREFIX_E).append(targetCol)
+                                .append(SqlKeyword.WHERE).append(SqlFragment.PREFIX_E).append(anchorCol).append(SqlFragment.SPACE_EQ_SPACE).append(SqlFragment.PREFIX_V).append(vertexMapping.idColumn());
                         for (int i = 2; i < parts.length; i++) {
-                            int eq = parts[i].indexOf('=');
+                            int eq = parts[i].indexOf(SqlFragment.EQUALS_SIGN);
                             if (eq >= 1) {
                                 String filterProp = parts[i].substring(0, eq);
                                 String filterVal  = parts[i].substring(eq + 1);
-                                subq.append(SqlKeyword.AND).append("_tv.").append(resolver.mapVertexProperty(targetVm, filterProp))
-                                        .append(" = '").append(filterVal.replace("'", "''")).append("'");
+                                subq.append(SqlKeyword.AND).append(SqlFragment.ALIAS_SUB_TV).append(SqlFragment.DOT).append(resolver.mapVertexProperty(targetVm, filterProp))
+                                        .append(SqlFragment.SPACE_EQ_SPACE).append(SqlFragment.SQL_QUOTE).append(filterVal.replace(SqlFragment.SQL_QUOTE, SqlFragment.SQL_QUOTE + SqlFragment.SQL_QUOTE)).append(SqlFragment.SQL_QUOTE);
                             }
                         }
-                        subq.append(")");
+                        subq.append(SqlFragment.CLOSE_PAREN);
                         selectJoiner.add(subq + SqlKeyword.AS + alias);
                     }
                 }
                 case OUT_NEIGHBOR_PROPERTY, IN_NEIGHBOR_PROPERTY -> {
-                    String[] parts = projection.property().split(":", 3);
+                    String[] parts = projection.property().split(SqlFragment.COLON, 3);
                     if (parts.length < 3)
                         throw new IllegalArgumentException("Invalid NEIGHBOR_PROPERTY descriptor: " + projection.property());
                     boolean isOut    = GremlinToken.OUT.equals(parts[0]);
@@ -328,8 +344,8 @@ public class VertexSqlBuilder {
                     String anchorCol = isOut ? em.outColumn() : em.inColumn();
                     String targetCol = isOut ? em.inColumn() : em.outColumn();
                     String mappedCol = resolver.mapVertexProperty(neighborMapping, neighborProp);
-                    String subqAlias = "_nje" + neighborJoinIdx;
-                    String vAlias    = "_njv" + neighborJoinIdx++;
+                    String subqAlias = SqlFragment.ALIAS_NJE_PREFIX + neighborJoinIdx;
+                    String vAlias    = SqlFragment.ALIAS_NJV_PREFIX + neighborJoinIdx++;
                     String aggExpr = buildNeighborAggSubquery(subqAlias, vAlias, mappedCol, em, neighborMapping,
                             anchorCol, targetCol, vertexMapping);
                     selectJoiner.add(aggExpr + SqlKeyword.AS + alias);
@@ -340,11 +356,11 @@ public class VertexSqlBuilder {
         }
 
         StringBuilder baseSql = new StringBuilder(parsed.dedupRequested() ? SqlKeyword.SELECT_DISTINCT : SqlKeyword.SELECT)
-                .append(selectJoiner).append(SqlKeyword.FROM).append(vertexMapping.table()).append(" v");
-        whereBuilder.appendWhereClauseForVertexAlias(baseSql, params, parsed.filters(), vertexMapping, "v");
+                .append(selectJoiner).append(SqlKeyword.FROM).append(vertexMapping.table()).append(SqlFragment.SPACE).append(SqlFragment.ALIAS_V);
+        whereBuilder.appendWhereClauseForVertexAlias(baseSql, params, parsed.filters(), vertexMapping, SqlFragment.ALIAS_V);
         if (parsed.whereClause() != null && whereBuilder.isStructuredWherePredicate(parsed.whereClause())) {
             whereBuilder.appendStructuredWherePredicate(
-                    baseSql, params, parsed.whereClause(), vertexMapping, "v", !parsed.filters().isEmpty());
+                    baseSql, params, parsed.whereClause(), vertexMapping, SqlFragment.ALIAS_V, !parsed.filters().isEmpty());
         }
 
         Integer limit = parsed.limit() != null ? parsed.limit() : parsed.preHopLimit();
@@ -352,11 +368,12 @@ public class VertexSqlBuilder {
             if (parsed.whereClause().kind() == com.graphqueryengine.query.translate.sql.model.WhereKind.PROJECT_GT
                     || parsed.whereClause().kind() == com.graphqueryengine.query.translate.sql.model.WhereKind.PROJECT_GTE) {
                 String numericLiteral = helper.sanitizeNumericLiteral(parsed.whereClause().right());
-                String operator = parsed.whereClause().kind() == com.graphqueryengine.query.translate.sql.model.WhereKind.PROJECT_GTE ? ">=" : ">";
-                StringBuilder wrapped = new StringBuilder(SqlKeyword.SELECT + SqlKeyword.STAR + " FROM (")
-                        .append(baseSql).append(") p").append(SqlKeyword.WHERE).append("p.")
+                String operator = parsed.whereClause().kind() == com.graphqueryengine.query.translate.sql.model.WhereKind.PROJECT_GTE ? SqlOperator.GTE : SqlOperator.GT;
+                StringBuilder wrapped = new StringBuilder(SqlKeyword.SELECT + SqlKeyword.STAR).append(SqlKeyword.FROM_SUBQUERY)
+                        .append(baseSql).append(SqlFragment.CLOSE_PAREN).append(SqlFragment.SPACE).append(SqlFragment.ALIAS_P)
+                        .append(SqlKeyword.WHERE).append(SqlFragment.ALIAS_P).append(SqlFragment.DOT)
                         .append(helper.quoteAlias(parsed.whereClause().left()))
-                        .append(" ").append(operator).append(" ").append(numericLiteral);
+                        .append(SqlFragment.SPACE).append(operator).append(SqlFragment.SPACE).append(numericLiteral);
                 helper.appendOrderBy(wrapped, parsed.orderByProperty(), parsed.orderDirection());
                 SqlRenderHelper.appendLimit(wrapped, limit);
                 return new TranslationResult(wrapped.toString(), params);
@@ -375,11 +392,11 @@ public class VertexSqlBuilder {
                                              EdgeMapping em, VertexMapping neighborMapping,
                                              String anchorCol, String targetCol,
                                              VertexMapping vertexMapping) {
-        return "(SELECT " + helper.buildNeighborAggExpr(vAlias + "." + mappedCol)
-                + SqlKeyword.FROM + em.table() + " " + subqAlias
-                + SqlKeyword.JOIN + neighborMapping.table() + " " + vAlias
-                + SqlKeyword.ON + vAlias + "." + neighborMapping.idColumn() + " = " + subqAlias + "." + targetCol
-                + SqlKeyword.WHERE + subqAlias + "." + anchorCol + " = v." + vertexMapping.idColumn() + ")";
+        return SqlFragment.OPEN_PAREN + SqlKeyword.SELECT + helper.buildNeighborAggExpr(vAlias + SqlFragment.DOT + mappedCol)
+                + SqlKeyword.FROM + em.table() + SqlFragment.SPACE + subqAlias
+                + SqlKeyword.JOIN + neighborMapping.table() + SqlFragment.SPACE + vAlias
+                + SqlKeyword.ON + vAlias + SqlFragment.DOT + neighborMapping.idColumn() + SqlFragment.SPACE_EQ_SPACE + subqAlias + SqlFragment.DOT + targetCol
+                + SqlKeyword.WHERE + subqAlias + SqlFragment.DOT + anchorCol + SqlFragment.SPACE_EQ_SPACE + SqlFragment.PREFIX_V + vertexMapping.idColumn() + SqlFragment.CLOSE_PAREN;
     }
 }
 

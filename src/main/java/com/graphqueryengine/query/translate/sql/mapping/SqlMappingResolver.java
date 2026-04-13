@@ -7,6 +7,7 @@ import com.graphqueryengine.query.translate.sql.HasFilter;
 import com.graphqueryengine.query.translate.sql.model.AsAlias;
 import com.graphqueryengine.query.translate.sql.model.HopStep;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
+import com.graphqueryengine.query.translate.sql.constant.SqlFragment;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -49,7 +50,9 @@ public class SqlMappingResolver {
         for (Map.Entry<String, EdgeMapping> entry : mappingConfig.edges().entrySet()) {
             EdgeMapping em = entry.getValue();
             boolean allMatch = filters.stream().allMatch(f ->
-                    "id".equals(f.property()) || "outV".equals(f.property()) || "inV".equals(f.property())
+                    GremlinToken.PROP_ID.equals(f.property())
+                    || GremlinToken.PROP_OUT_V.equals(f.property())
+                    || GremlinToken.PROP_IN_V.equals(f.property())
                     || em.properties().containsKey(f.property()));
             if (allMatch) candidates.add(entry.getKey());
         }
@@ -214,7 +217,7 @@ public class SqlMappingResolver {
         Integer hopIndex = aliasHopIndex.get(aliasLabel);
         if (hopIndex == null)
             throw new IllegalArgumentException("where() alias not found: " + aliasLabel);
-        return "v" + hopIndex;
+        return SqlFragment.V_PREFIX + hopIndex;
     }
 
     // ── Label resolution ──────────────────────────────────────────────────────

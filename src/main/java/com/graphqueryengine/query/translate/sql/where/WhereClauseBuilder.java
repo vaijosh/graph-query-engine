@@ -4,7 +4,9 @@ import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.VertexMapping;
 import com.graphqueryengine.query.translate.sql.HasFilter;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
+import com.graphqueryengine.query.translate.sql.constant.SqlFragment;
 import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
+import com.graphqueryengine.query.translate.sql.constant.SqlOperator;
 import com.graphqueryengine.query.translate.sql.dialect.SqlDialect;
 import com.graphqueryengine.query.translate.sql.dialect.StandardSqlDialect;
 import com.graphqueryengine.query.translate.sql.mapping.SqlMappingResolver;
@@ -102,11 +104,11 @@ public class WhereClauseBuilder {
             String column = isIdColumn
                     ? mapping.idColumn()
                     : resolver.mapVertexProperty(mapping, filter.property());
-            String qualifiedColumn = alias != null ? alias + "." + column : column;
-            if (SqlKeyword.IS_NULL.trim().equals(filter.operator())) {
+            String qualifiedColumn = alias != null ? alias + SqlFragment.DOT + column : column;
+            if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
                 whereJoiner.add(qualifiedColumn + SqlKeyword.IS_NULL);
             } else {
-                whereJoiner.add(qualifiedColumn + " " + filter.operator() + " " + SqlKeyword.PLACEHOLDER);
+                whereJoiner.add(qualifiedColumn + SqlFragment.SPACE + filter.operator() + SqlFragment.SPACE + SqlKeyword.PLACEHOLDER);
                 // ID columns are always BIGINT → use addIdParam for strict dialects (Trino)
                 if (isIdColumn) {
                     addIdParam(params, filter.typedValue());
@@ -132,11 +134,11 @@ public class WhereClauseBuilder {
         StringJoiner whereJoiner = new StringJoiner(SqlKeyword.AND);
         for (HasFilter filter : filters) {
             String column = resolver.mapEdgeFilterProperty(mapping, filter.property());
-            String qualifiedColumn = alias == null ? column : alias + "." + column;
-            if (SqlKeyword.IS_NULL.trim().equals(filter.operator())) {
+            String qualifiedColumn = alias == null ? column : alias + SqlFragment.DOT + column;
+            if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
                 whereJoiner.add(qualifiedColumn + SqlKeyword.IS_NULL);
             } else {
-                whereJoiner.add(qualifiedColumn + " " + filter.operator() + " " + SqlKeyword.PLACEHOLDER);
+                whereJoiner.add(qualifiedColumn + SqlFragment.SPACE + filter.operator() + SqlFragment.SPACE + SqlKeyword.PLACEHOLDER);
                 addParam(params, filter.typedValue());
             }
         }
@@ -173,8 +175,8 @@ public class WhereClauseBuilder {
             case NOT -> {
                 if (whereClause.clauses().size() != 1)
                     throw new IllegalArgumentException("where(not(...)) requires exactly one inner predicate");
-                yield SqlKeyword.NOT + "(" + buildStructuredWherePredicateSql(
-                        whereClause.clauses().get(0), vertexMapping, vertexAlias, params) + ")";
+                yield SqlKeyword.NOT + SqlFragment.OPEN_PAREN + buildStructuredWherePredicateSql(
+                        whereClause.clauses().get(0), vertexMapping, vertexAlias, params) + SqlFragment.CLOSE_PAREN;
             }
             default -> throw new IllegalArgumentException(
                     "Unsupported structured where() predicate: " + whereClause.kind());
@@ -188,69 +190,69 @@ public class WhereClauseBuilder {
             throw new IllegalArgumentException("Compound where() predicate requires inner predicates");
         StringJoiner joiner = new StringJoiner(delimiter);
         for (WhereClause clause : clauses) {
-            joiner.add("(" + buildStructuredWherePredicateSql(clause, vertexMapping, vertexAlias, params) + ")");
+            joiner.add(SqlFragment.OPEN_PAREN + buildStructuredWherePredicateSql(clause, vertexMapping, vertexAlias, params) + SqlFragment.CLOSE_PAREN);
         }
-        return "(" + joiner + ")";
+        return SqlFragment.OPEN_PAREN + joiner + SqlFragment.CLOSE_PAREN;
     }
 
     private String buildEdgeExistsPredicateSql(WhereClause whereClause, VertexMapping vertexMapping,
                                                 String vertexAlias, List<Object> params) {
         EdgeMapping edgeMapping = resolver.resolveEdgeMapping(whereClause.right());
-        String edgeAlias = "we";
+        String edgeAlias = SqlFragment.ALIAS_WE_CORR;
         String idRef = vertexAlias == null
                 ? vertexMapping.idColumn()
-                : vertexAlias + "." + vertexMapping.idColumn();
+                : vertexAlias + SqlFragment.DOT + vertexMapping.idColumn();
         String correlation;
         if (GremlinToken.OUT_E.equals(whereClause.left())) {
-            correlation = edgeAlias + "." + edgeMapping.outColumn() + " = " + idRef;
+            correlation = edgeAlias + SqlFragment.DOT + edgeMapping.outColumn() + SqlFragment.SPACE_EQ_SPACE + idRef;
         } else if (GremlinToken.IN_E.equals(whereClause.left())) {
-            correlation = edgeAlias + "." + edgeMapping.inColumn() + " = " + idRef;
+            correlation = edgeAlias + SqlFragment.DOT + edgeMapping.inColumn() + SqlFragment.SPACE_EQ_SPACE + idRef;
         } else {
-            correlation = "(" + edgeAlias + "." + edgeMapping.outColumn() + " = " + idRef
-                    + " OR " + edgeAlias + "." + edgeMapping.inColumn() + " = " + idRef + ")";
+            correlation = SqlFragment.OPEN_PAREN + edgeAlias + SqlFragment.DOT + edgeMapping.outColumn() + SqlFragment.SPACE_EQ_SPACE + idRef
+                    + SqlKeyword.OR + edgeAlias + SqlFragment.DOT + edgeMapping.inColumn() + SqlFragment.SPACE_EQ_SPACE + idRef + SqlFragment.CLOSE_PAREN;
         }
 
         // Count comparison: outE('LABEL').count().is(n)
         HasFilter countFilter = whereClause.filters().stream()
                 .filter(f -> GremlinToken.PROP_COUNT.equals(f.property())).findFirst().orElse(null);
         if (countFilter != null) {
-            StringBuilder countSql = new StringBuilder("(").append(SqlKeyword.SELECT_COUNT)
-                    .append(edgeMapping.table()).append(' ').append(edgeAlias)
+            StringBuilder countSql = new StringBuilder(SqlFragment.OPEN_PAREN).append(SqlKeyword.SELECT_COUNT)
+                    .append(edgeMapping.table()).append(SqlFragment.SPACE).append(edgeAlias)
                     .append(SqlKeyword.WHERE).append(correlation);
             for (HasFilter filter : whereClause.filters()) {
                 if (!GremlinToken.PROP_COUNT.equals(filter.property())) {
                     String column = resolver.mapEdgeFilterProperty(edgeMapping, filter.property());
-                    if (SqlKeyword.IS_NULL.trim().equals(filter.operator())) {
-                        countSql.append(SqlKeyword.AND).append(edgeAlias).append('.').append(column).append(SqlKeyword.IS_NULL);
+                    if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
+                        countSql.append(SqlKeyword.AND).append(edgeAlias).append(SqlFragment.DOT).append(column).append(SqlKeyword.IS_NULL);
                     } else {
-                        countSql.append(SqlKeyword.AND).append(edgeAlias).append('.').append(column)
-                                .append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
+                        countSql.append(SqlKeyword.AND).append(edgeAlias).append(SqlFragment.DOT).append(column)
+                                .append(SqlFragment.SPACE).append(filter.operator()).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
                         addParam(params, filter.typedValue());
                     }
                 }
             }
-            countSql.append(") ").append(toSqlOperator(countFilter.operator())).append(" ").append(SqlKeyword.PLACEHOLDER);
+            countSql.append(SqlFragment.CLOSE_PAREN).append(SqlFragment.SPACE).append(toSqlOperator(countFilter.operator())).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
             // COUNT(*) always returns BIGINT — use addCountParam for strict dialects (Trino)
             addCountParam(params, countFilter.typedValue());
             return countSql.toString();
         }
 
         // Standard EXISTS clause
-        StringBuilder existsSql = new StringBuilder(SqlKeyword.EXISTS + "(")
+        StringBuilder existsSql = new StringBuilder(SqlKeyword.EXISTS + SqlFragment.OPEN_PAREN)
                 .append(SqlKeyword.SELECT_1)
-                .append(edgeMapping.table()).append(' ').append(edgeAlias)
+                .append(edgeMapping.table()).append(SqlFragment.SPACE).append(edgeAlias)
                 .append(SqlKeyword.WHERE).append(correlation);
         for (HasFilter filter : whereClause.filters()) {
             String column = resolver.mapEdgeFilterProperty(edgeMapping, filter.property());
-            if (SqlKeyword.IS_NULL.trim().equals(filter.operator())) {
-                existsSql.append(SqlKeyword.AND).append(edgeAlias).append('.').append(column).append(SqlKeyword.IS_NULL);
+            if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
+                existsSql.append(SqlKeyword.AND).append(edgeAlias).append(SqlFragment.DOT).append(column).append(SqlKeyword.IS_NULL);
             } else {
-                existsSql.append(SqlKeyword.AND).append(edgeAlias).append('.').append(column)
-                        .append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
+                existsSql.append(SqlKeyword.AND).append(edgeAlias).append(SqlFragment.DOT).append(column)
+                        .append(SqlFragment.SPACE).append(filter.operator()).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
                 addParam(params, filter.typedValue());
             }
         }
-        return existsSql.append(")").toString();
+        return existsSql.append(SqlFragment.CLOSE_PAREN).toString();
     }
 
     private String buildNeighborHasPredicateSql(WhereClause whereClause, VertexMapping vertexMapping,
@@ -279,25 +281,25 @@ public class WhereClauseBuilder {
 
         String idRef = vertexAlias == null
                 ? vertexMapping.idColumn()
-                : vertexAlias + "." + vertexMapping.idColumn();
-        StringBuilder existsSql = new StringBuilder(SqlKeyword.EXISTS + "(")
+                : vertexAlias + SqlFragment.DOT + vertexMapping.idColumn();
+        StringBuilder existsSql = new StringBuilder(SqlKeyword.EXISTS + SqlFragment.OPEN_PAREN)
                 .append(SqlKeyword.SELECT_1)
-                .append(edgeMapping.table()).append(" _we")
-                .append(SqlKeyword.JOIN).append(neighborVertexMapping.table()).append(" _wv")
-                .append(SqlKeyword.ON).append("_wv.").append(neighborVertexMapping.idColumn()).append(" = _we.").append(targetCol)
-                .append(SqlKeyword.WHERE).append("_we.").append(anchorCol).append(" = ").append(idRef);
+                .append(edgeMapping.table()).append(SqlFragment.SPACE).append(SqlFragment.ALIAS_WE)
+                .append(SqlKeyword.JOIN).append(neighborVertexMapping.table()).append(SqlFragment.SPACE).append(SqlFragment.ALIAS_WV)
+                .append(SqlKeyword.ON).append(SqlFragment.ALIAS_WV).append(SqlFragment.DOT).append(neighborVertexMapping.idColumn()).append(SqlFragment.SPACE_EQ_SPACE).append(SqlFragment.ALIAS_WE).append(SqlFragment.DOT).append(targetCol)
+                .append(SqlKeyword.WHERE).append(SqlFragment.ALIAS_WE).append(SqlFragment.DOT).append(anchorCol).append(SqlFragment.SPACE_EQ_SPACE).append(idRef);
 
         for (HasFilter filter : whereClause.filters()) {
             String column = resolver.mapVertexProperty(neighborVertexMapping, filter.property());
-            if (SqlKeyword.IS_NULL.trim().equals(filter.operator())) {
-                existsSql.append(SqlKeyword.AND).append("_wv.").append(column).append(SqlKeyword.IS_NULL);
+            if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
+                existsSql.append(SqlKeyword.AND).append(SqlFragment.ALIAS_WV).append(SqlFragment.DOT).append(column).append(SqlKeyword.IS_NULL);
             } else {
-                existsSql.append(SqlKeyword.AND).append("_wv.").append(column)
-                        .append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
+                existsSql.append(SqlKeyword.AND).append(SqlFragment.ALIAS_WV).append(SqlFragment.DOT).append(column)
+                        .append(SqlFragment.SPACE).append(filter.operator()).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
                 addParam(params, filter.typedValue());
             }
         }
-        existsSql.append(")");
+        existsSql.append(SqlFragment.CLOSE_PAREN);
         return existsSql.toString();
     }
 
@@ -314,10 +316,10 @@ public class WhereClauseBuilder {
         if (hopIndex == null)
             throw new IllegalArgumentException(
                     "where(eq('alias')): alias '" + targetAlias + "' not defined via .as() in the traversal");
-        String targetVertexAlias = "v" + hopIndex;
+        String targetVertexAlias = SqlFragment.V_PREFIX + hopIndex;
         sql.append(hasExistingWhere ? SqlKeyword.AND : SqlKeyword.WHERE)
-                .append(currentAlias).append('.').append(idCol)
-                .append(" = ").append(targetVertexAlias).append('.').append(idCol);
+                .append(currentAlias).append(SqlFragment.DOT).append(idCol)
+                .append(SqlFragment.SPACE_EQ_SPACE).append(targetVertexAlias).append(SqlFragment.DOT).append(idCol);
     }
 
     public void appendNeqAliasPredicate(StringBuilder sql, WhereClause whereClause,
@@ -326,17 +328,17 @@ public class WhereClauseBuilder {
                                          String idCol, boolean hasExistingWhere) {
         int leftHop  = resolver.resolveAliasHopIndex(whereClause.left(), asAliases, "left");
         int rightHop = resolver.resolveAliasHopIndex(whereClause.right(), asAliases, "right");
-        String leftAlias  = "v" + leftHop;
-        String rightAlias = "v" + rightHop;
+        String leftAlias  = SqlFragment.V_PREFIX + leftHop;
+        String rightAlias = SqlFragment.V_PREFIX + rightHop;
         String predicate;
         if (whereByProperty == null || whereByProperty.isBlank()) {
-            predicate = leftAlias + "." + idCol + SqlKeyword.NEQ + rightAlias + "." + idCol;
+            predicate = leftAlias + SqlFragment.DOT + idCol + SqlKeyword.NEQ + rightAlias + SqlFragment.DOT + idCol;
         } else {
             VertexMapping leftMapping  = resolver.resolveVertexMappingAtHop(hops, startVertexMapping, leftHop);
             VertexMapping rightMapping = resolver.resolveVertexMappingAtHop(hops, startVertexMapping, rightHop);
             String leftCol  = resolver.mapVertexProperty(leftMapping, whereByProperty);
             String rightCol = resolver.mapVertexProperty(rightMapping, whereByProperty);
-            predicate = leftAlias + "." + leftCol + SqlKeyword.NEQ + rightAlias + "." + rightCol;
+            predicate = leftAlias + SqlFragment.DOT + leftCol + SqlKeyword.NEQ + rightAlias + SqlFragment.DOT + rightCol;
         }
         sql.append(hasExistingWhere ? SqlKeyword.AND : SqlKeyword.WHERE).append(predicate);
     }
@@ -373,13 +375,13 @@ public class WhereClauseBuilder {
                 || GremlinToken.IN_E.equals(edgeCarryingHop.direction())
                 || GremlinToken.BOTH_E.equals(edgeCarryingHop.direction()))) {
             terminalEdgeMapping = resolver.resolveEdgeMapping(edgeCarryingHop.singleLabel());
-            terminalEdgeAlias = "e" + edgeCarryingHopIndex;
+            terminalEdgeAlias = SqlFragment.E_PREFIX + edgeCarryingHopIndex;
         }
         // Also try edge mapping for the last normalized hop (handles outE().has().inV() normalized to out())
         if (terminalEdgeMapping == null && lastHop != null && !lastHop.labels().isEmpty()) {
             try {
                 terminalEdgeMapping = resolver.resolveEdgeMapping(lastHop.singleLabel());
-                terminalEdgeAlias = "e" + parsed.hops().size();
+                terminalEdgeAlias = SqlFragment.E_PREFIX + parsed.hops().size();
             } catch (IllegalArgumentException ignored) {
                 terminalEdgeMapping = null;
                 terminalEdgeAlias = null;
@@ -387,7 +389,7 @@ public class WhereClauseBuilder {
         }
 
         for (HasFilter filter : filters) {
-            String alias = "v0";
+            String alias = SqlFragment.V0;
             String mappedColumn;
             if (GremlinToken.PROP_ID.equals(filter.property())) {
                 mappedColumn = startVertexMapping.idColumn();
@@ -405,11 +407,11 @@ public class WhereClauseBuilder {
                     }
                 }
             }
-            sql.append(where ? SqlKeyword.AND : SqlKeyword.WHERE).append(alias).append('.').append(mappedColumn);
-            if (SqlKeyword.IS_NULL.trim().equals(filter.operator())) {
+            sql.append(where ? SqlKeyword.AND : SqlKeyword.WHERE).append(alias).append(SqlFragment.DOT).append(mappedColumn);
+            if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
                 sql.append(SqlKeyword.IS_NULL);
             } else {
-                sql.append(" ").append(filter.operator()).append(" ").append(SqlKeyword.PLACEHOLDER);
+                sql.append(SqlFragment.SPACE).append(filter.operator()).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
                 addParam(params, filter.typedValue());
             }
             where = true;
@@ -421,12 +423,12 @@ public class WhereClauseBuilder {
 
     private String toSqlOperator(String predicate) {
         return switch (predicate) {
-            case "gt"  -> ">";
-            case "gte" -> ">=";
-            case "lt"  -> "<";
-            case "lte" -> "<=";
-            case "eq"  -> "=";
-            case "neq" -> "!=";
+            case GremlinToken.PRED_GT  -> SqlOperator.GT;
+            case GremlinToken.PRED_GTE -> SqlOperator.GTE;
+            case GremlinToken.PRED_LT  -> SqlOperator.LT;
+            case GremlinToken.PRED_LTE -> SqlOperator.LTE;
+            case GremlinToken.PRED_EQ  -> SqlOperator.EQ;
+            case GremlinToken.PRED_NEQ -> SqlOperator.NEQ;
             default -> throw new IllegalArgumentException("Unsupported predicate operator: " + predicate);
         };
     }

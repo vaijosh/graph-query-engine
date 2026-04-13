@@ -13,6 +13,9 @@ import com.graphqueryengine.query.translate.sql.model.SelectField;
 import com.graphqueryengine.query.translate.sql.model.WhereClause;
 import com.graphqueryengine.query.translate.sql.model.WhereKind;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
+import com.graphqueryengine.query.translate.sql.constant.GremlinStepName;
+import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
+import com.graphqueryengine.query.translate.sql.constant.SqlOperator;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -112,66 +115,66 @@ public class GremlinStepParser {
             String stepName = stepNode.name();
             List<String> args = stepNode.args();
             String rawStepArgs = stepNode.rawArgs() == null ? "" : stepNode.rawArgs().trim();
-            if (whereByPending && !"by".equals(stepName)) whereByPending = false;
+            if (whereByPending && !GremlinStepName.BY.equals(stepName)) whereByPending = false;
 
             switch (stepName) {
-                case "hasLabel" -> { ensureArgCount(stepName, args, 1); label = unquote(args.get(0)); }
-                case "has" -> {
+                case GremlinStepName.HAS_LABEL -> { ensureArgCount(stepName, args, 1); label = unquote(args.get(0)); }
+                case GremlinStepName.HAS -> {
                     ensureArgCount(stepName, args, 2);
                     filters.add(parseHasArgument(unquote(args.get(0)), args.get(1).trim()));
                 }
-                case "hasId" -> {
+                case GremlinStepName.HAS_ID -> {
                     ensureArgCount(stepName, args, 1);
                     filters.add(new HasFilter("id", unquote(args.get(0))));
                 }
-                case "hasNot" -> {
+                case GremlinStepName.HAS_NOT -> {
                     ensureArgCount(stepName, args, 1);
-                    filters.add(new HasFilter(unquote(args.get(0)), null, "IS NULL"));
+                    filters.add(new HasFilter(unquote(args.get(0)), null, SqlKeyword.IS_NULL_OP));
                 }
-                case "values" -> { ensureArgCount(stepName, args, 1); valuesProperty = unquote(args.get(0)); }
-                case "is" -> {
+                case GremlinStepName.VALUES -> { ensureArgCount(stepName, args, 1); valuesProperty = unquote(args.get(0)); }
+                case GremlinStepName.IS -> {
                     ensureArgCount(stepName, args, 1);
                     if (valuesProperty == null || valuesProperty.isBlank())
                         throw new IllegalArgumentException("is(...) is only supported after values('property')");
                     filters.add(parseHasArgument(valuesProperty, args.get(0).trim()));
                 }
-                case "valueMap" -> {
+                case GremlinStepName.VALUE_MAP -> {
                     valueMapRequested = true;
                     if (!args.isEmpty()) {
                         valueMapKeys = args.stream().map(this::unquote).toList();
                     }
                 }
-                case "out" -> {
+                case GremlinStepName.OUT -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("out expects at least 1 argument");
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.OUT, args.stream().map(this::unquote).toList()));
                 }
-                case "in" -> {
+                case GremlinStepName.IN -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("in expects at least 1 argument");
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.IN, args.stream().map(this::unquote).toList()));
                 }
-                case "both" -> {
+                case GremlinStepName.BOTH -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("both expects at least 1 argument");
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.BOTH, args.stream().map(this::unquote).toList()));
                 }
-                case "outV" -> {
+                case GremlinStepName.OUT_V -> {
                     ensureArgCount(stepName, args, 0);
                     hopsSeen = true;
                     if (normalizeEndpointHop(GremlinToken.OUT_V, hops)) hops.add(new HopStep(GremlinToken.OUT_V, List.of()));
                 }
-                case "inV" -> {
+                case GremlinStepName.IN_V -> {
                     ensureArgCount(stepName, args, 0);
                     hopsSeen = true;
                     if (normalizeEndpointHop(GremlinToken.IN_V, hops)) hops.add(new HopStep(GremlinToken.IN_V, List.of()));
                 }
-                case "bothV" -> {
+                case GremlinStepName.BOTH_V -> {
                     ensureArgCount(stepName, args, 0);
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.BOTH_V, List.of()));
                 }
-                case "otherV" -> {
+                case GremlinStepName.OTHER_V -> {
                     ensureArgCount(stepName, args, 0);
                     hopsSeen = true;
                     if (hops.isEmpty()) throw new IllegalArgumentException("otherV() must follow outE() or inE()");
@@ -184,13 +187,13 @@ public class GremlinStepParser {
                         throw new IllegalArgumentException("otherV() must follow outE() or inE()");
                     }
                 }
-                case "repeat" -> {
+                case GremlinStepName.REPEAT -> {
                     if (rawStepArgs.isBlank()) throw new IllegalArgumentException("repeat() requires an argument");
                     hopsSeen = true;
                     pendingRepeatHop = parseRepeatHop(rawStepArgs);
                 }
-                case "simplePath" -> { ensureArgCount(stepName, args, 0); simplePathRequested = true; }
-                case "times" -> {
+                case GremlinStepName.SIMPLE_PATH -> { ensureArgCount(stepName, args, 0); simplePathRequested = true; }
+                case GremlinStepName.TIMES -> {
                     if (pendingRepeatHop == null)
                         throw new IllegalArgumentException("times() must follow repeat(out(...)), repeat(in(...)), or repeat(both(...))");
                     ensureArgCount(stepName, args, 1);
@@ -207,7 +210,7 @@ public class GremlinStepParser {
                     }
                     pendingRepeatHop = null;
                 }
-                case "limit" -> {
+                case GremlinStepName.LIMIT -> {
                     if (args.isEmpty() || args.size() > 2)
                         throw new IllegalArgumentException("limit expects 1 or 2 argument(s)");
                     String limitArg = args.get(args.size() - 1).trim();
@@ -216,15 +219,15 @@ public class GremlinStepParser {
                     catch (NumberFormatException ex) { throw new IllegalArgumentException("limit() must be numeric"); }
                     if (!hopsSeen) preHopLimit = parsedLimit; else limit = parsedLimit;
                 }
-                case "count" -> { ensureArgCount(stepName, args, 0); countRequested = true; }
-                case "sum"   -> { ensureArgCount(stepName, args, 0); sumRequested = true; }
-                case "mean"  -> { ensureArgCount(stepName, args, 0); meanRequested = true; }
-                case "groupCount" -> {
+                case GremlinStepName.COUNT -> { ensureArgCount(stepName, args, 0); countRequested = true; }
+                case GremlinStepName.SUM   -> { ensureArgCount(stepName, args, 0); sumRequested = true; }
+                case GremlinStepName.MEAN  -> { ensureArgCount(stepName, args, 0); meanRequested = true; }
+                case GremlinStepName.GROUP_COUNT -> {
                     ensureArgCount(stepName, args, 0);
                     if (groupCountSeen) throw new IllegalArgumentException("Only a single groupCount() step is supported");
                     groupCountSeen = true;
                 }
-                case "project" -> {
+                case GremlinStepName.PROJECT -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("project expects at least 1 argument");
                     if (!projectAliases.isEmpty()) throw new IllegalArgumentException("Only a single project(...) step is supported");
                     for (String arg : args) {
@@ -233,42 +236,42 @@ public class GremlinStepParser {
                         projectAliases.add(a);
                     }
                 }
-                case "outE" -> {
+                case GremlinStepName.OUT_E -> {
                     if (args.size() > 1) throw new IllegalArgumentException("outE expects 0 or 1 argument(s)");
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.OUT_E, args.isEmpty() ? List.of() : List.of(unquote(args.get(0)))));
                 }
-                case "inE" -> {
+                case GremlinStepName.IN_E -> {
                     if (args.size() > 1) throw new IllegalArgumentException("inE expects 0 or 1 argument(s)");
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.IN_E, args.isEmpty() ? List.of() : List.of(unquote(args.get(0)))));
                 }
-                case "bothE" -> {
+                case GremlinStepName.BOTH_E -> {
                     if (args.size() > 1) throw new IllegalArgumentException("bothE expects 0 or 1 argument(s)");
                     hopsSeen = true;
                     hops.add(new HopStep(GremlinToken.BOTH_E, args.isEmpty() ? List.of() : List.of(unquote(args.get(0)))));
                 }
-                case "as" -> {
+                case GremlinStepName.AS -> {
                     ensureArgCount(stepName, args, 1);
                     String aliasName = unquote(args.get(0));
                     if (aliasName.isBlank()) throw new IllegalArgumentException("as() label must be non-empty");
                     asAliases.add(new AsAlias(aliasName, hops.size()));
                 }
-                case "select" -> {
+                case GremlinStepName.SELECT -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("select expects at least 1 argument");
                     if (selectSeen) throw new IllegalArgumentException("Only a single select(...) step is supported");
                     selectSeen = true;
                     for (String arg : args) selectAliases.add(unquote(arg));
                 }
-                case "where" -> {
+                case GremlinStepName.WHERE -> {
                     if (whereClause != null) throw new IllegalArgumentException("Only a single where() step is supported");
                     whereClause = parseWhere(rawStepArgs);
                     whereByPending = whereClause.kind() == WhereKind.NEQ_ALIAS;
                 }
-                case "dedup"    -> { ensureArgCount(stepName, args, 0); dedupRequested = true; }
-                case "identity" -> ensureArgCount(stepName, args, 0);
-                case "path"     -> { ensureArgCount(stepName, args, 0); pathSeen = true; }
-                case "by" -> {
+                case GremlinStepName.DEDUP    -> { ensureArgCount(stepName, args, 0); dedupRequested = true; }
+                case GremlinStepName.IDENTITY -> ensureArgCount(stepName, args, 0);
+                case GremlinStepName.PATH     -> { ensureArgCount(stepName, args, 0); pathSeen = true; }
+                case GremlinStepName.BY -> {
                     if (args.isEmpty()) throw new IllegalArgumentException("by(...) expects at least 1 argument");
                     if (whereByPending) {
                         ensureArgCount(stepName, args, 1);
@@ -280,22 +283,22 @@ public class GremlinStepParser {
                         selectByExpressions.add(rawStepArgs);
                     } else if (orderSeen && orderByProperty == null && !orderByCountDesc) {
                         List<String> byArgsTrimmed = args.stream().map(String::trim).toList();
-                        if (byArgsTrimmed.size() == 2 && ("values".equals(byArgsTrimmed.get(0)) || "__.values()".equals(byArgsTrimmed.get(0)))) {
+                        if (byArgsTrimmed.size() == 2 && (GremlinToken.VALUES_TOKEN.equals(byArgsTrimmed.get(0)) || GremlinToken.VALUES_ANON_TOKEN.equals(byArgsTrimmed.get(0)))) {
                             String dirToken = byArgsTrimmed.get(1).toLowerCase();
                             orderByCountDesc = true;
-                            orderDirection = (GremlinToken.ORDER_DESC.equals(dirToken) || GremlinToken.ORDER_DESC_FULL.equals(dirToken)) ? "DESC" : "ASC";
+                            orderDirection = (GremlinToken.ORDER_DESC.equals(dirToken) || GremlinToken.ORDER_DESC_FULL.equals(dirToken)) ? SqlKeyword.DESC : SqlKeyword.ASC;
                         } else if (byArgsTrimmed.size() == 2 && !byArgsTrimmed.get(0).contains("(")) {
                             orderByProperty = unquote(byArgsTrimmed.get(0));
                             String dirToken = byArgsTrimmed.get(1).toLowerCase();
-                            orderDirection = (dirToken.contains(GremlinToken.ORDER_DESC) || GremlinToken.ORDER_DESC_FULL.equals(dirToken)) ? "DESC" : "ASC";
-                        } else if (rawStepArgs.contains("select(") && rawStepArgs.contains("Order.")) {
-                            int selectStart = rawStepArgs.indexOf("select(") + 7;
+                            orderDirection = (dirToken.contains(GremlinToken.ORDER_DESC) || GremlinToken.ORDER_DESC_FULL.equals(dirToken)) ? SqlKeyword.DESC : SqlKeyword.ASC;
+                        } else if (rawStepArgs.contains(GremlinToken.SELECT_OPEN) && rawStepArgs.contains(GremlinToken.ORDER_DOT)) {
+                            int selectStart = rawStepArgs.indexOf(GremlinToken.SELECT_OPEN) + GremlinToken.SELECT_OPEN.length();
                             int selectEnd = rawStepArgs.indexOf(")", selectStart);
                             orderByProperty = unquote(rawStepArgs.substring(selectStart, selectEnd));
-                            orderDirection = rawStepArgs.contains("Order.desc") ? "DESC" : "ASC";
+                            orderDirection = rawStepArgs.contains(GremlinToken.ORDER_BY_DESC_TOKEN) ? SqlKeyword.DESC : SqlKeyword.ASC;
                         } else {
                             orderByProperty = unquote(rawStepArgs);
-                            orderDirection = "ASC";
+                            orderDirection = SqlKeyword.ASC;
                         }
                     } else if (groupCountSeen && groupCountProperty == null && groupCountKeySpec == null) {
                         GroupCountKeySpec parsedKey = tryParseGroupCountSelectKey(rawStepArgs);
@@ -318,7 +321,7 @@ public class GremlinStepParser {
                         throw new IllegalArgumentException("by(...) is only supported after project(...), groupCount(...), or order(...)");
                     }
                 }
-                case "order" -> {
+                case GremlinStepName.ORDER -> {
                     if (args.size() > 1) throw new IllegalArgumentException("order expects 0 or 1 argument(s)");
                     if (orderSeen) throw new IllegalArgumentException("Only a single order() step is supported");
                     orderSeen = true;
@@ -425,7 +428,7 @@ public class GremlinStepParser {
 
         Matcher neighborMatcher = WHERE_OUT_NEIGHBOR_HAS_PATTERN.matcher(expression);
         if (neighborMatcher.matches()) {
-            WhereKind kind = "out".equals(neighborMatcher.group(1)) ? WhereKind.OUT_NEIGHBOR_HAS : WhereKind.IN_NEIGHBOR_HAS;
+            WhereKind kind = GremlinToken.OUT.equals(neighborMatcher.group(1)) ? WhereKind.OUT_NEIGHBOR_HAS : WhereKind.IN_NEIGHBOR_HAS;
             return new WhereClause(kind, neighborMatcher.group(1), neighborMatcher.group(2),
                     parseHasChain(neighborMatcher.group(3)));
         }
@@ -453,7 +456,7 @@ public class GremlinStepParser {
 
         Matcher degreeMatcher = EDGE_DEGREE_PATTERN.matcher(expression);
         if (degreeMatcher.matches()) {
-            String direction = degreeMatcher.group(1).equals("outE") ? "out" : "in";
+            String direction = degreeMatcher.group(1).equals(GremlinToken.OUT_E) ? GremlinToken.OUT : GremlinToken.IN;
             String edgeLabel = degreeMatcher.group(2);
             List<HasFilter> degreeFilters = parseHasChain(degreeMatcher.group(3));
             StringBuilder encoded = new StringBuilder(direction + ":" + edgeLabel);
@@ -468,7 +471,7 @@ public class GremlinStepParser {
             List<HasFilter> vcFilters = parseHasChain(vertexCountMatcher.group(3));
             StringBuilder encoded = new StringBuilder(direction + ":" + edgeLabel);
             for (HasFilter f : vcFilters) encoded.append(":").append(f.property()).append("=").append(f.value());
-            ProjectionKind kind = "out".equals(direction) ? ProjectionKind.OUT_VERTEX_COUNT : ProjectionKind.IN_VERTEX_COUNT;
+            ProjectionKind kind = GremlinToken.OUT.equals(direction) ? ProjectionKind.OUT_VERTEX_COUNT : ProjectionKind.IN_VERTEX_COUNT;
             return new ProjectionField(alias, kind, encoded.toString());
         }
 
@@ -477,7 +480,7 @@ public class GremlinStepParser {
             String direction = neighborValuesMatcher.group(1);
             String edgeLabel = splitArgs(neighborValuesMatcher.group(2)).stream().map(this::unquote).toList().get(0);
             String prop = neighborValuesMatcher.group(3);
-            ProjectionKind kind = "out".equals(direction) ? ProjectionKind.OUT_NEIGHBOR_PROPERTY : ProjectionKind.IN_NEIGHBOR_PROPERTY;
+            ProjectionKind kind = GremlinToken.OUT.equals(direction) ? ProjectionKind.OUT_NEIGHBOR_PROPERTY : ProjectionKind.IN_NEIGHBOR_PROPERTY;
             return new ProjectionField(alias, kind, direction + ":" + edgeLabel + ":" + prop);
         }
 
@@ -490,7 +493,7 @@ public class GremlinStepParser {
             String property = unquote(endpointMatcher.group(2));
             if (property.isBlank())
                 throw new IllegalArgumentException("by(outV().values(...)) and by(inV().values(...)) require a property name");
-            ProjectionKind kind = "outV".equals(endpoint) ? ProjectionKind.OUT_VERTEX_PROPERTY : ProjectionKind.IN_VERTEX_PROPERTY;
+            ProjectionKind kind = GremlinToken.OUT_V.equals(endpoint) ? ProjectionKind.OUT_VERTEX_PROPERTY : ProjectionKind.IN_VERTEX_PROPERTY;
             return new ProjectionField(alias, kind, property);
         }
 
@@ -521,14 +524,7 @@ public class GremlinStepParser {
         if (m.matches()) {
             String predicate = m.group(1);
             String innerVal = unquote(m.group(2).trim());
-            String operator = switch (predicate) {
-                case "gt"  -> ">";
-                case "gte" -> ">=";
-                case "lt"  -> "<";
-                case "lte" -> "<=";
-                case "neq" -> "!=";
-                default    -> "=";
-            };
+            String operator = SqlOperator.fromPredicate(predicate);
             return new HasFilter(property, innerVal, operator);
         }
         return new HasFilter(property, unquote(trimmed));
@@ -538,8 +534,8 @@ public class GremlinStepParser {
 
     public RepeatHopResult parseRepeatHop(String repeatBodyRaw) {
         String text = repeatBodyRaw == null ? "" : repeatBodyRaw.trim();
-        boolean hasSimplePath = text.endsWith(".simplePath()");
-        if (hasSimplePath) text = text.substring(0, text.length() - ".simplePath()".length()).trim();
+        boolean hasSimplePath = text.endsWith(GremlinStepName.SIMPLE_PATH_SUFFIX);
+        if (hasSimplePath) text = text.substring(0, text.length() - GremlinStepName.SIMPLE_PATH_SUFFIX.length()).trim();
         if (!text.endsWith(")"))
             throw new IllegalArgumentException("Only repeat(out(...)), repeat(in(...)), or repeat(both(...)) is supported");
 
@@ -598,9 +594,13 @@ public class GremlinStepParser {
         hops.remove(hops.size() - 1);
         String normalized;
         if (GremlinToken.OUT_E.equals(previous.direction())) {
+            // outE().inV()  = follow outgoing edge to its destination = out() hop
+            // outE().outV() = unusual (go back to source via out-edge)       = in() hop
             normalized = GremlinToken.IN_V.equals(endpointStep) ? GremlinToken.OUT : GremlinToken.IN;
         } else {
-            normalized = GremlinToken.IN_V.equals(endpointStep) ? GremlinToken.IN : GremlinToken.OUT;
+            // inE().outV()  = follow incoming edge back to its source = in() hop
+            // inE().inV()   = unusual (arrive back at current vertex)   = out() hop
+            normalized = GremlinToken.OUT_V.equals(endpointStep) ? GremlinToken.IN : GremlinToken.OUT;
         }
         hops.add(new HopStep(normalized, previous.labels()));
         return false;

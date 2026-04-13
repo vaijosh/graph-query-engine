@@ -14,14 +14,29 @@ import com.graphqueryengine.query.factory.DefaultGraphQueryTranslatorFactory;
 import com.graphqueryengine.query.parser.AntlrGremlinTraversalParser;
 import com.graphqueryengine.query.parser.GremlinTraversalParser;
 import com.graphqueryengine.query.parser.model.GremlinParseResult;
+import com.graphqueryengine.gremlin.provider.ProviderConstants;
 import com.graphqueryengine.query.translate.sql.constant.GremlinToken;
+import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
 import com.graphqueryengine.query.translate.sql.model.HopStep;
 import com.graphqueryengine.query.translate.sql.model.ParsedTraversal;
+import com.graphqueryengine.query.translate.sql.model.ProjectionField;
+import com.graphqueryengine.query.translate.sql.model.ProjectionKind;
 import com.graphqueryengine.query.translate.sql.parse.GremlinStepParser;
 
 import javax.script.ScriptException;
-import java.sql.*;
-import java.util.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongPredicate;
 import java.util.logging.Logger;
@@ -93,7 +108,7 @@ public class WcojGraphProvider implements GraphProvider {
     }
 
     @Override
-    public String providerId() { return "wcoj"; }
+    public String providerId() { return ProviderConstants.PROVIDER_WCOJ; }
 
     // ── Main entry point ─────────────────────────────────────────────────────
 
@@ -133,7 +148,8 @@ public class WcojGraphProvider implements GraphProvider {
             throws ScriptException {
         GremlinExecutionResult r = execute(gremlin);
         return new GremlinTransactionalExecutionResult(
-                r.gremlin(), r.results(), r.resultCount(), "read-only", "committed");
+                r.gremlin(), r.results(), r.resultCount(),
+                ProviderConstants.TX_MODE_READ_ONLY, ProviderConstants.TX_STATUS_COMMITTED);
     }
 
     // ── WCOJ execution path ──────────────────────────────────────────────────
@@ -213,12 +229,61 @@ public class WcojGraphProvider implements GraphProvider {
                                                    Connection conn) throws SQLException {
         List<String> byProps = parsed.pathByProperties();
 
-        if (!parsed.pathSeen() || byProps.isEmpty()) {
-            // Return raw IDs if no .path().by() specified
-            List<Object> results = new ArrayList<>();
-            for (long[] path : paths) {
-                results.add(path[hopCount]);  // terminal vertex ID
+        // ── Simple-property projections ────────────────────────────────────────
+        // project('p1','p2',...).by('p1').by('p2') with all EDGE_PROPERTY kinds:
+        // resolve terminal vertex properties and return scalar (single column) or
+        // Map (multiple columns) — same semantics as the SQL provider.
+        if (!parsed.projections().isEmpty() && isSimplePropertyProjection(parsed.projections())) {
+            String terminalLabel = resolveTerminalLabel(parsed, config, parsed.label(), hopCount);
+            Set<Long> terminalIds = new LinkedHashSet<>();
+            for (long[] path : paths) terminalIds.add(path[hopCount]);
+
+            List<ProjectionField> projFields = parsed.projections();
+            boolean single = projFields.size() == 1;
+
+            if (single) {
+                // Single projection → return scalar values (mirrors SQL provider scalar path)
+                String prop = projFields.get(0).property();
+                Map<Long, Object> propMap = fetchProperty(conn, config, terminalLabel, prop, terminalIds);
+                List<Object> results = new ArrayList<>();
+                for (long[] path : paths) results.add(propMap.getOrDefault(path[hopCount], path[hopCount]));
+                return new GremlinExecutionResult(gremlin, results, results.size());
+            } else {
+                // Multiple projections → return Map per row (List-wrapped values like SQL provider)
+                Map<String, Map<Long, Object>> propMaps = new LinkedHashMap<>();
+                for (ProjectionField pf : projFields) {
+                    propMaps.put(pf.alias(),
+                            fetchProperty(conn, config, terminalLabel, pf.property(), terminalIds));
+                }
+                List<Object> results = new ArrayList<>();
+                for (long[] path : paths) {
+                    long termId = path[hopCount];
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    for (ProjectionField pf : projFields) {
+                        Object val = propMaps.get(pf.alias()).getOrDefault(termId, termId);
+                        row.put(pf.alias(), List.of(val));
+                    }
+                    results.add(row);
+                }
+                return new GremlinExecutionResult(gremlin, results, results.size());
             }
+        }
+
+        if (!parsed.pathSeen() || byProps.isEmpty()) {
+            // If a values('property') step was requested, resolve the terminal vertex property
+            String valuesProp = parsed.valueProperty();
+            if (valuesProp != null && !valuesProp.isBlank()) {
+                String terminalLabel = resolveTerminalLabel(parsed, config, parsed.label(), hopCount);
+                Set<Long> terminalIds = new LinkedHashSet<>();
+                for (long[] path : paths) terminalIds.add(path[hopCount]);
+                Map<Long, Object> propMap = fetchProperty(conn, config, terminalLabel, valuesProp, terminalIds);
+                List<Object> results = new ArrayList<>();
+                for (long[] path : paths) results.add(propMap.getOrDefault(path[hopCount], path[hopCount]));
+                return new GremlinExecutionResult(gremlin, results, results.size());
+            }
+            // No property requested — return raw terminal vertex IDs
+            List<Object> results = new ArrayList<>();
+            for (long[] path : paths) results.add(path[hopCount]);
             return new GremlinExecutionResult(gremlin, results, results.size());
         }
 
@@ -236,10 +301,19 @@ public class WcojGraphProvider implements GraphProvider {
             }
         }
 
-        // Batch-fetch properties for each hop position
+        // Batch-fetch properties for each hop position.
+        // TinkerPop semantics: if a single by() modulator is given it applies to all positions.
         Map<Integer, Map<Long, Object>> propByPos = new HashMap<>();
         for (int pos = 0; pos <= hopCount; pos++) {
-            String propName = pos < byProps.size() ? byProps.get(pos) : null;
+            String propName;
+            if (byProps.isEmpty()) {
+                propName = null;
+            } else if (byProps.size() == 1) {
+                // single by() modulator — apply to all positions (TinkerPop cycling semantics)
+                propName = byProps.get(0);
+            } else {
+                propName = pos < byProps.size() ? byProps.get(pos) : null;
+            }
             if (propName == null) continue;
             String label = pos < vertexLabels.size() ? vertexLabels.get(pos) : startLabel;
             propByPos.put(pos, fetchProperty(conn, config, label, propName,
@@ -273,8 +347,8 @@ public class WcojGraphProvider implements GraphProvider {
         if (col == null) return Collections.emptyMap();
 
         String placeholders = String.join(",", Collections.nCopies(ids.size(), "?"));
-        String sql = "SELECT " + vm.idColumn() + ", " + col
-                + " FROM " + vm.table() + " WHERE " + vm.idColumn()
+        String sql = SqlKeyword.SELECT + vm.idColumn() + ", " + col
+                + SqlKeyword.FROM + vm.table() + SqlKeyword.WHERE + vm.idColumn()
                 + " IN (" + placeholders + ")";
 
         Map<Long, Object> result = new HashMap<>();
@@ -292,25 +366,50 @@ public class WcojGraphProvider implements GraphProvider {
 
     /**
      * Returns {@code true} when the WCOJ engine can accelerate this traversal.
-     * Multi-label hops (BELONGS_TO, LOCATED_IN in same step) are supported via union.
+     *
+     * <p>In addition to pure path/count/values queries, WCOJ can now also handle
+     * <em>simple-property projections</em> — {@code project('p').by('p')} patterns
+     * where every {@code by()} modulator is a plain {@link ProjectionKind#EDGE_PROPERTY}
+     * reference with no sub-traversal (degree counts, choose(), etc.).
+     * Such projections are resolved with a single batched SQL property-fetch after the
+     * leapfrog join, just like {@code values('p')}.
      */
     private static boolean isWcojEligible(ParsedTraversal parsed) {
         if (parsed.hops().isEmpty()) return false;
-        // Only handle path/count/values queries; defer projections and aggregations to SQL
+        // Only handle path/count/values queries; defer aggregations to SQL
         if (parsed.sumRequested() || parsed.meanRequested()) return false;
         if (parsed.groupCountProperty() != null || parsed.groupCountKeySpec() != null) return false;
-        if (!parsed.projections().isEmpty()) return false;
         if (!parsed.selectFields().isEmpty()) return false;
         if (parsed.orderByProperty() != null) return false;
-        // Edge-step hops (outE/inE) are not yet supported in WCOJ
+        // Allow projections only when every by() is a simple property reference
+        if (!parsed.projections().isEmpty() && !isSimplePropertyProjection(parsed.projections())) {
+            return false;
+        }
+        // Edge-step hops (outE/inE/bothE) and bidirectional (both) are not yet supported in WCOJ
         for (HopStep hop : parsed.hops()) {
             if (GremlinToken.OUT_E.equals(hop.direction())
                     || GremlinToken.IN_E.equals(hop.direction())
-                    || GremlinToken.BOTH_E.equals(hop.direction())) {
+                    || GremlinToken.BOTH_E.equals(hop.direction())
+                    || GremlinToken.BOTH.equals(hop.direction())) {
                 return false;
             }
             // Multi-label hops are fine — handled by union in the join
             if (hop.labels().size() > 1) return false; // TODO: support multi-label
+        }
+        return true;
+    }
+
+    /**
+     * Returns {@code true} if all projection fields are simple vertex/edge property
+     * references (no sub-traversal degree counts, choose(), etc.).
+     * These can be resolved after the WCOJ join with a batched SQL property fetch.
+     */
+    private static boolean isSimplePropertyProjection(List<ProjectionField> projections) {
+        for (ProjectionField pf : projections) {
+            if (pf.kind() != ProjectionKind.EDGE_PROPERTY
+                    && pf.kind() != ProjectionKind.IDENTITY) {
+                return false;
+            }
         }
         return true;
     }
@@ -340,7 +439,7 @@ public class WcojGraphProvider implements GraphProvider {
 
         // Use the translated SQL's WHERE + LIMIT to get seed IDs
         // Re-derive: use the SQL translator output but strip SELECT ... to just get IDs
-        String seedSql = "SELECT " + vm.idColumn() + " FROM (" + seedQuery.sql() + ") _seed";
+        String seedSql = SqlKeyword.SELECT + vm.idColumn() + SqlKeyword.FROM + "(" + seedQuery.sql() + ") _seed";
 
         Set<Long> seedIds = new LinkedHashSet<>();
         try (PreparedStatement ps = conn.prepareStatement(seedSql)) {
@@ -392,6 +491,22 @@ public class WcojGraphProvider implements GraphProvider {
             current = next;
         }
         return labels;
+    }
+
+    /** Resolves the vertex label at the terminal (last) hop position. */
+    private static String resolveTerminalLabel(ParsedTraversal parsed, MappingConfig config,
+                                               String startLabel, int hopCount) {
+        String current = startLabel;
+        for (int i = 0; i < hopCount; i++) {
+            HopStep hop = parsed.hops().get(i);
+            if (hop.labels().isEmpty()) continue;
+            var em = config.edges().get(hop.singleLabel());
+            if (em == null) continue;
+            boolean out = GremlinToken.OUT.equals(hop.direction());
+            String next = out ? em.inVertexLabel() : em.outVertexLabel();
+            if (next != null) current = next;
+        }
+        return current;
     }
 
     // ── SQL fallback ─────────────────────────────────────────────────────────

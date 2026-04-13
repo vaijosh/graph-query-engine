@@ -1,12 +1,23 @@
 package com.graphqueryengine.engine.wcoj;
 
-import java.io.*;
-import java.nio.*;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.*;
-import java.sql.*;
-import java.util.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.logging.Logger;
+import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
 
 /**
  * Disk-backed adjacency index stored as a pair of memory-mapped CSR files.
@@ -106,7 +117,7 @@ public class DiskBackedAdjacencyIndex implements NeighbourLookup {
         long edgeCount = 0;
 
         try (PreparedStatement ps = conn.prepareStatement(
-                     "SELECT " + outColumn + ", " + inColumn + " FROM " + table);
+                     SqlKeyword.SELECT + outColumn + ", " + inColumn + SqlKeyword.FROM + table);
              ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
                 long from = rs.getLong(1), to = rs.getLong(2);

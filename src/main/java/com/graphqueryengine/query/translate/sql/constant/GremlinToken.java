@@ -44,5 +44,27 @@ public final class GremlinToken {
     // ── Projection / identity ─────────────────────────────────────────────────
     public static final String IDENTITY          = "identity()";
     public static final String IDENTITY_PREFIXED = "__.identity()";
-}
 
+    // ── Predicate operator names (as used in Gremlin expressions) ─────────────
+    public static final String PRED_GT  = "gt";
+    public static final String PRED_GTE = "gte";
+    public static final String PRED_LT  = "lt";
+    public static final String PRED_LTE = "lte";
+    public static final String PRED_NEQ = "neq";
+    public static final String PRED_EQ  = "eq";
+
+    // ── By-modulator sub-step tokens ──────────────────────────────────────────
+    /** The {@code values} token used as a by-modulator argument prefix (e.g. {@code by(values, desc)}). */
+    public static final String VALUES_TOKEN         = "values";
+    public static final String VALUES_ANON_TOKEN    = "__.values()";
+    /** The {@code Order.desc} token variant recognised in by() arguments. */
+    public static final String ORDER_BY_DESC_TOKEN  = "Order.desc";
+
+    // ── select() context tokens ───────────────────────────────────────────────
+    public static final String SELECT_OPEN  = "select(";
+    public static final String ORDER_DOT    = "Order.";
+
+    // ── Boolean literal tokens ────────────────────────────────────────────────
+    public static final String BOOL_TRUE  = "true";
+    public static final String BOOL_FALSE = "false";
+}

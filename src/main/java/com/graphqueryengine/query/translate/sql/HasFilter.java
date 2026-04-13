@@ -1,5 +1,7 @@
 package com.graphqueryengine.query.translate.sql;
 
+import com.graphqueryengine.query.translate.sql.constant.SqlOperator;
+
 /**
  * A single {@code has(property, value)} or {@code has(property, predicate(value))} filter.
  *
@@ -23,7 +25,7 @@ public record HasFilter(String property, String value, String operator) {
 
     /** Convenience constructor for equality filters (the common case). */
     public HasFilter(String property, String value) {
-        this(property, value, "=");
+        this(property, value, SqlOperator.EQ);
     }
 
     /**
@@ -42,8 +44,8 @@ public record HasFilter(String property, String value, String operator) {
 
         // Only coerce to numeric for range operators – equality stays as String to keep id
         // lookups working on string-typed columns.
-        boolean isRangeOperator = ">".equals(operator) || ">=".equals(operator)
-                || "<".equals(operator) || "<=".equals(operator);
+        boolean isRangeOperator = SqlOperator.GT.equals(operator) || SqlOperator.GTE.equals(operator)
+                || SqlOperator.LT.equals(operator) || SqlOperator.LTE.equals(operator);
 
         if (isRangeOperator) {
             // Quoted literals inside a range predicate are unusual but respect them as strings.

@@ -10,8 +10,15 @@ import com.graphqueryengine.query.api.TranslationResult;
 import com.graphqueryengine.query.factory.DefaultGraphQueryTranslatorFactory;
 
 import javax.script.ScriptException;
-import java.sql.*;
-import java.util.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * A {@link GraphProvider} that executes Gremlin queries by translating them to SQL
@@ -61,7 +68,7 @@ public class SqlGraphProvider implements GraphProvider {
 
     @Override
     public String providerId() {
-        return backendRegistry != null ? "sql-multi" : "sql";
+        return backendRegistry != null ? ProviderConstants.PROVIDER_SQL_MULTI : ProviderConstants.PROVIDER_SQL;
     }
 
     // ── Execution ────────────────────────────────────────────────────────────
@@ -142,7 +149,7 @@ public class SqlGraphProvider implements GraphProvider {
         GremlinExecutionResult result = execute(gremlin);
         return new GremlinTransactionalExecutionResult(
                 result.gremlin(), result.results(), result.resultCount(),
-                "read-only", "committed");
+                ProviderConstants.TX_MODE_READ_ONLY, ProviderConstants.TX_STATUS_COMMITTED);
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────

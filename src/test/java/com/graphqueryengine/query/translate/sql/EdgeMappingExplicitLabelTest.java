@@ -9,13 +9,15 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Verifies that explicit outVertexLabel / inVertexLabel on EdgeMapping drives
  * target-vertex resolution deterministically, superseding column-stem and
  * edge-table-name heuristics.
- *
  * Also confirms backward compatibility: mappings without endpoint labels still
  * resolve correctly via existing heuristics.
  */

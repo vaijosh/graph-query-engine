@@ -30,22 +30,33 @@ public final class SqlKeyword {
     public static final String ORDER_BY        = " ORDER BY ";
     public static final String LIMIT           = " LIMIT ";
 
+    /** The count-alias name used in {@code ORDER BY count DESC}. Identical to {@link SqlFragment#ALIAS_COUNT}. */
+    public static final String COUNT_ALIAS     = "count ";
+
     // ── Set operations ────────────────────────────────────────────────────────
     public static final String UNION_ALL       = " UNION ALL ";
     public static final String UNION           = " UNION ";
 
     // ── Aggregate functions ───────────────────────────────────────────────────
-    public static final String COUNT_STAR      = "COUNT(*) AS count";
+    /** {@code COUNT(*) AS count} — full count aggregate expression. */
+    public static final String COUNT_STAR      = "COUNT(*)" + AS + SqlFragment.ALIAS_COUNT;
     @SuppressWarnings("unused")
     public static final String COUNT_STAR_RAW  = "COUNT(*)";
     public static final String COUNT_DISTINCT  = "COUNT(DISTINCT ";
-    public static final String SUM_ALIAS       = ") AS sum";
-    public static final String MEAN_ALIAS      = ") AS mean";
+    /** {@code ) AS sum} — closes a SUM(…) aggregate and aliases it. */
+    public static final String SUM_ALIAS       = SqlFragment.CLOSE_PAREN + AS + SqlFragment.ALIAS_SUM;
+    /** {@code ) AS mean} — closes an AVG(…) aggregate and aliases it. */
+    public static final String MEAN_ALIAS      = SqlFragment.CLOSE_PAREN + AS + SqlFragment.ALIAS_MEAN;
     public static final String SUM_FN          = "SUM(";
     public static final String AVG_FN          = "AVG(";
 
     // ── Predicates / conditions ───────────────────────────────────────────────
     public static final String IS_NULL         = " IS NULL";
+    /**
+     * Operator token used in {@link com.graphqueryengine.query.translate.sql.HasFilter}
+     * to signal an IS NULL check (no bind parameter needed).
+     */
+    public static final String IS_NULL_OP      = "IS NULL";
     public static final String EXISTS          = "EXISTS ";
     public static final String NOT_IN          = " NOT IN (";
     public static final String NEQ             = " <> ";
@@ -61,6 +72,8 @@ public final class SqlKeyword {
     public static final String THEN            = " THEN ";
     public static final String ELSE            = " ELSE ";
     public static final String END             = " END";
+    /** {@code FROM (} — open a subquery/derived-table reference. */
+    public static final String FROM_SUBQUERY   = " FROM (";
 
     // ── CTE ───────────────────────────────────────────────────────────────────
     public static final String WITH            = "WITH ";

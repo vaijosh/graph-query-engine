@@ -31,12 +31,8 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <javalin.version>6.7.0</javalin.version>
         <jackson.version>2.18.6</jackson.version>
         <junit.version>5.11.4</junit.version>
-        <tinkerpop.version>3.7.4</tinkerpop.version>
-        <!-- Must match the cucumber version bundled with TinkerPop gremlin-test -->
-        <cucumber.version>6.11.0</cucumber.version>
         <antlr.version>4.9.3</antlr.version>
     </properties>
 
@@ -49,74 +45,10 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
-            <!-- Override vulnerable transitive deps reported by Mend.io -->
-            <!--
-                CVE-2024-6763 (MEDIUM): Jetty HttpURI insufficient authority validation → SSRF/redirect bypass.
-                CVE-2025-11143 (LOW):   Jetty URI parsing differences vs other parsers → potential filter bypass.
-
-                Both CVEs affect the HttpURI utility class directly; Jetty's own internal use is NOT vulnerable.
-                This engine does not pass user-supplied URIs to HttpURI, so the practical risk is negligible.
-
-                Fix status (as of 2026-04-10):
-                  CVE-2024-6763 — fixed in Jetty 12.0.12+ / 11.0.25+ (this pin).
-                  CVE-2025-11143 — NO patch available on Maven Central for Jetty 11.x (EOL);
-                                   patched in Jetty 12.1.5+ and 12.0.31+, but Javalin 6.x requires
-                                   Jetty 11 — upgrading to Jetty 12 would require Javalin 7.x migration.
-                                   Commercial backports available via TuxCare / HeroDevs for Jetty 11.x.
-
-                Accepted risk: low-severity URI parser differential; no user-supplied URI passed to HttpURI.
-                Revisit when Javalin 7.x (Jetty 12) is stable.
-            -->
-            <dependency>
-                <groupId>org.eclipse.jetty</groupId>
-                <artifactId>jetty-http</artifactId>
-                <version>11.0.25</version>
-            </dependency>
-            <!-- CVE-2024-29131 / CVE-2024-29133: commons-configuration2 (transitive via gremlin-groovy) -->
-            <dependency>
-                <groupId>org.apache.commons</groupId>
-                <artifactId>commons-configuration2</artifactId>
-                <version>2.10.1</version>
-            </dependency>
-            <!-- CVE-2025-48734: commons-beanutils (transitive via gremlin-groovy) -->
-            <dependency>
-                <groupId>commons-beanutils</groupId>
-                <artifactId>commons-beanutils</artifactId>
-                <version>1.11.0</version>
-            </dependency>
-            <!-- CVE-2025-48924: commons-lang3 (transitive via gremlin) -->
-            <dependency>
-                <groupId>org.apache.commons</groupId>
-                <artifactId>commons-lang3</artifactId>
-                <version>3.18.0</version>
-            </dependency>
-            <!-- CVE-2023-52428 / CVE-2025-53864: nimbus-jose-jwt (transitive via gremlin-test) -->
-            <dependency>
-                <groupId>com.nimbusds</groupId>
-                <artifactId>nimbus-jose-jwt</artifactId>
-                <version>9.37.4</version>
-            </dependency>
-            <!-- CVE-2021-27568 / CVE-2023-1370: json-smart (transitive via nimbus-jose-jwt) -->
-            <dependency>
-                <groupId>net.minidev</groupId>
-                <artifactId>json-smart</artifactId>
-                <version>2.4.9</version>
-            </dependency>
-            <!-- CVE-2020-8908 / CVE-2023-2976: guava (transitive via gremlin-test) -->
-            <dependency>
-                <groupId>com.google.guava</groupId>
-                <artifactId>guava</artifactId>
-                <version>32.0.1-jre</version>
-            </dependency>
         </dependencies>
     </dependencyManagement>
 
     <dependencies>
-        <dependency>
-            <groupId>io.javalin</groupId>
-            <artifactId>javalin</artifactId>
-            <version>${javalin.version}</version>
-        </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
@@ -141,93 +73,7 @@
             <version>471</version>
             <scope>runtime</scope>
         </dependency>
-        <dependency>
-            <groupId>org.apache.tinkerpop</groupId>
-            <artifactId>gremlin-core</artifactId>
-            <version>${tinkerpop.version}</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.antlr</groupId>
-                    <artifactId>antlr4-runtime</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.tinkerpop</groupId>
-            <artifactId>gremlin-groovy</artifactId>
-            <version>${tinkerpop.version}</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.antlr</groupId>
-                    <artifactId>antlr4-runtime</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.tinkerpop</groupId>
-            <artifactId>tinkergraph-gremlin</artifactId>
-            <version>${tinkerpop.version}</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.antlr</groupId>
-                    <artifactId>antlr4-runtime</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
 
-        <!-- TinkerPop Gremlin compatibility test suite (Cucumber BDD feature files + StepDefinition) -->
-        <dependency>
-            <groupId>org.apache.tinkerpop</groupId>
-            <artifactId>gremlin-test</artifactId>
-            <version>${tinkerpop.version}</version>
-            <scope>test</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.antlr</groupId>
-                    <artifactId>antlr4-runtime</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <!-- Cucumber BDD runner matching the version used by gremlin-test -->
-        <dependency>
-            <groupId>io.cucumber</groupId>
-            <artifactId>cucumber-java</artifactId>
-            <version>${cucumber.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.cucumber</groupId>
-            <artifactId>cucumber-junit</artifactId>
-            <version>${cucumber.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.cucumber</groupId>
-            <artifactId>cucumber-guice</artifactId>
-            <version>${cucumber.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <!-- Guice DI required by cucumber-guice -->
-        <dependency>
-            <groupId>com.google.inject</groupId>
-            <artifactId>guice</artifactId>
-            <version>5.1.0</version>
-            <scope>test</scope>
-        </dependency>
-        <!-- JUnit 4 required by cucumber-junit 6.x -->
-        <dependency>
-            <groupId>junit</groupId>
-            <artifactId>junit</artifactId>
-            <version>4.13.2</version>
-            <scope>test</scope>
-        </dependency>
-        <!-- JUnit Vintage engine: lets maven-surefire 3.x run JUnit 4 alongside JUnit 5 -->
-        <dependency>
-            <groupId>org.junit.vintage</groupId>
-            <artifactId>junit-vintage-engine</artifactId>
-            <version>${junit.version}</version>
-            <scope>test</scope>
-        </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
@@ -265,10 +111,9 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.2</version>
                 <configuration>
-                    <!-- Run JUnit 5 tests normally; also pick up JUnit 4 Cucumber runner -->
+                    <!-- Run JUnit 5 tests -->
                     <includes>
                         <include>**/*Test.java</include>
-                        <include>**/*Suite.java</include>
                     </includes>
                 </configuration>
             </plugin>

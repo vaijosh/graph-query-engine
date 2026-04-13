@@ -215,20 +215,30 @@ def _write_csv(path: pathlib.Path, fieldnames: list[str], rows: list[tuple]) -> 
         w.writerows(rows)
 
 
-def _csvread_insert(table: str, csv_file: pathlib.Path, columns: list[str], db_url: str, h2_jar: str) -> None:
+def _csvread_insert(table: str, csv_file: pathlib.Path, columns: list[str], db_url: str, h2_jar: str,
+                    bigint_cols: set[str] | None = None) -> None:
     """
     Load a CSV into *table* using a single:
       INSERT INTO <table> (<cols>) SELECT <cols> FROM CSVREAD('<file>')
     H2's CSVREAD reads the file name from a column header, so we build
     a SELECT that maps the CSV columns to the table columns.
+
+    ``bigint_cols`` controls which columns receive an explicit CAST(… AS BIGINT).
+    It defaults to the columns that are always numeric FKs/PKs across all AML tables.
+    Columns like ``account_id`` and ``bank_id`` are intentionally omitted from the
+    default because in some tables (aml_accounts, aml_banks) they are VARCHAR
+    strings (e.g. "8000EBD30") while in others (aml_account_bank, aml_bank_country)
+    they are integer FKs — callers must pass ``bigint_cols`` explicitly when the
+    latter applies.
     """
+    if bigint_cols is None:
+        # Safe default: only columns that are unambiguously BIGINT in every table.
+        bigint_cols = {"id", "country_id", "transfer_id", "alert_id",
+                       "from_account_id", "to_account_id"}
     cols = ", ".join(columns)
     # Cast id / numeric columns that may arrive as strings from CSVREAD
     cast_cols = ", ".join(
-        f"CAST({c} AS BIGINT) AS {c}" if c in ("id", "account_id", "bank_id",
-                                                 "country_id", "transfer_id",
-                                                 "alert_id", "from_account_id",
-                                                 "to_account_id")
+        f"CAST({c} AS BIGINT) AS {c}" if c in bigint_cols
         else f"CAST({c} AS DOUBLE) AS {c}" if c == "amount"
         else f"CAST({c} AS INTEGER) AS {c}" if c == "risk_score"
         else c
@@ -454,7 +464,8 @@ def seed_csv_bulk(csv_path: str, max_rows: int = 100_000, wipe: bool = False) ->
                    data["account_bank"])
         _csvread_insert("aml_account_bank", account_bank_csv,
                         ["id", "account_id", "bank_id", "since", "is_primary"],
-                        db_url, h2_jar)
+                        db_url, h2_jar,
+                        bigint_cols={"id", "account_id", "bank_id"})
 
         # bank_country
         bank_country_csv = tmp / "bank_country.csv"
@@ -463,7 +474,8 @@ def seed_csv_bulk(csv_path: str, max_rows: int = 100_000, wipe: bool = False) ->
                    data["bank_country"])
         _csvread_insert("aml_bank_country", bank_country_csv,
                         ["id", "bank_id", "country_id", "is_headquarters"],
-                        db_url, h2_jar)
+                        db_url, h2_jar,
+                        bigint_cols={"id", "bank_id", "country_id"})
 
         # Alerts
         if data["alerts"]:
@@ -483,7 +495,8 @@ def seed_csv_bulk(csv_path: str, max_rows: int = 100_000, wipe: bool = False) ->
                        data["account_alert"])
             _csvread_insert("aml_account_alert", account_alert_csv,
                             ["id", "account_id", "alert_id", "flagged_at", "reason"],
-                            db_url, h2_jar)
+                            db_url, h2_jar,
+                            bigint_cols={"id", "account_id", "alert_id"})
 
         # transfer_channel
         transfer_channel_csv = tmp / "transfer_channel.csv"

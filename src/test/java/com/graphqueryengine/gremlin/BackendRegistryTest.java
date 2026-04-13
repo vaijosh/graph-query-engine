@@ -4,7 +4,10 @@ import com.graphqueryengine.gremlin.provider.BackendRegistry;
 import com.graphqueryengine.mapping.MappingStore;
 import org.junit.jupiter.api.Test;
 import java.util.List;
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Unit tests for {@link BackendRegistry}.
  * Uses an in-memory H2 database so no external infrastructure is required.

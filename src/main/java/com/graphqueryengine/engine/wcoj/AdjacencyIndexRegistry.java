@@ -2,6 +2,7 @@ package com.graphqueryengine.engine.wcoj;
 
 import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
+import com.graphqueryengine.query.translate.sql.constant.SqlKeyword;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -273,7 +274,7 @@ public class AdjacencyIndexRegistry {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static long countRows(Connection conn, String table) throws SQLException {
-        try (var ps = conn.prepareStatement("SELECT COUNT(*) FROM " + table);
+        try (var ps = conn.prepareStatement(SqlKeyword.SELECT_COUNT + table);
              var rs = ps.executeQuery()) {
             return rs.next() ? rs.getLong(1) : 0L;
         }
