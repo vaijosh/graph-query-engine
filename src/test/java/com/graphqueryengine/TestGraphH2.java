@@ -3,8 +3,9 @@ package com.graphqueryengine;
 import com.graphqueryengine.config.DatabaseConfig;
 import com.graphqueryengine.db.DatabaseManager;
 import com.graphqueryengine.engine.wcoj.AdjacencyIndexRegistry;
-import com.graphqueryengine.engine.wcoj.WcojGraphProvider;
+import com.graphqueryengine.engine.wcoj.WcojOptimiser;
 import com.graphqueryengine.gremlin.GremlinExecutionService;
+import com.graphqueryengine.gremlin.provider.SqlGraphProvider;
 import com.graphqueryengine.mapping.EdgeMapping;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.MappingStore;
@@ -32,8 +33,8 @@ import java.util.Map;
  * <pre>{@code
  * // Preferred: reuse the shared singleton — schema+seed run only once per JVM.
  * TestGraphH2 h2 = TestGraphH2.shared();
- * GremlinExecutionService svc = h2.wcojService();   // WCOJ provider (shared instance)
- * GremlinExecutionService svc = h2.sqlService();    // plain SQL provider
+ * GremlinExecutionService svc = h2.wcojService();   // SQL provider with WCOJ enabled
+ * GremlinExecutionService svc = h2.sqlService();    // SQL provider (same — WCOJ is embedded)
  * }</pre>
  */
 public class TestGraphH2 {
@@ -71,7 +72,7 @@ public class TestGraphH2 {
     private final DatabaseManager databaseManager;
     private final MappingStore mappingStore;
     /** Lazily created once and reused by all callers of {@link #wcojService()}. */
-    private GremlinExecutionService sharedWcojService;
+    private GremlinExecutionService sharedService;
 
     public TestGraphH2() {
         this.databaseManager = new DatabaseManager(DB_CONFIG);
@@ -88,24 +89,31 @@ public class TestGraphH2 {
     // ── Providers ─────────────────────────────────────────────────────────────
 
     /**
-     * Returns a {@link GremlinExecutionService} backed by the WCOJ engine + H2.
+     * Returns a {@link GremlinExecutionService} backed by {@link SqlGraphProvider}
+     * with the WCOJ optimiser enabled (using an in-memory-only test registry).
      *
-     * <p>The service (and the underlying {@link AdjacencyIndexRegistry}) is built once
-     * and reused across all calls on the same {@code TestGraphH2} instance, so the
-     * expensive WCOJ index-build only happens once per JVM when used via {@link #shared()}.
+     * <p>The service is built once and reused across all calls on the same
+     * {@code TestGraphH2} instance so the expensive index-build only happens
+     * once per JVM when used via {@link #shared()}.
      */
     public synchronized GremlinExecutionService wcojService() {
-        if (sharedWcojService == null) {
+        if (sharedService == null) {
             Path tmpCache = Path.of(System.getProperty("java.io.tmpdir"), "wcoj-test-cache");
             AdjacencyIndexRegistry registry = new AdjacencyIndexRegistry(
                     10_000_000L,           // keep everything in memory for tests
                     512L * 1024 * 1024,    // 512 MB disk quota (not used in-memory)
                     tmpCache
             );
-            sharedWcojService = new GremlinExecutionService(
-                    new WcojGraphProvider(databaseManager, mappingStore, registry));
+            WcojOptimiser optimiser = new WcojOptimiser(mappingStore, registry);
+            sharedService = new GremlinExecutionService(
+                    new SqlGraphProvider(databaseManager, mappingStore, optimiser));
         }
-        return sharedWcojService;
+        return sharedService;
+    }
+
+    /** Alias for {@link #wcojService()} — WCOJ is now embedded in the SQL provider. */
+    public GremlinExecutionService sqlService() {
+        return wcojService();
     }
 
     /** Exposes the raw {@link DatabaseManager} for low-level test setup. */
@@ -113,6 +121,9 @@ public class TestGraphH2 {
 
     /** Exposes the {@link MappingStore} so tests can add extra mappings. */
     public MappingStore mappingStore() { return mappingStore; }
+
+    // ...existing code...
+
 
     // ── Schema & Seed ─────────────────────────────────────────────────────────
 

@@ -139,20 +139,19 @@ This document describes the current implementation in `src/main/java/com/graphqu
 │                                                                                        │
 │  GremlinExecutionService                                                               │
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐   │
-│  │  GraphProvider (interface)     GraphProviderFactory  env: GRAPH_PROVIDER        │   │
+│  │  GraphProvider (interface)     GraphProviderFactory  env: GRAPH_PROVIDER=sql    │   │
 │  │                                                                                 │   │
 │  │  ┌──────────────────────────────────────────────────────────────────────────┐   │   │
-│  │  │  WcojGraphProvider  (DEFAULT)                                            │   │   │
-│  │  │  • AntlrGremlinTraversalParser + GremlinStepParser                       │   │   │
-│  │  │  • isWcojEligible() → LeapfrogTrieJoin  (multi-hop paths)               │   │   │
-│  │  │  • AdjacencyIndexRegistry  (two-tier: heap / disk-mapped CSR)            │   │   │
-│  │  │  • SQL fallback  (via GremlinSqlTranslator + JDBC)                       │   │   │
-│  │  └──────────────────────────────────────────────────────────────────────────┘   │   │
-│  │                                                                                 │   │
-│  │  ┌──────────────────────────────────────────────────────────────────────────┐   │   │
-│  │  │  TinkerGraphProvider  (optional, set GRAPH_PROVIDER=tinkergraph)         │   │   │
-│  │  │  • GremlinGroovyScriptEngine  (evaluates full TinkerPop traversals)      │   │   │
-│  │  │  • TinkerGraph  (in-memory graph, loaded from ./data/graph.gryo)         │   │   │
+│  │  │  SqlGraphProvider  (the only provider)                                   │   │   │
+│  │  │                                                                          │   │   │
+│  │  │  ┌────────────────────────────────────────────────────────────────────┐  │   │   │
+│  │  │  │  WcojOptimiser  (embedded; WCOJ_ENABLED=true by default)           │  │   │   │
+│  │  │  │  • isWcojEligible() → LeapfrogTrieJoin  (multi-hop paths)         │  │   │   │
+│  │  │  │  • AdjacencyIndexRegistry  (two-tier: heap / disk-mapped CSR)     │  │   │   │
+│  │  │  │  • returns null if ineligible → SQL fallback                       │  │   │   │
+│  │  │  └────────────────────────────────────────────────────────────────────┘  │   │   │
+│  │  │                                                                          │   │   │
+│  │  │  SQL fallback  (GremlinSqlTranslator + JDBC via BackendRegistry)         │   │   │
 │  │  └──────────────────────────────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────────────────────────────┘   │
 │  Returns: GremlinExecutionResult { gremlin, results, resultCount }                     │
@@ -177,9 +176,12 @@ This document describes the current implementation in `src/main/java/com/graphqu
 ```Text
 
 THIS ENGINE:
-  Gremlin  →  GremlinStepParser  →  isWcojEligible()?
-                  YES: LeapfrogTrieJoin (adjacency index)  →  property fetch via JDBC  →  result
-                   NO: SQL text (GremlinSqlTranslator)  →  JDBC  →  [Trino]  →  Iceberg/S3
+  Gremlin  →  SqlGraphProvider
+                 └─ WcojOptimiser.tryExecute()  (WCOJ_ENABLED=true by default)
+                        isWcojEligible()?
+                          YES: LeapfrogTrieJoin (adjacency index)  →  property fetch via JDBC  →  result
+                           NO: returns null
+                 └─ SQL fallback: GremlinSqlTranslator  →  JDBC  →  [Trino]  →  Iceberg/S3
                                                                          ↑
                                                                separate process, must be running
 
@@ -202,10 +204,14 @@ PUPPYGRAPH:
   - SQL compiler: `GremlinSqlTranslator`
   - mode wrappers: `StandardSqlGraphQueryTranslator`, `IcebergSqlGraphQueryTranslator`
 - **Native execution subsystem**: `GremlinExecutionService` + `GraphProvider` SPI
-  - **WCOJ engine** (default): `WcojGraphProvider` → `AdjacencyIndexRegistry` → `LeapfrogTrieJoin`
-    - Two-tier index storage: in-memory `AdjacencyIndex` (heap) and `DiskBackedAdjacencyIndex` (memory-mapped CSR)
+  - **Only provider**: `SqlGraphProvider` — always `GRAPH_PROVIDER=sql` (the default)
+  - **Embedded WCOJ optimiser**: `WcojOptimiser` (enabled by default via `WCOJ_ENABLED=true`)
+    - Intercepts eligible multi-hop queries before SQL translation
+    - `AdjacencyIndexRegistry` — two-tier: in-memory `AdjacencyIndex` (heap) or `DiskBackedAdjacencyIndex` (memory-mapped CSR)
     - Per-mapping disk quota and isolation under `wcoj-index-cache/`
-  - **TinkerGraph provider** (optional): full TinkerPop traversal via Groovy script engine
+    - `LeapfrogTrieJoin` — depth-first DFS with O(log n) `seek()` on sorted neighbour arrays
+  - **SQL fallback**: all ineligible queries (aggregations, ORDER BY, outE/inE hops) handled via `GremlinSqlTranslator` + JDBC
+  - Disable WCOJ with `WCOJ_ENABLED=false`; tune with `WCOJ_MAX_EDGES` and `WCOJ_DISK_QUOTA_MB`
 - **Database bootstrap**: `DatabaseConfig`, `DatabaseManager`
 
 ### High-Level Data Flow
@@ -228,10 +234,11 @@ Client  →  App (Javalin)
 ── Native Gremlin execution path (POST /gremlin/query) ─────────────────────────────────
 Client  →  App (Javalin)
            └─ GremlinExecutionService.execute(gremlin)
-                 └─ WcojGraphProvider  (default provider)
+                 └─ SqlGraphProvider  (the only provider)
                        ├─ AntlrGremlinTraversalParser.parse() + GremlinStepParser.parse()
                        │     → ParsedTraversal
-                       ├─ isWcojEligible()?
+                       ├─ WcojOptimiser.tryExecute()  [when WCOJ_ENABLED=true]
+                       │   isWcojEligible()?
                        │   YES:
                        │     AdjacencyIndexRegistry.getOrLoad()
                        │       ├─ rowCount ≤ 5M  →  AdjacencyIndex  (JVM heap HashMap)
@@ -240,7 +247,7 @@ Client  →  App (Javalin)
                        │     LeapfrogTrieJoin.enumerate()
                        │       └─ depth-first DFS with seek() on sorted neighbour arrays
                        │     fetchProperty()  →  batched IN query for vertex properties
-                       │   NO:
+                       │   NO (or WCOJ_ENABLED=false):
                        │     GremlinSqlTranslator.translate()  →  SQL
                        │     JDBC execute  →  ResultSet
                        └─ GremlinExecutionResult { gremlin, results, resultCount }
@@ -438,14 +445,51 @@ The service intentionally separates:
 - **Execution** (`/gremlin/query`)
 
 `/query/explain` never executes SQL. It returns SQL + parameters for inspection.
+The `translatedSql` field always shows the SQL plan; for multi-hop queries with
+`WCOJ_ENABLED=true` (the default) this plan is shown for reference only — execution
+goes through the Leapfrog Trie Join optimiser, not the SQL join chain.
+The `mode` and `executionEngine` fields in `QueryExplanation` are always `"SQL"`;
+the `executionStrategy` field describes whether WCOJ will be used.
 
-Native Gremlin execution is routed through `GremlinExecutionService` and `GraphProvider` SPI.  The default provider is `WcojGraphProvider` which uses the Worst-Case Optimal Join algorithm for multi-hop path traversals and falls back to SQL for all other query shapes.
+Native Gremlin execution is routed through `GremlinExecutionService` and `GraphProvider`
+SPI.  There is only one provider: `SqlGraphProvider`.  It embeds a `WcojOptimiser`
+(enabled by default via `WCOJ_ENABLED=true`) that intercepts eligible multi-hop path
+traversals using the Leapfrog Trie Join algorithm.  All other query shapes — and any
+query when `WCOJ_ENABLED=false` — are handled by the standard SQL translator + JDBC.
 
-This keeps SQL generation deterministic and testable while preserving full Gremlin semantics in native mode.
+This keeps SQL generation deterministic and testable while the WCOJ layer provides
+transparent performance acceleration for the most expensive query pattern (multi-hop traversals).
 
 ---
 
 ## 9a) Worst-Case Optimal Join (WCOJ) Engine
+
+### Design: WCOJ as an embedded optimiser, not a separate engine
+
+WCOJ is **not** a separate `GraphProvider`.  There is only one provider (`SqlGraphProvider`).
+`WcojOptimiser` is an optional component embedded inside `SqlGraphProvider` that is
+consulted **before** SQL translation for every query.  This means:
+
+- Multi-backend routing (`BackendRegistry`) and Iceberg/H2 dialect selection always work,
+  regardless of whether WCOJ is active.
+- `WCOJ_ENABLED=false` degrades gracefully to plain SQL — no restart or reconfiguration needed.
+- The SQL plan (`translatedSql` in `/query/explain`) always shows the equivalent N-JOIN SQL
+  for reference, even when WCOJ will execute the query differently.
+
+```text
+SqlGraphProvider.execute(gremlin)
+  │
+  ├─ 1. Parse (AntlrGremlinTraversalParser + GremlinStepParser) → ParsedTraversal
+  │
+  ├─ 2. WcojOptimiser.tryExecute()   [if WCOJ_ENABLED=true]
+  │       isWcojEligible()?
+  │         YES → LeapfrogTrieJoin → Result     (returned immediately)
+  │         NO  → returns null
+  │
+  └─ 3. SQL fallback (when null returned or WCOJ_ENABLED=false)
+          GremlinSqlTranslator.translate() → SQL
+          JDBC execute via BackendRegistry → ResultSet
+```
 
 ### Motivation
 
@@ -465,13 +509,14 @@ never exceeds the theoretical worst-case bound of the final output.
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         WCOJ ENGINE  (engine/wcoj/)                             │
+│                         WCOJ OPTIMISER  (engine/wcoj/)                          │
 │                                                                                 │
-│  WcojGraphProvider  (GraphProvider SPI)                                         │
+│  WcojOptimiser  (embedded inside SqlGraphProvider)                              │
 │  ┌───────────────────────────────────────────────────────────────────────────┐  │
-│  │  1. Parse traversal (AntlrGremlinTraversalParser + GremlinStepParser)     │  │
-│  │  2. isWcojEligible() ?                                                    │  │
-│  │     YES ──► executeWcoj()         NO ──► executeSql() (SQL fallback)      │  │
+│  │  tryExecute(gremlin, config, databaseManager)                             │  │
+│  │    1. Parse traversal (AntlrGremlinTraversalParser + GremlinStepParser)   │  │
+│  │    2. isWcojEligible()?                                                   │  │
+│  │         YES ──► executeWcoj() → Result     NO ──► return null             │  │
 │  └───────────────────────────────────────────────────────────────────────────┘  │
 │                                                                                 │
 │  AdjacencyIndexRegistry  (two-tier index management)                            │
@@ -595,7 +640,7 @@ wcoj-index-cache/
 
 ### WCOJ Eligibility Check
 
-`WcojGraphProvider.isWcojEligible()` determines whether a parsed traversal can be
+`WcojOptimiser.isWcojEligible()` determines whether a parsed traversal can be
 accelerated.  WCOJ is used when **all** of the following hold:
 
 | Condition | Reason |
@@ -630,20 +675,22 @@ touches property columns.
 
 ### SQL Fallback Path
 
-For ineligible queries (aggregations, projections, ordering, edge-step hops) the
-provider delegates transparently to `GremlinSqlTranslator` → JDBC, exactly as if
-no WCOJ engine were present.  The SQL generated is identical to what `/query/explain`
-returns, and is logged when `SQL_TRACE` / `X-SQL-Trace` is enabled.
+For ineligible queries (aggregations, projections, ordering, edge-step hops), or when
+`WCOJ_ENABLED=false`, `SqlGraphProvider` delegates transparently to
+`GremlinSqlTranslator` → JDBC, exactly as if no WCOJ optimiser were present.
+The SQL generated is identical to what `/query/explain` returns, and is logged when
+`SQL_TRACE` / `X-SQL-Trace` is enabled.
 
 ---
 
 ### Configuration
 
-| Property | Default | Description |
-|----------|---------|-------------|
-| `wcoj.cache.dir` | `<cwd>/wcoj-index-cache` | Root directory for disk CSR files |
-| `wcoj.disk.quota.mb` | `2048` | Per-mapping disk quota in MB |
-| `AdjacencyIndexRegistry.DEFAULT_MAX_EDGES_IN_MEMORY` | `5,000,000` | Row threshold for heap vs disk tier |
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `WCOJ_ENABLED` | `true` | Set `false` to disable WCOJ and always run SQL joins |
+| `WCOJ_MAX_EDGES` | `5,000,000` | In-memory edge row threshold; larger tables spill to disk CSR |
+| `WCOJ_DISK_QUOTA_MB` | `2048` | Per-mapping disk quota in MB |
+| `wcoj.cache.dir` (system property) | `<cwd>/wcoj-index-cache` | Root directory for disk CSR files |
 
 ---
 
@@ -729,7 +776,10 @@ Important env vars in current design:
 
 - `PORT`
 - `DB_URL`, `DB_USER`, `DB_PASSWORD`, `DB_DRIVER`
-- `GRAPH_PROVIDER`
+- `GRAPH_PROVIDER` (only valid value: `sql`; this is the default)
+- `WCOJ_ENABLED` (default `true` — set `false` to always use SQL joins instead of Leapfrog)
+- `WCOJ_MAX_EDGES` (default `5000000` — in-memory edge row threshold before disk spill)
+- `WCOJ_DISK_QUOTA_MB` (default `2048` — per-mapping WCOJ disk quota in MB)
 - `QUERY_TRANSLATOR_BACKEND`
 - `QUERY_PARSER`
 - `SQL_TRACE`
@@ -1002,10 +1052,10 @@ Every step is assessed against the three-layer pipeline:
 
 | Step | SQL equivalent | Layer 2 changes | Layer 3 changes | Complexity | Key risk |
 |------|---------------|-----------------|-----------------|------------|----------|
-| `.coalesce(t1, t2)` | `COALESCE(expr1, expr2)` | Parse inner traversal arguments as sub-expressions (e.g., `values(p)` → column reference); add `coalesceExpressions` list to `ParsedTraversal` | In `buildVertexProjectionSql` or `buildHopTraversalSql` emit `COALESCE(col1, col2) AS alias` | **High** | Inner traversals must be simple `values(p)` or `constant(v)` steps — arbitrary inner traversals are not translatable |
+| `.coalesce(t1, t2)` | `COALESCE(expr1, expr2)` | Parse inner traversal arguments as sub-expressions (e.g., `values(p)` → column reference); add `coalesceExpressions` list to `ParsedTraversal` | In `buildVertexProjectionSql` or `buildHopTraversalSql` emit `COALESCE(col1, col2) AS alias` | **High** | Branches that are multi-step traversals (not just `constant()` or `values()`) require recursive translation |
 | `.optional(traversal)` | `LEFT JOIN` instead of `INNER JOIN` for the traversal | Parse inner traversal as a single hop; add `optionalHop` flag to `HopStep` | Change `JOIN` to `LEFT JOIN` in the hop join loop when `optionalHop=true`; handle NULLs in SELECT | **Medium** | Only works when the optional traversal is a single hop — nested optionals or multi-hop optionals are not tractable |
 | `.union(t1, t2, …)` | `SELECT … UNION ALL SELECT …` | Parse inner traversal arguments as sub-traversals; add `unionBranches` list to `ParsedTraversal` | Translate each branch separately and join with `UNION ALL`; wrap in outer SELECT if aggregation is needed | **High** | Each branch must be independently translatable; branches that share state with the outer traversal (aliased steps) require correlated rewriting |
-| `.choose(pred, t_true, t_false)` general | `CASE WHEN … THEN … ELSE … END` | Extend `parseChooseProjection` beyond the current `values().is()` / `constant()` limitation; accept branch sub-traversals | In `buildVertexProjectionSql` emit CASE WHEN expressions; simple property branches map to column references | **High** | Branches that are multi-step traversals (not just `constant()` or `values()`) require recursive translation |
+| `.choose(pred, t_true, t_false)` general | `CASE WHEN … THEN … ELSE … END` | Extend `parseChooseProjection` beyond the current `values().is()` / `constant()` limitation; accept branch sub-traversals | In `buildVertexProjectionSql` emit CASE WHEN expressions; simple property branches map to column references | **High** | Branch sub-traversals that are not simple `values(p)` or `constant(v)` steps require recursive translation |
 
 ---
 
@@ -1078,7 +1128,7 @@ A commercial zero-ETL graph database solution is a read-only graph analytics eng
 | `.where(traversal)` | ✅ Both | commercial zero-ETL graph DB: `where(out('created'))`; this engine: edge-exist and neighbor-has correlated subquery forms |
 | `.where(and(t1, t2))` / `.where(or(t1, t2))` | ✅ Both | Supported for recursive composition of traversal-style `where` predicates |
 | `.where(not(traversal))` | ✅ Both | Supported as `NOT (...)` around traversal-style `where` predicates |
-| `.is(predicate)` | ⚠️ Partial parity | Supported for `values(...).is(...)` and `where(select(...).is(...))`; general standalone forms remain unsupported |
+| `.is(predicate)` | ⚠️ Partial parity | Supported for `values('p').is(pred(...))` and `where(select(...).is(...))`; general standalone forms remain unsupported |
 
 ---
 
@@ -1091,7 +1141,7 @@ A commercial zero-ETL graph database solution is a read-only graph analytics eng
 | `.project(a…).by(p)` | ✅ Both | commercial zero-ETL graph DB shows `project('person','knowsCount','createdCount').by(identity()).by(out('knows').count()).by(out('created').count())` |
 | `.by(identity())` in `project` | ✅ Both | Supported for vertex and edge projections |
 | `.by(out(l).count())` in `project` | ✅ Both | commercial zero-ETL graph DB uses this pattern; this engine supports it as `OUT_VERTEX_COUNT` projection kind |
-| `.elementMap()` | ❌ Neither (documented) | Not mentioned in commercial zero-ETL graph DB docs; not in this engine |
+| `.elementMap()` | ❌ | Not documented by the commercial zero-ETL graph DB as supported Gremlin steps |
 | `.path()` | ✅ Both | commercial zero-ETL graph DB shows full traversal path output |
 | `.path().by(p)` | 🔵 This engine only | This engine supports per-hop property extraction; commercial zero-ETL graph DB shows path without `by()` modulator |
 

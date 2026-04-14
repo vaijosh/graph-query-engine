@@ -3,11 +3,25 @@ package com.graphqueryengine.gremlin.provider;
 import com.graphqueryengine.config.BackendConfig;
 import com.graphqueryengine.config.DatabaseConfig;
 import com.graphqueryengine.db.DatabaseManager;
-import com.graphqueryengine.engine.wcoj.AdjacencyIndexRegistry;
-import com.graphqueryengine.engine.wcoj.WcojGraphProvider;
 import com.graphqueryengine.mapping.MappingStore;
 
+/**
+ * Factory for creating {@link GraphProvider} instances.
+ *
+ * <p>Only one provider type exists: {@code "sql"} (the default).
+ * WCOJ acceleration is an <em>opt-out</em> feature of {@link SqlGraphProvider}
+ * controlled by the {@code WCOJ_ENABLED} environment variable (default: {@code true}).
+ *
+ * <h3>Environment variables</h3>
+ * <pre>
+ *   GRAPH_PROVIDER=sql         (only valid value; "sql" is the default)
+ *   WCOJ_ENABLED=true|false    (default true  — enable/disable leapfrog optimiser)
+ *   WCOJ_MAX_EDGES=&lt;n&gt;         (default 5_000_000 — in-memory edge threshold)
+ *   WCOJ_DISK_QUOTA_MB=&lt;n&gt;    (default 2048 — per-mapping disk quota in MB)
+ * </pre>
+ */
 public final class GraphProviderFactory {
+
     private GraphProviderFactory() {
     }
 
@@ -16,16 +30,16 @@ public final class GraphProviderFactory {
     }
 
     public static GraphProvider fromEnvironment(DatabaseManager databaseManager, MappingStore mappingStore) {
+        // GRAPH_PROVIDER is kept for forward-compatibility, but only "sql" is supported.
         String configuredProvider = System.getenv()
-                .getOrDefault("GRAPH_PROVIDER", "sql").trim().toLowerCase();
+                .getOrDefault("GRAPH_PROVIDER", ProviderConstants.PROVIDER_SQL).trim().toLowerCase();
         return fromProviderName(configuredProvider, databaseManager, mappingStore);
     }
 
     public static GraphProvider fromProviderName(String configuredProvider,
                                                   DatabaseManager databaseManager,
                                                   MappingStore mappingStore) {
-
-        if ("sql".equals(configuredProvider)) {
+        if (ProviderConstants.PROVIDER_SQL.equals(configuredProvider)) {
             if (databaseManager == null || mappingStore == null) {
                 throw new IllegalStateException(
                         "GRAPH_PROVIDER=sql requires a DatabaseManager and MappingStore. " +
@@ -34,35 +48,8 @@ public final class GraphProviderFactory {
             return new SqlGraphProvider(databaseManager, mappingStore);
         }
 
-        if ("wcoj".equals(configuredProvider)) {
-            if (databaseManager == null || mappingStore == null) {
-                throw new IllegalStateException(
-                        "GRAPH_PROVIDER=wcoj requires a DatabaseManager and MappingStore. " +
-                        "Ensure DB_URL, DB_USER, and DB_DRIVER are configured.");
-            }
-            long maxEdgesInMemory = AdjacencyIndexRegistry.DEFAULT_MAX_EDGES_IN_MEMORY;
-            String maxEdgesEnv = System.getenv("WCOJ_MAX_EDGES");
-            if (maxEdgesEnv != null && !maxEdgesEnv.isBlank()) {
-                try { maxEdgesInMemory = Long.parseLong(maxEdgesEnv.trim()); }
-                catch (NumberFormatException ignored) { /* keep default */ }
-            }
-
-            long diskQuotaMb = 2048L; // 2 GB default
-            String diskQuotaEnv = System.getenv("WCOJ_DISK_QUOTA_MB");
-            if (diskQuotaEnv != null && !diskQuotaEnv.isBlank()) {
-                try { diskQuotaMb = Long.parseLong(diskQuotaEnv.trim()); }
-                catch (NumberFormatException ignored) { /* keep default */ }
-            }
-
-            return new WcojGraphProvider(databaseManager, mappingStore,
-                    new AdjacencyIndexRegistry(
-                            maxEdgesInMemory,
-                            diskQuotaMb * 1024 * 1024,
-                            AdjacencyIndexRegistry.DEFAULT_CACHE_DIR));
-        }
-
-        throw new IllegalArgumentException("Unsupported GRAPH_PROVIDER: " + configuredProvider +
-                ". Supported providers: sql, wcoj");
+        throw new IllegalArgumentException("Unsupported GRAPH_PROVIDER: '" + configuredProvider +
+                "'. Only 'sql' is supported. WCOJ is enabled via WCOJ_ENABLED=true (the default).");
     }
 
     /**
@@ -76,4 +63,3 @@ public final class GraphProviderFactory {
         return new SqlGraphProvider(dm, mappingStore);
     }
 }
-

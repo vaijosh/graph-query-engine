@@ -30,7 +30,7 @@ public class GremlinExecutionService {
 
     /**
      * Returns the underlying {@link GraphProvider} so demo/admin code can cast it
-     * to a concrete type (e.g. {@link com.graphqueryengine.engine.wcoj.WcojGraphProvider})
+     * to a concrete type (e.g. {@link com.graphqueryengine.gremlin.provider.SqlGraphProvider})
      * without leaking demo concerns into the service API.
      */
     public GraphProvider provider() {

@@ -12,10 +12,9 @@ public final class ProviderConstants {
     // ── Provider IDs ──────────────────────────────────────────────────────────
     public static final String PROVIDER_SQL       = "sql";
     public static final String PROVIDER_SQL_MULTI = "sql-multi";
-    public static final String PROVIDER_WCOJ      = "wcoj";
 
     // ── Transaction metadata ──────────────────────────────────────────────────
-    public static final String TX_MODE_READ_ONLY  = "read-only";
+    public static final String TX_MODE_READ_ONLY   = "read-only";
     public static final String TX_STATUS_COMMITTED = "committed";
 }
 

@@ -1,8 +1,12 @@
 package com.graphqueryengine.gremlin.provider;
 
+import com.graphqueryengine.config.DatabaseConfig;
 import com.graphqueryengine.db.DatabaseManager;
+import com.graphqueryengine.engine.wcoj.AdjacencyIndexRegistry;
+import com.graphqueryengine.engine.wcoj.WcojOptimiser;
 import com.graphqueryengine.gremlin.GremlinExecutionResult;
 import com.graphqueryengine.gremlin.GremlinTransactionalExecutionResult;
+import com.graphqueryengine.mapping.BackendConnectionConfig;
 import com.graphqueryengine.mapping.MappingConfig;
 import com.graphqueryengine.mapping.MappingStore;
 import com.graphqueryengine.query.api.GraphQueryTranslator;
@@ -19,14 +23,22 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 /**
  * A {@link GraphProvider} that executes Gremlin queries by translating them to SQL
  * and running them directly against a JDBC database (e.g. H2, Trino / Iceberg).
  *
+ * <h3>WCOJ acceleration</h3>
+ * <p>When {@code WCOJ_ENABLED=true} (the default), multi-hop path traversals are
+ * intercepted by the embedded {@link WcojOptimiser} before falling back to SQL.
+ * Set {@code WCOJ_ENABLED=false} to disable the optimiser and always use SQL.
+ * Tuning knobs: {@code WCOJ_MAX_EDGES} (in-memory edge limit) and
+ * {@code WCOJ_DISK_QUOTA_MB} (per-mapping disk quota, default 2048 MB).
+ *
  * <h3>Single-backend mode</h3>
  * <p>Constructed with a single {@link DatabaseManager} — all queries go to that one connection.
- * Activated via {@code GRAPH_PROVIDER=sql} when only one backend is configured.
  *
  * <h3>Multi-backend / hybrid mode</h3>
  * <p>Constructed with a {@link BackendRegistry} — the connection is chosen per query based
@@ -36,10 +48,19 @@ import java.util.Map;
  */
 public class SqlGraphProvider implements GraphProvider {
 
+    private static final Logger LOG = Logger.getLogger(SqlGraphProvider.class.getName());
+
     private final DatabaseManager databaseManager;   // null when registry is set
     private final BackendRegistry backendRegistry;   // null in single-backend mode
     private final GraphQueryTranslator translator;
     private final MappingStore mappingStore;
+    /** Non-null when WCOJ_ENABLED=true (the default). */
+    private final WcojOptimiser wcojOptimiser;
+    /**
+     * Cache of DatabaseManager instances keyed by JDBC URL — reused by the WCOJ optimiser
+     * when the active mapping declares its own backends (e.g. Trino for Iceberg).
+     */
+    private final ConcurrentHashMap<String, DatabaseManager> managerCache = new ConcurrentHashMap<>();
 
     // ── Constructors ─────────────────────────────────────────────────────────
 
@@ -49,6 +70,7 @@ public class SqlGraphProvider implements GraphProvider {
         this.backendRegistry  = null;
         this.mappingStore     = mappingStore;
         this.translator       = new DefaultGraphQueryTranslatorFactory().create();
+        this.wcojOptimiser    = buildWcojOptimiser(mappingStore);
     }
 
     /** Multi-backend constructor: connection is resolved per-query from the registry. */
@@ -57,6 +79,49 @@ public class SqlGraphProvider implements GraphProvider {
         this.backendRegistry  = backendRegistry;
         this.mappingStore     = mappingStore;
         this.translator       = new DefaultGraphQueryTranslatorFactory().create();
+        this.wcojOptimiser    = buildWcojOptimiser(mappingStore);
+    }
+
+    /**
+     * Test-injectable constructor: supply an explicit {@link WcojOptimiser}
+     * (or {@code null} to disable WCOJ regardless of {@code WCOJ_ENABLED}).
+     */
+    public SqlGraphProvider(DatabaseManager databaseManager, MappingStore mappingStore,
+                            WcojOptimiser wcojOptimiser) {
+        this.databaseManager  = databaseManager;
+        this.backendRegistry  = null;
+        this.mappingStore     = mappingStore;
+        this.translator       = new DefaultGraphQueryTranslatorFactory().create();
+        this.wcojOptimiser    = wcojOptimiser;
+    }
+
+    /** Reads {@code WCOJ_ENABLED} / tuning env-vars and wires up the optimiser (or returns null). */
+    private static WcojOptimiser buildWcojOptimiser(MappingStore mappingStore) {
+        String enabled = System.getenv().getOrDefault("WCOJ_ENABLED", "true").trim().toLowerCase();
+        if ("false".equals(enabled) || "0".equals(enabled) || "off".equals(enabled)) {
+            LOG.info("[WCOJ] Disabled via WCOJ_ENABLED=" + enabled);
+            return null;
+        }
+
+        long maxEdgesInMemory = AdjacencyIndexRegistry.DEFAULT_MAX_EDGES_IN_MEMORY;
+        String maxEdgesEnv = System.getenv("WCOJ_MAX_EDGES");
+        if (maxEdgesEnv != null && !maxEdgesEnv.isBlank()) {
+            try { maxEdgesInMemory = Long.parseLong(maxEdgesEnv.trim()); }
+            catch (NumberFormatException ignored) { /* keep default */ }
+        }
+
+        long diskQuotaBytes = 2048L * 1024 * 1024; // 2 GB default
+        String diskQuotaEnv = System.getenv("WCOJ_DISK_QUOTA_MB");
+        if (diskQuotaEnv != null && !diskQuotaEnv.isBlank()) {
+            try { diskQuotaBytes = Long.parseLong(diskQuotaEnv.trim()) * 1024 * 1024; }
+            catch (NumberFormatException ignored) { /* keep default */ }
+        }
+
+        AdjacencyIndexRegistry registry = new AdjacencyIndexRegistry(
+                maxEdgesInMemory, diskQuotaBytes, AdjacencyIndexRegistry.DEFAULT_CACHE_DIR);
+        LOG.info("[WCOJ] Enabled — maxEdgesInMemory=" + maxEdgesInMemory
+                + " diskQuotaBytes=" + diskQuotaBytes);
+        return new WcojOptimiser(mappingStore, registry);
     }
 
     // ── Public accessors ─────────────────────────────────────────────────────
@@ -87,6 +152,16 @@ public class SqlGraphProvider implements GraphProvider {
             return new GremlinExecutionResult(gremlin, List.of(), 0);
         }
 
+        // ── WCOJ fast path (multi-hop path/count traversals) ─────────────────
+        if (wcojOptimiser != null) {
+            DatabaseManager wcojDm = resolveManagerForConfig(mappingConfig);
+            WcojOptimiser.Result wcojResult = wcojOptimiser.tryExecute(gremlin, mappingConfig, wcojDm);
+            if (wcojResult != null) {
+                return wcojResult.executionResult();
+            }
+        }
+
+        // ── SQL path ─────────────────────────────────────────────────────────
         TranslationResult translationResult;
         try {
             translationResult = translator.translate(gremlin, mappingConfig);
@@ -183,6 +258,34 @@ public class SqlGraphProvider implements GraphProvider {
         }
         // datasource == null → falls back to registry default (first-registered backend).
         return backendRegistry.getManagerById(datasource);
+    }
+
+    /**
+     * Resolves the best {@link DatabaseManager} for the given mapping config, used by the
+     * WCOJ optimiser (which runs before SQL translation, so there is no TranslationResult yet).
+     *
+     * <p>Priority:
+     * <ol>
+     *   <li>Mapping-declared backend (first entry in {@code config.backends()}).</li>
+     *   <li>BackendRegistry default (multi-backend mode).</li>
+     *   <li>Fixed single {@link DatabaseManager} (single-backend mode).</li>
+     * </ol>
+     */
+    private DatabaseManager resolveManagerForConfig(MappingConfig config) {
+        if (config != null && config.backends() != null && !config.backends().isEmpty()) {
+            BackendConnectionConfig bcc = config.backends().values().iterator().next();
+            if (bcc.url() != null && !bcc.url().isBlank()) {
+                return managerCache.computeIfAbsent(bcc.url(), url -> {
+                    LOG.info("[WCOJ] Using mapping backend connection: " + url);
+                    return new DatabaseManager(
+                            new DatabaseConfig(bcc.url(), bcc.user(), bcc.password(), bcc.driverClass()));
+                });
+            }
+        }
+        if (backendRegistry != null) {
+            return backendRegistry.getManagerById(null); // → registry default
+        }
+        return databaseManager;
     }
 
     /**

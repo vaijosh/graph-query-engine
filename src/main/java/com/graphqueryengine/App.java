@@ -62,29 +62,6 @@ public class App {
     }
 
     /**
-     * Test-friendly overload: starts the engine using an explicit provider name,
-     * bypassing the {@code GRAPH_PROVIDER} environment variable.
-     * Supported values: {@code "sql"}, {@code "wcoj"}.
-     */
-    public static RouterServer start(int port, String providerName) {
-        return start(port, providerName, (app, svc) -> {}, new DefaultGraphQueryTranslatorFactory());
-    }
-
-    public static RouterServer start(int port,
-                                     String providerName,
-                                     BiConsumer<RouterServer, GremlinExecutionService> extensions,
-                                     GraphQueryTranslatorFactory translatorFactory) {
-        MappingStore mappingStore = new MappingStore();
-        GraphQueryTranslator translator = translatorFactory.create();
-        DatabaseConfig databaseConfig = DatabaseConfig.fromEnvironment();
-        DatabaseManager databaseManager = new DatabaseManager(databaseConfig);
-        ensureDatabaseFileInitialized(databaseManager, databaseConfig);
-        GremlinExecutionService gremlinExecutionService = new GremlinExecutionService(
-                GraphProviderFactory.fromProviderName(providerName, databaseManager, mappingStore));
-        return buildAndStartApp(port, gremlinExecutionService, null, translator, extensions, mappingStore, databaseConfig);
-    }
-
-    /**
      * Starts the engine and invokes {@code extensions} so callers (e.g. the demo module)
      * can register additional routes against the same {@link RouterServer} instance without
      * creating a dependency from the engine onto demo code.
@@ -99,29 +76,11 @@ public class App {
         MappingStore mappingStore = new MappingStore();
         GraphQueryTranslator translator = translatorFactory.create();
 
-        String configuredProvider = System.getenv().getOrDefault("GRAPH_PROVIDER", "sql").trim().toLowerCase();
 
-        // WCOJ path: uses its own DatabaseManager + AdjacencyIndexRegistry (disk-backed).
-        // Does NOT use BackendRegistry — WCOJ manages its own JDBC connection pool.
-        if ("wcoj".equals(configuredProvider)) {
-            DatabaseConfig databaseConfig = DatabaseConfig.fromEnvironment();
-            DatabaseManager databaseManager = new DatabaseManager(databaseConfig);
-            ensureDatabaseFileInitialized(databaseManager, databaseConfig);
-            GremlinExecutionService gremlinExecutionService = new GremlinExecutionService(
-                    GraphProviderFactory.fromProviderName("wcoj", databaseManager, mappingStore));
-            return buildAndStartApp(port, gremlinExecutionService, null, translator, extensions, mappingStore,
-                    databaseConfig);
-        }
-
-        // SQL path: build multi-backend registry.
         BackendRegistry backendRegistry = BackendRegistry.fromEnvironment(mappingStore);
-        // Validate all backends can connect.
         for (BackendRegistry.Entry entry : backendRegistry.listEntries()) {
             LOG.info("Backend verified: id={} url={}", entry.id(), entry.url());
         }
-        // Create a registry-aware SqlGraphProvider that routes queries to the correct
-        // backend based on the mapping's datasource field. This is the provider used
-        // for all requests that don't carry an explicit X-Backend-Id header.
         com.graphqueryengine.gremlin.provider.SqlGraphProvider registryAwareProvider =
                 new com.graphqueryengine.gremlin.provider.SqlGraphProvider(backendRegistry, mappingStore);
         GremlinExecutionService registryAwareService = new GremlinExecutionService(registryAwareProvider);
@@ -343,25 +302,25 @@ public class App {
                     LOG.debug("[SQL-TRACE] endpoint=/query/explain disabled for this request");
                 }
 
-                // Determine how this query will actually be executed
-                String activeProvider = gremlinExecutionService.providerId();
+                // Determine execution strategy note.
+                // WCOJ is an internal optimisation inside SqlGraphProvider — not a separate engine.
+                // The engine is always "SQL". For hop queries, describe the WCOJ optimisation path.
                 boolean isHopQuery = translationResult.plan() != null
                         && translationResult.plan().hops() != null
                         && !translationResult.plan().hops().isEmpty();
-                String execEngine;
+                String wcojEnabled = System.getenv().getOrDefault("WCOJ_ENABLED", "true").trim().toLowerCase();
+                boolean wcojActive = !"false".equals(wcojEnabled) && !"0".equals(wcojEnabled) && !"off".equals(wcojEnabled);
                 String execStrategy;
-                if ("wcoj".equals(activeProvider) && isHopQuery) {
-                    execEngine   = "WCOJ";
-                    execStrategy = "1) Seed SQL: SELECT id FROM <table> WHERE … → start-vertex IDs    " +
-                                   "2) Leapfrog Trie Join: in-memory DFS over CSR adjacency index (no SQL JOINs)    " +
-                                   "3) Property-fetch SQL: SELECT id, <props> FROM <table> WHERE id IN (…)    " +
-                                   "The 'translatedSql' field shows the equivalent N-JOIN plan SQL mode would run — for reference only.";
-                } else if ("wcoj".equals(activeProvider)) {
-                    execEngine   = "WCOJ_FALLBACK_SQL";
-                    execStrategy = "WCOJ fell back to SQL (aggregation/projection query). " +
-                                   "The 'translatedSql' field is the exact SQL executed.";
+                if (isHopQuery && wcojActive) {
+                    execStrategy = "Leapfrog Trie Join (WCOJ) optimiser will intercept this hop query: " +
+                                   "1) Seed SQL → start-vertex IDs  " +
+                                   "2) In-memory DFS over CSR adjacency index (no SQL JOINs)  " +
+                                   "3) Property-fetch SQL → SELECT id, <props> WHERE id IN (…). " +
+                                   "The translatedSql shows the equivalent N-JOIN plan for reference only. " +
+                                   "Set WCOJ_ENABLED=false to always run that SQL plan instead.";
+                } else if (isHopQuery) {
+                    execStrategy = "WCOJ disabled (WCOJ_ENABLED=false) — will run the translatedSql N-JOIN plan directly.";
                 } else {
-                    execEngine   = "SQL";
                     execStrategy = null;
                 }
 
@@ -369,10 +328,10 @@ public class App {
                         request.gremlin(),
                         translationResult.sql(),
                         translationResult.parameters(),
-                        execEngine,
+                        "SQL",
                         "mappingId=" + selectedMapping.id(),
                         translationResult.plan(),
-                        execEngine,
+                        "SQL",
                         execStrategy
                 );
                 ctx.json(explanation);
@@ -464,14 +423,13 @@ public class App {
          * }
          * </pre>
          * Returns 200 with the registered backend id and url.
-         * Returns 400 if id or url is missing, or if the engine is in wcoj/single-sql mode.
+         * Returns 400 if id or url is missing, or if backendRegistry is unavailable.
          */
         app.post("/backends/register", ctx -> {
             if (backendRegistry == null) {
                 ctx.status(400).json(Map.of(
                         "error", "Runtime backend registration is only supported when the engine " +
-                                 "is running in SQL mode (GRAPH_PROVIDER=sql). " +
-                                 "Current mode does not use a BackendRegistry."));
+                                 "is running with a BackendRegistry. Current mode does not use one."));
                 return;
             }
 
