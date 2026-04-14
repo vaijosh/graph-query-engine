@@ -111,11 +111,6 @@ public class TestGraphH2 {
         return sharedService;
     }
 
-    /** Alias for {@link #wcojService()} — WCOJ is now embedded in the SQL provider. */
-    public GremlinExecutionService sqlService() {
-        return wcojService();
-    }
-
     /** Exposes the raw {@link DatabaseManager} for low-level test setup. */
     public DatabaseManager databaseManager() { return databaseManager; }
 

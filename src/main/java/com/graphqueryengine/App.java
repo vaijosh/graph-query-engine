@@ -2,12 +2,10 @@ package com.graphqueryengine;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.graphqueryengine.config.DatabaseConfig;
-import com.graphqueryengine.db.DatabaseManager;
 import com.graphqueryengine.gremlin.GremlinExecutionResult;
 import com.graphqueryengine.gremlin.GremlinExecutionService;
 import com.graphqueryengine.gremlin.GremlinTransactionalExecutionResult;
 import com.graphqueryengine.gremlin.provider.BackendRegistry;
-import com.graphqueryengine.gremlin.provider.GraphProviderFactory;
 import com.graphqueryengine.http.RouterServer;
 import com.graphqueryengine.http.RouterServer.RequestContext;
 import com.graphqueryengine.http.RouterServer.UploadedFile;
@@ -22,6 +20,7 @@ import com.graphqueryengine.query.factory.GraphQueryTranslatorFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.script.ScriptException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -29,8 +28,6 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.sql.Connection;
-import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,7 +35,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.BiConsumer;
-import javax.script.ScriptException;
 
 public class App {
     private static final Logger LOG = LoggerFactory.getLogger(App.class);
@@ -484,14 +480,6 @@ public class App {
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
-
-    private static void ensureDatabaseFileInitialized(DatabaseManager databaseManager, DatabaseConfig databaseConfig) {
-        try (Connection ignored = databaseManager.connection()) {
-            LOG.info("Database connection verified on startup");
-        } catch (SQLException ex) {
-            throw new IllegalStateException("Failed to initialize database: " + databaseConfig.url(), ex);
-        }
-    }
 
     private static void logGremlinWithSqlIfAvailable(String endpoint,
                                                      String gremlin,

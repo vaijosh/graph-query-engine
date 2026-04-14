@@ -21,13 +21,10 @@ public record QueryExplanation(
         String gremlin,
         String translatedSql,
         List<Object> parameters,
-        /** Always {@code "SQL"}. */
         String mode,
         String note,
         @JsonInclude(JsonInclude.Include.NON_NULL) QueryPlan plan,
-        /** Always {@code "SQL"}. Retained for API backward-compatibility. */
         @JsonInclude(JsonInclude.Include.NON_NULL) String executionEngine,
-        /** Null for non-hop queries; describes WCOJ optimisation path for hop queries. */
         @JsonInclude(JsonInclude.Include.NON_NULL) String executionStrategy
 ) {
     /** Backward-compatible constructor for existing call sites (no plan). */

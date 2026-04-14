@@ -117,10 +117,19 @@ public class SqlGraphProvider implements GraphProvider {
             catch (NumberFormatException ignored) { /* keep default */ }
         }
 
+        // TTL — default 30 s; set WCOJ_INDEX_TTL_SECONDS=0 to disable expiry.
+        long ttlSeconds = AdjacencyIndexRegistry.DEFAULT_TTL_SECONDS;
+        String ttlEnv = System.getenv("WCOJ_INDEX_TTL_SECONDS");
+        if (ttlEnv != null && !ttlEnv.isBlank()) {
+            try { ttlSeconds = Long.parseLong(ttlEnv.trim()); }
+            catch (NumberFormatException ignored) { /* keep default */ }
+        }
+
         AdjacencyIndexRegistry registry = new AdjacencyIndexRegistry(
-                maxEdgesInMemory, diskQuotaBytes, AdjacencyIndexRegistry.DEFAULT_CACHE_DIR);
+                maxEdgesInMemory, diskQuotaBytes, AdjacencyIndexRegistry.DEFAULT_CACHE_DIR, ttlSeconds);
         LOG.info("[WCOJ] Enabled — maxEdgesInMemory=" + maxEdgesInMemory
-                + " diskQuotaBytes=" + diskQuotaBytes);
+                + " diskQuotaBytes=" + diskQuotaBytes
+                + " indexTtlSeconds=" + ttlSeconds);
         return new WcojOptimiser(mappingStore, registry);
     }
 
@@ -266,19 +275,41 @@ public class SqlGraphProvider implements GraphProvider {
      *
      * <p>Priority:
      * <ol>
-     *   <li>Mapping-declared backend (first entry in {@code config.backends()}).</li>
+     *   <li>Mapping-declared backend keyed by {@link MappingConfig#defaultDatasource()}.</li>
+     *   <li>First entry in {@code config.backends()} (fallback when no defaultDatasource is set).</li>
      *   <li>BackendRegistry default (multi-backend mode).</li>
      *   <li>Fixed single {@link DatabaseManager} (single-backend mode).</li>
      * </ol>
+     *
+     * <p>When the resolved backend URL is a Trino URL ({@code jdbc:trino:}), the Iceberg
+     * warehouse optimizer is automatically activated by appending the following Trino session
+     * properties to the JDBC URL (if not already present):
+     * <ul>
+     *   <li>{@code sessionProperties.optimizer.join_reordering_strategy=AUTOMATIC}</li>
+     *   <li>{@code sessionProperties.optimizer.optimize_hash_generation=true}</li>
+     *   <li>{@code sessionProperties.iceberg.pushdown_filter_enabled=true}</li>
+     * </ul>
      */
     private DatabaseManager resolveManagerForConfig(MappingConfig config) {
         if (config != null && config.backends() != null && !config.backends().isEmpty()) {
-            BackendConnectionConfig bcc = config.backends().values().iterator().next();
-            if (bcc.url() != null && !bcc.url().isBlank()) {
-                return managerCache.computeIfAbsent(bcc.url(), url -> {
+            // Prefer the backend that matches defaultDatasource; fall back to first entry.
+            BackendConnectionConfig bcc = null;
+            String defaultDs = config.defaultDatasource();
+            if (defaultDs != null && !defaultDs.isBlank()) {
+                bcc = config.backends().get(defaultDs);
+            }
+            if (bcc == null) {
+                bcc = config.backends().values().iterator().next();
+            }
+
+            if (bcc != null && bcc.url() != null && !bcc.url().isBlank()) {
+                String resolvedUrl = applyIcebergWarehouseOptimizer(bcc.url());
+                final BackendConnectionConfig finalBcc = bcc;
+                return managerCache.computeIfAbsent(resolvedUrl, url -> {
                     LOG.info("[WCOJ] Using mapping backend connection: " + url);
                     return new DatabaseManager(
-                            new DatabaseConfig(bcc.url(), bcc.user(), bcc.password(), bcc.driverClass()));
+                            new DatabaseConfig(url, finalBcc.user(), finalBcc.password(),
+                                    finalBcc.driverClass()));
                 });
             }
         }
@@ -286,6 +317,43 @@ public class SqlGraphProvider implements GraphProvider {
             return backendRegistry.getManagerById(null); // → registry default
         }
         return databaseManager;
+    }
+
+    /**
+     * When {@code url} is a Trino JDBC URL, appends Trino session properties that
+     * activate the Iceberg connector's cost-based warehouse optimizer.  Returns the
+     * original URL unchanged for non-Trino backends.
+     *
+     * <p>The following session properties are injected (skipped if already present):
+     * <ul>
+     *   <li>{@code sessionProperties.optimizer.join_reordering_strategy=AUTOMATIC}</li>
+     *   <li>{@code sessionProperties.optimizer.optimize_hash_generation=true}</li>
+     *   <li>{@code sessionProperties.iceberg.pushdown_filter_enabled=true}</li>
+     * </ul>
+     */
+    static String applyIcebergWarehouseOptimizer(String url) {
+        if (url == null || !url.startsWith("jdbc:trino:")) {
+            return url;
+        }
+        // Trino JDBC uses "?" for the first parameter and "&" for subsequent ones.
+        String separator = url.contains("?") ? "&" : "?";
+        StringBuilder sb = new StringBuilder(url);
+        if (!url.contains("optimizer.join_reordering_strategy")) {
+            sb.append(separator).append("sessionProperties.optimizer.join_reordering_strategy=AUTOMATIC");
+            separator = "&";
+        }
+        if (!url.contains("optimizer.optimize_hash_generation")) {
+            sb.append(separator).append("sessionProperties.optimizer.optimize_hash_generation=true");
+            separator = "&";
+        }
+        if (!url.contains("iceberg.pushdown_filter_enabled")) {
+            sb.append(separator).append("sessionProperties.iceberg.pushdown_filter_enabled=true");
+        }
+        String result = sb.toString();
+        if (!result.equals(url)) {
+            LOG.info("[WCOJ] Iceberg warehouse optimizer session properties applied to Trino URL.");
+        }
+        return result;
     }
 
     /**

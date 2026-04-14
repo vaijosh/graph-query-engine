@@ -1,6 +1,6 @@
 # Graph Query Engine
 
-Accepts a graph mapping file and Gremlin traversal strings, translates supported traversals into SQL `SELECT` statements, and executes them through JDBC. Also supports native Gremlin execution via TinkerPop/TinkerGraph.
+Accepts a graph mapping file and Gremlin traversal strings, translates supported traversals into SQL `SELECT` statements, and executes them through JDBC. SQL is always the execution backend; WCOJ acceleration is built in and opt-out.
 
 ## Quick start
 
@@ -18,18 +18,18 @@ mvn test        # run all tests
 | `DB_USER` | `sa`                                         | Database user |
 | `DB_PASSWORD` | _(empty)_                                    | Database password |
 | `DB_DRIVER` | `org.h2.Driver`                              | JDBC driver class |
-| `GRAPH_PROVIDER` | `sql`                                        | Gremlin execution backend: `sql` (default), `wcoj` (faster multi-hop), `tinkergraph` (native) |
-| `WCOJ_MAX_EDGES` | `5000000`                                    | Max edges per table loaded into the WCOJ in-memory index (only when `GRAPH_PROVIDER=wcoj`) |
-| `TINKERGRAPH_LOCATION` | `./data/graph.gryo`                          | Path to persisted TinkerGraph data file (loaded on startup, saved after mutating Gremlin calls) |
+| `GRAPH_PROVIDER` | `sql`                                        | Always `sql`. WCOJ is an embedded optimiser; use `WCOJ_ENABLED=false` to disable it. |
+| `WCOJ_ENABLED` | `true`                                       | Enable/disable WCOJ Leapfrog optimiser (set `false` for pure SQL) |
+| `WCOJ_MAX_EDGES` | `5000000`                                    | Max edges per table kept in the WCOJ in-memory index before spilling to disk |
+| `WCOJ_DISK_QUOTA_MB` | `2048`                                       | Per-mapping disk quota for CSR index files (MB) |
+| `WCOJ_INDEX_TTL_SECONDS` | `30`                                         | Seconds before a cached WCOJ index is rebuilt from source (0 = disable TTL) |
 
 For a temporary in-memory SQL DB, set `DB_URL=jdbc:h2:mem:graph;DB_CLOSE_DELAY=-1`.
 
 Run with explicit persistence paths:
 
 ```bash
-DB_URL="jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE" \
-TINKERGRAPH_LOCATION="./data/graph.gryo" \
-mvn exec:java
+DB_URL="jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE" mvn exec:java
 ```
 
 ## Endpoints
@@ -262,7 +262,8 @@ For multi-hop path queries (e.g. 3-hop money trails in AML), standard SQL joins 
 from **intermediate result explosion** — joining Account→Transfer→Account for a 3-hop
 chain produces O(E²) intermediate rows before the final filter is applied.
 
-The `wcoj` provider replaces binary SQL joins with a
+The WCOJ optimiser is **embedded inside the `sql` provider** and enabled by default.
+It replaces binary SQL joins with a
 [Leapfrog Trie Join](https://arxiv.org/abs/1210.0481) algorithm that:
 
 - Loads edge tables into a **Compressed Sparse Row (CSR) in-memory index** on first use
@@ -271,10 +272,17 @@ The `wcoj` provider replaces binary SQL joins with a
 - Applies `simplePath()` cycle-exclusion as an O(depth) stack check (no HashSet)
 - **Automatically falls back to SQL** for aggregations, projections, ORDER BY, edge queries, and tables exceeding `WCOJ_MAX_EDGES`
 
-### Start with WCOJ
+### Enable / disable WCOJ
 
 ```bash
-GRAPH_PROVIDER=wcoj mvn exec:java
+# Default — WCOJ on, TTL=30 s
+mvn exec:java
+
+# Disable WCOJ entirely (pure SQL)
+WCOJ_ENABLED=false mvn exec:java
+
+# Force disk index for large edge tables
+WCOJ_MAX_EDGES=500000 mvn exec:java
 ```
 
 ### Performance comparison (5-hop chain, 80k accounts)

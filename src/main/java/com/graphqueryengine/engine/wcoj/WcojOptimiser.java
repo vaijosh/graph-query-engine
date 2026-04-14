@@ -37,7 +37,6 @@ import java.util.logging.Logger;
 /**
  * WCOJ (Worst-Case Optimal Join / Leapfrog Trie Join) optimiser for multi-hop
  * path traversals.
- *
  * This class encapsulates the WCOJ acceleration logic previously embedded in the
  * (now-removed) {@code WcojGraphProvider}.  It is now an <em>optional optimiser</em> called by
  * {@link com.graphqueryengine.gremlin.provider.SqlGraphProvider} before falling
@@ -85,10 +84,9 @@ public class WcojOptimiser {
      *
      * @return A {@link Result} wrapping the execution result, or {@code null} if the
      *         query is not eligible for WCOJ (caller should use SQL instead).
-     * @throws ScriptException if WCOJ was eligible but execution failed.
      */
     public Result tryExecute(String gremlin, MappingConfig config,
-                             DatabaseManager databaseManager) throws ScriptException {
+                             DatabaseManager databaseManager) {
         // 1. Parse
         ParsedTraversal parsed;
         try {

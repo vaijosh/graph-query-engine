@@ -75,7 +75,7 @@ Execute a Gremlin traversal within a transaction context.
 
 ### `GET /gremlin/provider`
 ```json
-{"provider":"tinkergraph"}
+{"provider":"sql"}
 ```
 
 ---
@@ -267,7 +267,7 @@ Delete a stored mapping. If the deleted mapping was active, the next available m
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `7000` | HTTP listen port |
-| `GRAPH_PROVIDER` | `tinkergraph` | Gremlin execution backend |
+| `GRAPH_PROVIDER` | `sql` | Always `sql`. WCOJ acceleration is opt-out via `WCOJ_ENABLED=false`. |
 | `SQL_TRACE` | `true` | Enable SQL trace logging globally |
 | `MAPPING_STORE_DIR` | `.mapping-store` | Directory for persisted mapping files |
 

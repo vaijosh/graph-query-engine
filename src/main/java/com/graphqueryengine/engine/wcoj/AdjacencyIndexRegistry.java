@@ -41,10 +41,18 @@ import java.util.logging.Logger;
  * registry logs a warning and returns {@code null} — the caller falls back to SQL
  * for that query (identical behaviour to the old size limit, but scoped per mapping).
  *
- * <h3>Configuration via system properties</h3>
+ * <h3>TTL-based expiry</h3>
+ * Each index entry carries a load timestamp. When {@code ttlSeconds > 0}, any cached
+ * entry older than {@code ttlSeconds} seconds is treated as stale: the in-memory index
+ * is invalidated and reloaded from JDBC, and the disk index is rebuilt.  Set
+ * {@code ttlSeconds = 0} to disable TTL (indices live until {@link #invalidateMapping}
+ * is called explicitly).
+ *
+ * <h3>Configuration via system properties / env-vars</h3>
  * <pre>
  *   wcoj.cache.dir          Root cache directory  (default: &lt;cwd&gt;/wcoj-index-cache)
  *   wcoj.disk.quota.mb      Per-mapping quota in MB  (default: 2048 = 2 GB)
+ *   WCOJ_INDEX_TTL_SECONDS  Index TTL in seconds     (default: 30; 0 = disabled)
  * </pre>
  */
 public class AdjacencyIndexRegistry {
@@ -60,6 +68,9 @@ public class AdjacencyIndexRegistry {
     /** Default per-mapping disk quota: 2 GB. */
     public static final long DEFAULT_DISK_QUOTA_BYTES = 2L * 1024 * 1024 * 1024;
 
+    /** Default index TTL: 30 seconds. */
+    public static final long DEFAULT_TTL_SECONDS = 30L;
+
     /** Root cache directory — one subdirectory per mapping ID is created below it. */
     public static final Path DEFAULT_CACHE_DIR = Path.of(
             System.getProperty("wcoj.cache.dir",
@@ -70,6 +81,11 @@ public class AdjacencyIndexRegistry {
     private final long maxEdgesInMemory;
     private final long diskQuotaBytesPerMapping;
     private final Path rootCacheDir;
+    /**
+     * How long (in seconds) a cached index is considered fresh.
+     * {@code 0} means no expiry — indices are permanent until manually invalidated.
+     */
+    private final long ttlSeconds;
 
     // ── Per-mapping state ──────────────────────────────────────────────────────
 
@@ -91,23 +107,44 @@ public class AdjacencyIndexRegistry {
     private final ConcurrentHashMap<String, AtomicLong>
             diskUsageBytes = new ConcurrentHashMap<>();
 
+    /**
+     * Last-loaded epoch-millis for in-memory indices: mappingId → (edgeKey → loadedAt).
+     */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>
+            memLoadTime = new ConcurrentHashMap<>();
+
+    /**
+     * Last-built epoch-millis for disk-backed indices: mappingId → (edgeKey → builtAt).
+     */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>
+            diskLoadTime = new ConcurrentHashMap<>();
+
     // ── Constructors ───────────────────────────────────────────────────────────
 
     public AdjacencyIndexRegistry() {
-        this(DEFAULT_MAX_EDGES_IN_MEMORY, DEFAULT_DISK_QUOTA_BYTES, DEFAULT_CACHE_DIR);
+        this(DEFAULT_MAX_EDGES_IN_MEMORY, DEFAULT_DISK_QUOTA_BYTES, DEFAULT_CACHE_DIR, DEFAULT_TTL_SECONDS);
     }
 
     public AdjacencyIndexRegistry(long maxEdgesInMemory,
                                    long diskQuotaBytesPerMapping,
                                    Path rootCacheDir) {
-        this.maxEdgesInMemory       = maxEdgesInMemory;
+        this(maxEdgesInMemory, diskQuotaBytesPerMapping, rootCacheDir, DEFAULT_TTL_SECONDS);
+    }
+
+    public AdjacencyIndexRegistry(long maxEdgesInMemory,
+                                   long diskQuotaBytesPerMapping,
+                                   Path rootCacheDir,
+                                   long ttlSeconds) {
+        this.maxEdgesInMemory        = maxEdgesInMemory;
         this.diskQuotaBytesPerMapping = diskQuotaBytesPerMapping;
-        this.rootCacheDir           = rootCacheDir;
+        this.rootCacheDir            = rootCacheDir;
+        this.ttlSeconds              = ttlSeconds;
         LOG.info(String.format(
-                "[WCOJ] Registry configured — memLimit=%,d edges  diskQuota=%s/mapping  cacheDir=%s",
+                "[WCOJ] Registry configured — memLimit=%,d edges  diskQuota=%s/mapping  cacheDir=%s  ttl=%ds",
                 maxEdgesInMemory,
                 DiskBackedAdjacencyIndex.humanBytes(diskQuotaBytesPerMapping),
-                rootCacheDir));
+                rootCacheDir,
+                ttlSeconds));
     }
 
     // ── Main API ───────────────────────────────────────────────────────────────
@@ -120,6 +157,10 @@ public class AdjacencyIndexRegistry {
      *   <li>If larger and within disk quota → disk-backed CSR index.</li>
      *   <li>If larger and over disk quota → returns {@code null}; caller falls back to SQL.</li>
      * </ul>
+     *
+     * <p>If a TTL is configured and the cached entry is older than {@code ttlSeconds} seconds,
+     * the entry is treated as stale: in-memory indices are reloaded from JDBC and disk
+     * indices are rebuilt before being returned.
      *
      * @param conn       JDBC connection for loading (read-only).
      * @param config     Active mapping configuration.
@@ -140,8 +181,18 @@ public class AdjacencyIndexRegistry {
         // ── Tier 1: check in-memory cache ─────────────────────────────────────
         ConcurrentHashMap<String, AdjacencyIndex> mMap =
                 memCache.computeIfAbsent(mappingId, k -> new ConcurrentHashMap<>());
+        ConcurrentHashMap<String, Long> mTimes =
+                memLoadTime.computeIfAbsent(mappingId, k -> new ConcurrentHashMap<>());
+
         AdjacencyIndex mem = mMap.get(edgeKey);
-        if (mem != null && mem.isLoaded()) return mem;
+        if (mem != null && mem.isLoaded()) {
+            if (isFresh(mTimes.get(edgeKey))) {
+                return mem;  // still fresh
+            }
+            LOG.info(String.format("[WCOJ] TTL expired for in-memory index '%s' (mapping='%s') — reloading.",
+                    edgeKey, mappingId));
+            mem.invalidate();
+        }
 
         // ── Check row count to decide tier ────────────────────────────────────
         long rowCount = countRows(conn, em.table());
@@ -150,9 +201,12 @@ public class AdjacencyIndexRegistry {
             // Load into heap
             AdjacencyIndex idx = mMap.computeIfAbsent(edgeKey,
                     k -> new AdjacencyIndex(em.table(), em.outColumn(), em.inColumn()));
-            if (!idx.isLoaded()) {
-                LOG.info(String.format("[WCOJ] Loading %s into memory (%,d rows)", em.table(), rowCount));
-                idx.load(conn);
+            synchronized (idx) {
+                if (!idx.isLoaded()) {
+                    LOG.info(String.format("[WCOJ] Loading %s into memory (%,d rows)", em.table(), rowCount));
+                    idx.load(conn);
+                    mTimes.put(edgeKey, System.currentTimeMillis());
+                }
             }
             return idx;
         }
@@ -164,6 +218,8 @@ public class AdjacencyIndexRegistry {
 
         ConcurrentHashMap<String, DiskBackedAdjacencyIndex> dMap =
                 diskCache.computeIfAbsent(mappingId, k -> new ConcurrentHashMap<>());
+        ConcurrentHashMap<String, Long> dTimes =
+                diskLoadTime.computeIfAbsent(mappingId, k -> new ConcurrentHashMap<>());
 
         // Compute required bytes for this index (estimate: 2 files × edgeCount × 8 B
         // + vertex table overhead — the actual build will be accurate)
@@ -172,7 +228,18 @@ public class AdjacencyIndexRegistry {
         AtomicLong usage = diskUsageBytes.computeIfAbsent(mappingId, k -> new AtomicLong(0L));
 
         DiskBackedAdjacencyIndex disk = dMap.get(edgeKey);
-        if (disk != null && disk.isBuilt()) return disk;
+        if (disk != null && disk.isBuilt()) {
+            if (isFresh(dTimes.get(edgeKey))) {
+                return disk;  // still fresh
+            }
+            LOG.info(String.format("[WCOJ] TTL expired for disk index '%s' (mapping='%s') — rebuilding.",
+                    edgeKey, mappingId));
+            try { disk.delete(); } catch (IOException ignored) {}
+            dMap.remove(edgeKey);
+            dTimes.remove(edgeKey);
+            usage.addAndGet(-estimatedBytes); // reclaim estimated quota so rebuild is allowed
+            disk = null;
+        }
 
         // Enforce quota for new builds
         if (disk == null) {
@@ -206,6 +273,7 @@ public class AdjacencyIndexRegistry {
                 long written = newIdx.buildIfAbsent(conn);
                 if (written > 0) {
                     long newTotal = usage.addAndGet(written);
+                    dTimes.put(edgeKey, System.currentTimeMillis());
                     LOG.info(String.format(
                             "[WCOJ-Disk] Mapping '%s' disk usage: %s / %s",
                             mappingId,
@@ -239,11 +307,13 @@ public class AdjacencyIndexRegistry {
     public void invalidateMapping(String mappingId) {
         ConcurrentHashMap<String, AdjacencyIndex> mMap = memCache.remove(mappingId);
         if (mMap != null) mMap.values().forEach(AdjacencyIndex::invalidate);
+        memLoadTime.remove(mappingId);
 
         ConcurrentHashMap<String, DiskBackedAdjacencyIndex> dMap = diskCache.remove(mappingId);
         if (dMap != null) {
             dMap.values().forEach(d -> { try { d.delete(); } catch (IOException ignored) {} });
         }
+        diskLoadTime.remove(mappingId);
 
         diskUsageBytes.remove(mappingId);
         LOG.info("[WCOJ] Invalidated all indices for mapping: " + mappingId);
@@ -271,7 +341,21 @@ public class AdjacencyIndexRegistry {
     @SuppressWarnings("unused")
     public long diskQuotaBytesPerMapping() { return diskQuotaBytesPerMapping; }
 
+    /** Returns the configured TTL in seconds (0 = disabled). */
+    @SuppressWarnings("unused")
+    public long ttlSeconds() { return ttlSeconds; }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Returns {@code true} if the entry loaded at {@code loadedAtMillis} is still within
+     * the configured TTL window.  Always returns {@code true} when TTL is disabled
+     * ({@code ttlSeconds == 0}) or when {@code loadedAtMillis} is {@code null}.
+     */
+    private boolean isFresh(Long loadedAtMillis) {
+        if (ttlSeconds <= 0 || loadedAtMillis == null) return true;
+        return (System.currentTimeMillis() - loadedAtMillis) <= ttlSeconds * 1000L;
+    }
 
     private static long countRows(Connection conn, String table) throws SQLException {
         try (var ps = conn.prepareStatement(SqlKeyword.SELECT_COUNT + table);
