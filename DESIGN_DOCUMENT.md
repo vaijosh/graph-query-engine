@@ -4,7 +4,7 @@
 
 The Graph Query Engine provides two complementary capabilities:
 
-1. **Native Gremlin execution** via a graph provider (`/gremlin/query`, `/gremlin/query/tx`)
+1. **Native Gremlin execution** via a graph provider (`/gremlin/query`)
 2. **Gremlin-to-SQL translation** for explain/reference (`/query/explain`)
 
 The service is designed for a mapping-driven model where vertex/edge labels are mapped to relational tables and columns.
@@ -30,8 +30,7 @@ This document describes the current implementation in `src/main/java/com/graphqu
 │  ┌────────────────┐  ┌────────────────────────┐  ┌───────────────────────────────────┐ │
 │  │ GET /health    │  │  Mapping Endpoints     │  │  Gremlin / Query Endpoints        │ │
 │  │                │  │  POST /mapping/upload  │  │  POST /gremlin/query   (execute)  │ │
-│  │                │  │  GET  /mapping         │  │  POST /gremlin/query/tx  (tx)     │ │
-│  │                │  │  GET  /mappings        │  │  GET  /gremlin/provider           │ │
+│  │                │  │  GET  /mapping         │  │  GET  /gremlin/provider           │ │
 │  │                │  │  POST /mapping/active  │  │  POST /query/explain  (SQL)       │ │
 │  │                │  │  DELETE /mapping       │  │  POST /query  ─► 307 redirect     │ │
 │  │                │  │  GET  /mapping/status  │  │                                   │ │
@@ -265,7 +264,6 @@ Implemented in `App`.
 - `GET /health`
 - `POST /query/explain` - SQL translation only
 - `POST /gremlin/query` - native execution
-- `POST /gremlin/query/tx` - transactional execution mode wrapper
 - `GET /gremlin/provider`
 
 ### Mapping Management
@@ -705,7 +703,6 @@ When enabled and a mapping exists, SQL translation logs are emitted for:
 
 - `/query/explain`
 - `/gremlin/query`
-- `/gremlin/query/tx`
 
 If a traversal is unsupported by SQL translator, native execution still proceeds; SQL trace logs note unavailability.
 

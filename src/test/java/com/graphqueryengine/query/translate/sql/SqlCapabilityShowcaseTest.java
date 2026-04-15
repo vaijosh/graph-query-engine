@@ -271,7 +271,7 @@ class SqlCapabilityShowcaseTest {
         );
 
         String sql = result.sql();
-        assertTrue(sql.contains("EXISTS"));
+        assertTrue(sql.contains("IN (SELECT"));
         assertTrue(sql.contains("aml_transfers"));
         assertTrue(sql.contains("LIMIT 10"));
     }
@@ -285,7 +285,7 @@ class SqlCapabilityShowcaseTest {
 
         String sql = result.sql();
         assertTrue(sql.contains("NOT"));
-        assertTrue(sql.contains("EXISTS"));
+        assertTrue(sql.contains("NOT IN (SELECT"));
         assertTrue(sql.contains("aml_account_alert"));
     }
 
@@ -298,7 +298,7 @@ class SqlCapabilityShowcaseTest {
 
         String sql = result.sql();
         assertTrue(sql.contains("AND"));
-        assertTrue(sql.contains("EXISTS"));
+        assertTrue(sql.contains("IN (SELECT"));
         assertTrue(sql.contains("COUNT(*)"));
         assertTrue(sql.contains("LIMIT 10"));
     }
@@ -311,7 +311,7 @@ class SqlCapabilityShowcaseTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\" FROM aml_accounts v WHERE ((EXISTS (SELECT 1 FROM aml_transfers we WHERE we.from_account_id = v.id AND we.is_laundering = ?)) AND ((SELECT COUNT(*) FROM aml_account_alert we WHERE we.account_id = v.id) = ?)) LIMIT 10",
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\" FROM aml_accounts v WHERE ((v.id IN (SELECT from_account_id FROM aml_transfers WHERE is_laundering = ?)) AND ((SELECT COUNT(*) FROM aml_account_alert we WHERE we.account_id = v.id) = ?)) LIMIT 10",
                 result.sql()
         );
         assertEquals(List.of("1", "0"), result.parameters());
@@ -325,7 +325,14 @@ class SqlCapabilityShowcaseTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", v.risk_score AS \"riskScore\", (SELECT COUNT(*) FROM aml_transfers WHERE from_account_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE from_account_id = v.id) AS \"totalOut\" FROM aml_accounts v WHERE ((EXISTS (SELECT 1 FROM aml_transfers we WHERE we.from_account_id = v.id AND we.is_laundering = ?)) AND ((SELECT COUNT(*) FROM aml_account_alert we WHERE we.account_id = v.id) = ?)) ORDER BY \"suspiciousOut\" DESC LIMIT 20",
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", v.risk_score AS \"riskScore\", " +
+                "COALESCE(_deg0._cnt, 0) AS \"suspiciousOut\", COALESCE(_deg1._cnt, 0) AS \"totalOut\" " +
+                "FROM aml_accounts v " +
+                "LEFT JOIN (SELECT from_account_id AS _id, COUNT(*) AS _cnt FROM aml_transfers WHERE is_laundering = '1' GROUP BY from_account_id LIMIT 2147483647) _deg0 ON _deg0._id = v.id " +
+                "LEFT JOIN (SELECT from_account_id AS _id, COUNT(*) AS _cnt FROM aml_transfers GROUP BY from_account_id LIMIT 2147483647) _deg1 ON _deg1._id = v.id " +
+                "WHERE ((v.id IN (SELECT from_account_id FROM aml_transfers WHERE is_laundering = ?)) " +
+                "AND ((SELECT COUNT(*) FROM aml_account_alert we WHERE we.account_id = v.id) = ?)) " +
+                "ORDER BY \"suspiciousOut\" DESC LIMIT 20",
                 result.sql()
         );
         assertEquals(List.of("1", "0"), result.parameters());

@@ -30,10 +30,6 @@ curl -X POST http://localhost:7000/gremlin/query \
   -H "Content-Type: application/json" \
   -d '{"gremlin":"g.V(1).repeat(out()).times(10).values(\"name\")"}'
 
-# Transactional execution
-curl -X POST http://localhost:7000/gremlin/query/tx \
-  -H "Content-Type: application/json" \
-  -d '{"gremlin":"g.V(1).values(\"name\")"}'
 
 # SQL explain
 curl -X POST http://localhost:7000/admin/seed-10hop

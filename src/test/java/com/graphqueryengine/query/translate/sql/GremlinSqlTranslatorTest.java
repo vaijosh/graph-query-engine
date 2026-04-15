@@ -195,7 +195,10 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"outDegree\" FROM aml_accounts v ORDER BY \"outDegree\" DESC LIMIT 15",
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", COALESCE(_deg0._cnt, 0) AS \"outDegree\" " +
+                "FROM aml_accounts v " +
+                "LEFT JOIN (SELECT out_id AS _id, COUNT(*) AS _cnt FROM aml_transfers GROUP BY out_id LIMIT 2147483647) _deg0 ON _deg0._id = v.id " +
+                "ORDER BY \"outDegree\" DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -211,7 +214,10 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT v.account_id AS \"accountId\", (SELECT COUNT(*) FROM aml_transfers WHERE in_id = v.id) AS \"inDegree\" FROM aml_accounts v ORDER BY \"inDegree\" DESC LIMIT 10",
+                "SELECT v.account_id AS \"accountId\", COALESCE(_deg0._cnt, 0) AS \"inDegree\" " +
+                "FROM aml_accounts v " +
+                "LEFT JOIN (SELECT in_id AS _id, COUNT(*) AS _cnt FROM aml_transfers GROUP BY in_id LIMIT 2147483647) _deg0 ON _deg0._id = v.id " +
+                "ORDER BY \"inDegree\" DESC LIMIT 10",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -256,9 +262,11 @@ class GremlinSqlTranslatorTest {
 
         assertEquals(
                 "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", " +
-                "(SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", " +
-                "(SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" " +
-                "FROM aml_accounts v ORDER BY \"suspiciousOut\" DESC LIMIT 15",
+                "COALESCE(_deg0._cnt, 0) AS \"suspiciousOut\", COALESCE(_deg1._cnt, 0) AS \"totalOut\" " +
+                "FROM aml_accounts v " +
+                "LEFT JOIN (SELECT out_id AS _id, COUNT(*) AS _cnt FROM aml_transfers WHERE is_laundering = '1' GROUP BY out_id LIMIT 2147483647) _deg0 ON _deg0._id = v.id " +
+                "LEFT JOIN (SELECT out_id AS _id, COUNT(*) AS _cnt FROM aml_transfers GROUP BY out_id LIMIT 2147483647) _deg1 ON _deg1._id = v.id " +
+                "ORDER BY \"suspiciousOut\" DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -306,7 +314,13 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "SELECT * FROM (SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id AND is_laundering = '1') AS \"suspiciousOut\", (SELECT COUNT(*) FROM aml_transfers WHERE out_id = v.id) AS \"totalOut\" FROM aml_accounts v) p WHERE p.\"suspiciousOut\" > 0 ORDER BY \"suspiciousOut\" DESC LIMIT 15",
+                "SELECT * FROM (" +
+                "SELECT v.account_id AS \"accountId\", v.bank_id AS \"bankId\", " +
+                "COALESCE(_deg0._cnt, 0) AS \"suspiciousOut\", COALESCE(_deg1._cnt, 0) AS \"totalOut\" " +
+                "FROM aml_accounts v " +
+                "LEFT JOIN (SELECT out_id AS _id, COUNT(*) AS _cnt FROM aml_transfers WHERE is_laundering = '1' GROUP BY out_id LIMIT 2147483647) _deg0 ON _deg0._id = v.id " +
+                "LEFT JOIN (SELECT out_id AS _id, COUNT(*) AS _cnt FROM aml_transfers GROUP BY out_id LIMIT 2147483647) _deg1 ON _deg1._id = v.id" +
+                ") p WHERE p.\"suspiciousOut\" > 0 ORDER BY \"suspiciousOut\" DESC LIMIT 15",
                 result.sql()
         );
         assertTrue(result.parameters().isEmpty());
@@ -465,7 +479,7 @@ class GremlinSqlTranslatorTest {
         );
 
         assertEquals(
-                "WITH _start AS (SELECT * FROM aml_accounts WHERE EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = id AND we.is_laundering = ?) LIMIT 1) SELECT COUNT(DISTINCT v2.id) AS count FROM _start v0 JOIN aml_transfers e1 ON e1.out_id = v0.id JOIN aml_accounts v1 ON v1.id = e1.in_id JOIN aml_transfers e2 ON e2.out_id = v1.id JOIN aml_accounts v2 ON v2.id = e2.in_id",
+                "WITH _start AS (SELECT * FROM aml_accounts WHERE id IN (SELECT out_id FROM aml_transfers WHERE is_laundering = ?) LIMIT 1) SELECT COUNT(DISTINCT v2.id) AS count FROM _start v0 JOIN aml_transfers e1 ON e1.out_id = v0.id JOIN aml_accounts v1 ON v1.id = e1.in_id JOIN aml_transfers e2 ON e2.out_id = v1.id JOIN aml_accounts v2 ON v2.id = e2.in_id",
                 result.sql()
         );
         assertEquals(List.of("1"), result.parameters());
@@ -830,7 +844,7 @@ class GremlinSqlTranslatorTest {
         String sql = result.sql();
         assertTrue(sql.contains("UNION"), "both() generates UNION");
         // v0 subquery must contain the where clause and LIMIT 1
-        assertTrue(sql.contains("EXISTS"), "where(outE) → EXISTS in subquery");
+        assertTrue(sql.contains("IN (SELECT out_id FROM aml_transfers WHERE is_laundering = ?)"), "where(outE) → IN (SELECT …) semi-join");
         assertTrue(sql.contains("LIMIT 1"), "preHopLimit inside subquery");
         // Project columns from the final vertex alias
         assertTrue(sql.contains("account_id AS \"accountId\""), "accountId projected");
@@ -1031,8 +1045,8 @@ class GremlinSqlTranslatorTest {
         );
 
         assertTrue(result.sql().contains("WHERE ("));
-        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = v.id AND we.is_laundering = ?)"));
-        assertTrue(result.sql().contains("EXISTS (SELECT 1 FROM aml_transfers we WHERE we.in_id = v.id AND we.currency = ?)"));
+        assertTrue(result.sql().contains("v.id IN (SELECT out_id FROM aml_transfers WHERE is_laundering = ?)"));
+        assertTrue(result.sql().contains("v.id IN (SELECT in_id FROM aml_transfers WHERE currency = ?)"));
         assertEquals(List.of("1", "USD"), result.parameters());
     }
 
@@ -1046,8 +1060,8 @@ class GremlinSqlTranslatorTest {
         );
 
         assertTrue(result.sql().contains(" OR "));
-        assertTrue(result.sql().contains("we.is_laundering = ?"));
-        assertTrue(result.sql().contains("we.currency = ?"));
+        assertTrue(result.sql().contains("out_id FROM aml_transfers WHERE is_laundering = ?"));
+        assertTrue(result.sql().contains("in_id FROM aml_transfers WHERE currency = ?"));
         assertEquals(List.of("1", "USD"), result.parameters());
     }
 
@@ -1060,7 +1074,7 @@ class GremlinSqlTranslatorTest {
                 mapping
         );
 
-        assertTrue(result.sql().contains("WHERE NOT (EXISTS (SELECT 1 FROM aml_transfers we WHERE we.out_id = v.id AND we.is_laundering = ?))"));
+        assertTrue(result.sql().contains("WHERE v.id NOT IN (SELECT out_id FROM aml_transfers WHERE is_laundering = ?)"));
         assertEquals(List.of("1"), result.parameters());
     }
 

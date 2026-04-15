@@ -205,6 +205,123 @@ class IcebergDiagTest {
         assertTrue(r.sql().contains("aml.transfers"), "SQL must reference transfers for TRANSFER");
     }
 
+    // ── Degree subquery tests ─────────────────────────────────────────────────
+
+    /**
+     * Regression: 6g by(outE/inE.count()) — degree subqueries.
+     * <p>Trino rejects {@code LIMIT} inside a derived-table subquery used in a
+     * {@code FROM}/{@code JOIN} clause with "Schema must be specified when session
+     * schema is not set".  The Iceberg dialect must omit the {@code LIMIT} that H2
+     * needs to prevent correlated re-scanning.
+     */
+    @Test
+    void degreeSubqueryOmitsLimitForIceberg() {
+        TranslationResult r = translator.translate(
+                "g.V().hasLabel('Account')" +
+                ".project('accountId','outDegree','inDegree')" +
+                ".by('accountId').by(outE('TRANSFER').count()).by(inE('TRANSFER').count())" +
+                ".order().by(select('outDegree'), Order.desc).limit(10)",
+                m());
+        System.out.println("Iceberg degree SQL: " + r.sql());
+
+        // Must contain the pre-aggregated LEFT JOIN
+        assertTrue(r.sql().contains("LEFT JOIN"), "SQL must use pre-aggregated LEFT JOIN");
+        assertTrue(r.sql().contains("GROUP BY"), "SQL must contain GROUP BY for degree aggregate");
+
+        // Must NOT contain LIMIT inside the derived table (Trino rejects it)
+        // The outer LIMIT 10 is fine — only the inner subquery LIMIT must be absent.
+        // Strategy: find the substring after "GROUP BY out_id" and before the closing ")"
+        int groupByIdx = r.sql().indexOf("GROUP BY");
+        assertTrue(groupByIdx >= 0, "GROUP BY not found");
+        int closingParen = r.sql().indexOf(")", groupByIdx);
+        assertTrue(closingParen >= 0, "Closing paren after GROUP BY not found");
+        String insideDerivedTable = r.sql().substring(groupByIdx, closingParen);
+        assertFalse(insideDerivedTable.contains("LIMIT"),
+                "Iceberg derived-table subquery must NOT contain LIMIT, but got: " + insideDerivedTable);
+    }
+
+    /**
+     * H2 dialect must still include {@code LIMIT 2147483647} inside the derived table
+     * to prevent correlated re-scanning.
+     */
+    @Test
+    void degreeSubqueryIncludesLimitForH2() {
+        GremlinSqlTranslator h2 = new GremlinSqlTranslator(); // StandardSqlDialect
+        TranslationResult r = h2.translate(
+                "g.V().hasLabel('Account')" +
+                ".project('accountId','outDegree','inDegree')" +
+                ".by('accountId').by(outE('TRANSFER').count()).by(inE('TRANSFER').count())" +
+                ".order().by(select('outDegree'), Order.desc).limit(10)",
+                m());
+        System.out.println("H2 degree SQL: " + r.sql());
+
+        int groupByIdx = r.sql().indexOf("GROUP BY");
+        assertTrue(groupByIdx >= 0);
+        int closingParen = r.sql().indexOf(")", groupByIdx);
+        assertTrue(closingParen >= 0);
+        String insideDerivedTable = r.sql().substring(groupByIdx, closingParen);
+        assertTrue(insideDerivedTable.contains("LIMIT"),
+                "H2 derived-table subquery MUST contain LIMIT to prevent correlated scan, but got: " + insideDerivedTable);
+    }
+
+    // ── choose() + order().by() combined ─────────────────────────────────────
+
+    /**
+     * 6h: choose(values(p).is(gte(v)), constant(x), constant(y)) + order().by(p)
+     * Verifies that CASE WHEN and ORDER BY are both correctly emitted for Iceberg,
+     * and that the derived-table LIMIT is absent (Trino rejects it).
+     */
+    @Test
+    void chooseProjectionWithOrderBy() {
+        TranslationResult r = translator.translate(
+                "g.V().hasLabel('Account')" +
+                ".project('accountId','riskBucket')" +
+                ".by('accountId')" +
+                ".by(choose(values('riskScore').is(gte(0.7)), constant('HIGH'), constant('NORMAL')))" +
+                ".order().by('accountId').limit(15)",
+                m());
+        System.out.println("6h choose+order SQL: " + r.sql());
+
+        assertTrue(r.sql().contains("CASE WHEN"),  "SQL must contain CASE WHEN for choose()");
+        assertTrue(r.sql().contains("'HIGH'"),      "SQL must contain 'HIGH' constant");
+        assertTrue(r.sql().contains("'NORMAL'"),    "SQL must contain 'NORMAL' constant");
+        assertTrue(r.sql().contains(">= 0.7"),      "SQL must use >= threshold 0.7");
+        assertTrue(r.sql().contains("ORDER BY"),    "SQL must contain ORDER BY for deterministic results");
+        // ORDER BY must use the fully-qualified column (v.account_id), NOT the quoted alias ("accountId").
+        // In Trino, ORDER BY "accountId" resolves as a case-sensitive column-name lookup against the
+        // underlying table — which has account_id, not accountId — so ordering is silently skipped.
+        // Using v.account_id ensures Trino sorts the results correctly.
+        assertTrue(r.sql().contains("ORDER BY v.account_id"),
+                "ORDER BY must use qualified column v.account_id, not alias. Got: " + r.sql());
+        assertFalse(r.sql().contains("ORDER BY \"accountId\""),
+                "ORDER BY must NOT use the quoted alias \"accountId\" for Iceberg. Got: " + r.sql());
+        assertFalse(r.sql().contains("LIMIT 2147483647"),
+                "Iceberg must not emit inner LIMIT 2147483647. Got: " + r.sql());
+        assertTrue(r.parameters().isEmpty(),        "choose() with constants uses no bind params");
+    }
+
+    /**
+     * H2 variant: choose() + order().by(vertexProp) must also use the fully-qualified
+     * column (v.account_id) rather than the quoted alias. H2 handles both forms, but
+     * consistency with Iceberg is required to avoid dialect-specific surprises.
+     */
+    @Test
+    void chooseProjectionWithOrderByH2() {
+        GremlinSqlTranslator h2 = new GremlinSqlTranslator(); // StandardSqlDialect
+        TranslationResult r = h2.translate(
+                "g.V().hasLabel('Account')" +
+                ".project('accountId','riskBucket')" +
+                ".by('accountId')" +
+                ".by(choose(values('riskScore').is(gte(0.7)), constant('HIGH'), constant('NORMAL')))" +
+                ".order().by('accountId').limit(15)",
+                m());
+        System.out.println("H2 6h choose+order SQL: " + r.sql());
+
+        assertTrue(r.sql().contains("CASE WHEN"),  "H2: must contain CASE WHEN");
+        assertTrue(r.sql().contains("ORDER BY v.account_id"),
+                "H2: ORDER BY must use qualified column v.account_id. Got: " + r.sql());
+    }
+
     // ── Existing render tests ──────────────────────────────────────────────────
 
     @Test

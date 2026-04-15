@@ -79,13 +79,19 @@ echo    "║  Edges   : 100,000 TRANSFER edges                              ║"
 echo -e "╚════════════════════════════════════════════════════════════════╝${NC}"
 
 # ── 0. Health ─────────────────────────────────────────────────────────────────
-section "Step 0: Health & Provider Check"
+section "Step 0: Health Check"
 endpoint "GET /health"
 HEALTH=$(curl -s "$BASE_URL/health")
-output; echo "  $HEALTH"
-PROVIDER=$(curl -s "$BASE_URL/gremlin/provider" | python3 -c "import sys,json; print(json.load(sys.stdin).get('provider','?'))")
-echo "  Active provider: $PROVIDER"
-ok "Service is healthy – provider: $PROVIDER"
+output; echo "$HEALTH" | python3 -c "
+import sys, json
+d=json.load(sys.stdin)
+print(f'  status   : {d.get(\"status\",\"?\")}')
+print(f'  provider : {d.get(\"provider\",\"?\")}')
+backends = d.get('backends', [])
+if backends:
+    print(f'  backends : {[b[\"id\"] for b in backends]}')
+"
+ok "Service is healthy"
 
 pause
 

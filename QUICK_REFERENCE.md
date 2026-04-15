@@ -19,7 +19,7 @@ mvn exec:java
 
 # Terminal 2: Start Jupyter
 cd /Users/vjoshi/SourceCode/GraphQueryEngine
-jupyter notebook aml_demo_queries.ipynb
+jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb
 ```
 
 **Browser automatically opens** → Run cells top-to-bottom
@@ -35,7 +35,7 @@ jupyter notebook aml_demo_queries.ipynb
 | **Start service (Maven)** | `mvn exec:java` |
 | **Load CSV (Python)** | `python3 demo/aml_csv_loader.py` |
 | **Normalize CSV** | `python3 scripts/normalize_aml.py` |
-| **Launch notebook** | `jupyter notebook aml_demo_queries.ipynb` |
+| **Launch notebook** | `jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb` |
 | **Run all cells** | In notebook: Kernel → Restart & Run All |
 | **Run single cell** | Click cell + press Shift+Enter |
 | **Stop service** | Ctrl+C in service terminal |
@@ -75,16 +75,16 @@ display_query_result(gremlin, result, title="Total Accounts")
 ## Simple Query Reference (S1-S8)
 
 ```groovy
-# S1: Total accounts
+// S1: Total accounts
 g.V().count()
 
-# S2: Total transfers
+// S2: Total transfers
 g.E().count()
 
-# S3: Suspicious count
+// S3: Suspicious count
 g.E().has('isLaundering','1').count()
 
-# S4: Suspicious details
+// S4: Suspicious details
 g.E().has('isLaundering','1')
   .project('from','to','amount','currency','timestamp')
   .by(outV().values('accountId'))
@@ -93,16 +93,16 @@ g.E().has('isLaundering','1')
   .by('currency')
   .by('eventTime')
 
-# S5: Currency distribution
+// S5: Currency distribution
 g.E().groupCount().by('currency')
 
-# S6: Format distribution
+// S6: Format distribution
 g.E().groupCount().by('paymentFormat')
 
-# S7: Suspicious by currency
+// S7: Suspicious by currency
 g.E().has('isLaundering','1').groupCount().by('currency')
 
-# S8: Suspicious by format
+// S8: Suspicious by format
 g.E().has('isLaundering','1').groupCount().by('paymentFormat')
 ```
 
@@ -111,7 +111,7 @@ g.E().has('isLaundering','1').groupCount().by('paymentFormat')
 ## Complex Query Reference (C1-C11)
 
 ```groovy
-# C1: Top hub accounts
+// C1: Top hub accounts
 g.V().project('accountId','bankId','outDegree')
   .by('accountId')
   .by('bankId')
@@ -119,7 +119,7 @@ g.V().project('accountId','bankId','outDegree')
   .order().by(select('outDegree'),Order.desc)
   .limit(15)
 
-# C2: Suspicious hubs
+// C2: Suspicious hubs
 g.V().project('accountId','bankId','suspiciousOut','totalOut')
   .by('accountId')
   .by('bankId')
@@ -129,7 +129,7 @@ g.V().project('accountId','bankId','suspiciousOut','totalOut')
   .order().by(select('suspiciousOut'),Order.desc)
   .limit(15)
 
-# C3: Cross-bank suspicious flow
+// C3: Cross-bank suspicious flow
 g.E().has('isLaundering','1').as('e')
   .project('fromBank','fromAcct','toBank','toAcct','amount')
   .by(outV().values('bankId'))
@@ -139,14 +139,14 @@ g.E().has('isLaundering','1').as('e')
   .by('amount')
   .limit(15)
 
-# C4: 2-hop suspicious chains
+// C4: 2-hop suspicious chains
 g.E().has('isLaundering','1').outV().as('a')
   .outE('TRANSFER').has('isLaundering','1').inV().as('b')
   .where('a',neq('b'))
   .select('a','b').by('accountId')
   .limit(20)
 
-# C5: 1-hop neighbor network
+// C5: 1-hop neighbor network
 g.V().where(outE('TRANSFER').has('isLaundering','1'))
   .limit(1).as('hub')
   .both('TRANSFER').dedup()
@@ -155,37 +155,37 @@ g.V().where(outE('TRANSFER').has('isLaundering','1'))
   .by('bankId')
   .limit(20)
 
-# C6: 3-hop paths
+// C6: 3-hop paths
 g.V().where(outE('TRANSFER').has('isLaundering','1'))
   .limit(1)
   .repeat(out('TRANSFER').simplePath()).times(3)
   .path().by('accountId')
   .limit(20)
 
-# C7: 5-hop paths
+// C7: 5-hop paths
 g.V().where(outE('TRANSFER').has('isLaundering','1'))
   .limit(1)
   .repeat(out('TRANSFER').simplePath()).times(5)
   .path().by('accountId')
   .limit(10)
 
-# C8: 10-hop investigation range
+// C8: 10-hop investigation range
 g.V().where(outE('TRANSFER').has('isLaundering','1'))
   .limit(1)
   .repeat(out('TRANSFER').simplePath()).times(10)
   .path().by('accountId')
   .limit(5)
 
-# C9: 2-hop reachability
+// C9: 2-hop reachability
 g.V().where(outE('TRANSFER').has('isLaundering','1'))
   .limit(1)
   .repeat(out('TRANSFER')).times(2)
   .dedup().count()
 
-# C10: Transactional (uses tx_mode=True)
+// C10: Suspicious count
 g.E().has('isLaundering','1').count()
 
-# C11: SQL explain (optional)
+// C11: SQL explain (optional)
 g.V(1).hasLabel("Node").repeat(out("LINK")).times(3)
 ```
 
@@ -207,16 +207,15 @@ g.V(1).hasLabel("Node").repeat(out("LINK")).times(3)
 
 ```
 /Users/vjoshi/SourceCode/GraphQueryEngine/
-├── aml_demo_queries.ipynb          ← Main notebook
-├── aml_demo.ipynb                  ← Data prep
-├── JUPYTER_NOTEBOOK_GUIDE.md       ← Full guide
-├── aml_demo_queries.sh             ← Original shell script
+├── demo/aml/notebooks/
+│   └── aml_sql_showcase.ipynb          ← Main notebook
+├── JUPYTER_NOTEBOOK_GUIDE.md           ← Full guide
 ├── demo/data/
-│   ├── aml-demo.csv                ← Normalized (generated)
-│   ├── HI-Small_Trans.csv           ← Raw data
+│   ├── aml-demo.csv                    ← Normalized (generated)
+│   ├── HI-Small_Trans.csv              ← Raw data
 │   └── ...
 └── scripts/
-    └── normalize_aml.py            ← Normalization script
+    └── normalize_aml.py                ← Normalization script
 ```
 
 ---

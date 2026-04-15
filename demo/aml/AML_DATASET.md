@@ -279,8 +279,7 @@ print(stats)
 | `scripts/download_aml_data.sh` | Download + normalize automation script |
 | `scripts/normalize_aml.py` | CSV column normalizer |
 | `demo/aml_csv_loader.py` | Python loader (HTTP → Graph Query Engine) |
-| `aml_demo_queries.ipynb` | AML Gremlin + complex query demo notebook |
-| `aml_sql_showcase.ipynb` | Full SQL-capability showcase (H2 + Iceberg, flip `BACKEND`) |
+| `aml_sql_showcase.ipynb` | AML Gremlin + SQL showcase notebook (H2 + Iceberg, flip `BACKEND`) |
 
 ---
 

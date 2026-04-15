@@ -30,6 +30,26 @@ public interface SqlDialect {
     }
 
     /**
+     * Whether this dialect requires a {@code LIMIT} clause inside derived-table
+     * subqueries (e.g. degree-aggregation LEFT JOINs) to prevent the query planner
+     * from re-correlating the aggregate back into a per-row scan.
+     *
+     * <p>H2's query planner can re-correlate a {@code GROUP BY} subquery if there is no
+     * {@code LIMIT}, turning an O(1) hash-aggregate into an O(N) per-row scan.
+     * Adding {@code LIMIT 2147483647} prevents this.
+     *
+     * <p>Trino/Iceberg does <em>not</em> support {@code LIMIT} inside a derived table
+     * used in a {@code FROM}/{@code JOIN} clause — the statement is rejected with
+     * "Schema must be specified when session schema is not set".  Trino always chooses
+     * a hash-aggregate plan and does not need the hint.
+     *
+     * @return {@code true} for H2 (default), {@code false} for Trino/Iceberg
+     */
+    default boolean requiresDerivedTableLimit() {
+        return true;
+    }
+
+    /**
      * Whether this dialect requires BIGINT/INTEGER id columns and COUNT comparisons
      * to be bound as {@link Long} rather than {@link String}.
      *

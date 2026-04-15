@@ -215,7 +215,7 @@ def show(query: str, title: str = "", limit: int = 20):
 # Health check
 try:
     health   = requests.get(f"{BASE_URL}/health", timeout=5).text
-    provider = requests.get(f"{BASE_URL}/gremlin/provider", timeout=5).json().get("provider", "?")
+    provider = requests.get(f"{BASE_URL}/health", timeout=5).json().get("provider", "?")
     display(Markdown(f"\\u2705 **Backend healthy** \\u2014 `{health}` | Provider: `{provider}`"))
 except Exception as e:
     display(Markdown(f"\\u274c **Backend not reachable:** {e}  \\n> Start it with: `mvn exec:java`"))

@@ -55,7 +55,6 @@ python3 scripts/benchmark_lsqb.py \
 - `name`: label for reporting
 - `gremlin`: traversal string
 - `endpoint`: endpoint path (default `/gremlin/query`)
-- `tx_mode`: optional bool; if true and endpoint omitted, defaults to `/gremlin/query/tx`
 - `weight`: weighted selection frequency (default `1`)
 
 Example:

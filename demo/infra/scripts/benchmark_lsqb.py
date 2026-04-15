@@ -2,7 +2,7 @@
 """LSQB-inspired benchmark runner for GraphQueryEngine.
 
 This script executes a weighted query workload against GraphQueryEngine endpoints
-(e.g., /gremlin/query and /gremlin/query/tx), then reports latency and throughput
+(e.g., /gremlin/query), then reports latency and throughput
 metrics similar to graph benchmark scorecards.
 
 It is intentionally lightweight and dependency-free (Python stdlib only).
@@ -29,7 +29,6 @@ class QueryCase:
     name: str
     gremlin: str
     endpoint: str = "/gremlin/query"
-    tx_mode: bool = False
     weight: int = 1
 
 
@@ -118,13 +117,10 @@ def load_workload(path: str) -> List[QueryCase]:
         if not isinstance(gremlin, str) or not gremlin.strip():
             raise ValueError(f"queries[{i}].gremlin must be a non-empty string")
         endpoint = str(q.get("endpoint", "/gremlin/query"))
-        tx_mode = bool(q.get("tx_mode", False))
         weight = int(q.get("weight", 1))
         if weight < 1:
             raise ValueError(f"queries[{i}].weight must be >= 1")
-        if tx_mode and "endpoint" not in q:
-            endpoint = "/gremlin/query/tx"
-        cases.append(QueryCase(name=name, gremlin=gremlin, endpoint=endpoint, tx_mode=tx_mode, weight=weight))
+        cases.append(QueryCase(name=name, gremlin=gremlin, endpoint=endpoint, weight=weight))
     return cases
 
 

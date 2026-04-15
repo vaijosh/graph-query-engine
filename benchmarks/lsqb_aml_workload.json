@@ -45,9 +45,9 @@
       "weight": 2
     },
     {
-      "name": "C10_tx_suspicious_count",
+      "name": "C10_suspicious_count",
       "gremlin": "g.E().has('isLaundering','1').count()",
-      "endpoint": "/gremlin/query/tx",
+      "endpoint": "/gremlin/query",
       "weight": 1
     }
   ]

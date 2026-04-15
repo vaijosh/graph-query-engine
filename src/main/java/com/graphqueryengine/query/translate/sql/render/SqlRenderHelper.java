@@ -35,6 +35,11 @@ public class SqlRenderHelper {
         this.parser   = parser;
     }
 
+    // ── Dialect access ────────────────────────────────────────────────────────
+
+    /** Returns the SQL dialect configured for this translator instance. */
+    public SqlDialect dialect() { return dialect; }
+
     // ── Limit / Order ─────────────────────────────────────────────────────────
 
     public static void appendLimit(StringBuilder sql, Integer limit) {

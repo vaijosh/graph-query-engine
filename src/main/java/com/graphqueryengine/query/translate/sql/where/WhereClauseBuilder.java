@@ -163,9 +163,14 @@ public class WhereClauseBuilder {
 
     public String buildStructuredWherePredicateSql(WhereClause whereClause, VertexMapping vertexMapping,
                                                     String vertexAlias, List<Object> params) {
+        return buildStructuredWherePredicateSql(whereClause, vertexMapping, vertexAlias, params, false);
+    }
+
+    private String buildStructuredWherePredicateSql(WhereClause whereClause, VertexMapping vertexMapping,
+                                                     String vertexAlias, List<Object> params, boolean negated) {
         return switch (whereClause.kind()) {
             case EDGE_EXISTS ->
-                    buildEdgeExistsPredicateSql(whereClause, vertexMapping, vertexAlias, params);
+                    buildEdgeExistsPredicateSql(whereClause, vertexMapping, vertexAlias, params, negated);
             case OUT_NEIGHBOR_HAS, IN_NEIGHBOR_HAS ->
                     buildNeighborHasPredicateSql(whereClause, vertexMapping, vertexAlias, params);
             case AND ->
@@ -175,8 +180,15 @@ public class WhereClauseBuilder {
             case NOT -> {
                 if (whereClause.clauses().size() != 1)
                     throw new IllegalArgumentException("where(not(...)) requires exactly one inner predicate");
-                yield SqlKeyword.NOT + SqlFragment.OPEN_PAREN + buildStructuredWherePredicateSql(
-                        whereClause.clauses().get(0), vertexMapping, vertexAlias, params) + SqlFragment.CLOSE_PAREN;
+                WhereClause inner = whereClause.clauses().get(0);
+                // Fold negation directly into EDGE_EXISTS → NOT IN (SELECT …) instead of
+                // NOT (EXISTS (…)) so the database can evaluate it as an anti-semi-join.
+                if (inner.kind() == com.graphqueryengine.query.translate.sql.model.WhereKind.EDGE_EXISTS) {
+                    yield buildStructuredWherePredicateSql(inner, vertexMapping, vertexAlias, params, true);
+                }
+                yield SqlKeyword.NOT + SqlFragment.OPEN_PAREN
+                        + buildStructuredWherePredicateSql(inner, vertexMapping, vertexAlias, params, false)
+                        + SqlFragment.CLOSE_PAREN;
             }
             default -> throw new IllegalArgumentException(
                     "Unsupported structured where() predicate: " + whereClause.kind());
@@ -195,27 +207,58 @@ public class WhereClauseBuilder {
         return SqlFragment.OPEN_PAREN + joiner + SqlFragment.CLOSE_PAREN;
     }
 
+    /**
+     * Builds a semi-join predicate for {@code where(outE/inE/bothE('LABEL').has(...))} filters.
+     *
+     * <h3>Why IN (SELECT …) instead of EXISTS (SELECT 1 …)?</h3>
+     * <p>The correlated {@code EXISTS} form evaluates the subquery once <em>per row</em> of the
+     * outer vertex table.  On large datasets (e.g. 140 k accounts × 1 M transfers) this is
+     * O(V × probe) — effectively a nested-loop join.
+     *
+     * <p>The {@code IN (SELECT joinCol FROM edgeTable WHERE filter)} form is a
+     * <em>non-correlated</em> subquery: the database can materialise it as a hash set once
+     * in O(E) time, then probe each vertex ID against that set in O(1).  Total: O(E + V).
+     *
+     * <p>Both H2 (embedded and AUTO_SERVER) and Trino/Iceberg choose hash semi-join plans
+     * for the {@code IN (SELECT …)} form.
+     *
+     * <h3>Count comparison</h3>
+     * <p>{@code outE('X').count().is(n)} is a scalar subquery — it stays as a
+     * {@code (SELECT COUNT(*) …) op ?} correlated aggregate since there is no non-correlated
+     * equivalent that preserves the per-vertex count semantics.
+     *
+     * <h3>bothE semi-join</h3>
+     * <p>For {@code bothE('X')}, the vertex ID may appear as either the out-column or the
+     * in-column, so we emit:
+     * {@code v.id IN (SELECT out_id FROM t WHERE … UNION ALL SELECT in_id FROM t WHERE …)}.
+     *
+     * @param negated when {@code true}, emits {@code v.id NOT IN (SELECT …)} instead.
+     */
     private String buildEdgeExistsPredicateSql(WhereClause whereClause, VertexMapping vertexMapping,
-                                                String vertexAlias, List<Object> params) {
+                                                String vertexAlias, List<Object> params, boolean negated) {
         EdgeMapping edgeMapping = resolver.resolveEdgeMapping(whereClause.right());
-        String edgeAlias = SqlFragment.ALIAS_WE_CORR;
         String idRef = vertexAlias == null
                 ? vertexMapping.idColumn()
                 : vertexAlias + SqlFragment.DOT + vertexMapping.idColumn();
-        String correlation;
-        if (GremlinToken.OUT_E.equals(whereClause.left())) {
-            correlation = edgeAlias + SqlFragment.DOT + edgeMapping.outColumn() + SqlFragment.SPACE_EQ_SPACE + idRef;
-        } else if (GremlinToken.IN_E.equals(whereClause.left())) {
-            correlation = edgeAlias + SqlFragment.DOT + edgeMapping.inColumn() + SqlFragment.SPACE_EQ_SPACE + idRef;
-        } else {
-            correlation = SqlFragment.OPEN_PAREN + edgeAlias + SqlFragment.DOT + edgeMapping.outColumn() + SqlFragment.SPACE_EQ_SPACE + idRef
-                    + SqlKeyword.OR + edgeAlias + SqlFragment.DOT + edgeMapping.inColumn() + SqlFragment.SPACE_EQ_SPACE + idRef + SqlFragment.CLOSE_PAREN;
-        }
 
-        // Count comparison: outE('LABEL').count().is(n)
+        // ── Count comparison: outE('LABEL').count().is(n) ────────────────────────
+        // This must remain a correlated scalar subquery; no non-correlated equivalent.
         HasFilter countFilter = whereClause.filters().stream()
                 .filter(f -> GremlinToken.PROP_COUNT.equals(f.property())).findFirst().orElse(null);
         if (countFilter != null) {
+            String edgeAlias = SqlFragment.ALIAS_WE_CORR;
+            String correlation;
+            if (GremlinToken.OUT_E.equals(whereClause.left())) {
+                correlation = edgeAlias + SqlFragment.DOT + edgeMapping.outColumn() + SqlFragment.SPACE_EQ_SPACE + idRef;
+            } else if (GremlinToken.IN_E.equals(whereClause.left())) {
+                correlation = edgeAlias + SqlFragment.DOT + edgeMapping.inColumn() + SqlFragment.SPACE_EQ_SPACE + idRef;
+            } else {
+                correlation = SqlFragment.OPEN_PAREN
+                        + edgeAlias + SqlFragment.DOT + edgeMapping.outColumn() + SqlFragment.SPACE_EQ_SPACE + idRef
+                        + SqlKeyword.OR
+                        + edgeAlias + SqlFragment.DOT + edgeMapping.inColumn() + SqlFragment.SPACE_EQ_SPACE + idRef
+                        + SqlFragment.CLOSE_PAREN;
+            }
             StringBuilder countSql = new StringBuilder(SqlFragment.OPEN_PAREN).append(SqlKeyword.SELECT_COUNT)
                     .append(edgeMapping.table()).append(SqlFragment.SPACE).append(edgeAlias)
                     .append(SqlKeyword.WHERE).append(correlation);
@@ -232,27 +275,62 @@ public class WhereClauseBuilder {
                 }
             }
             countSql.append(SqlFragment.CLOSE_PAREN).append(SqlFragment.SPACE).append(toSqlOperator(countFilter.operator())).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
-            // COUNT(*) always returns BIGINT — use addCountParam for strict dialects (Trino)
             addCountParam(params, countFilter.typedValue());
             return countSql.toString();
         }
 
-        // Standard EXISTS clause
-        StringBuilder existsSql = new StringBuilder(SqlKeyword.EXISTS + SqlFragment.OPEN_PAREN)
-                .append(SqlKeyword.SELECT_1)
-                .append(edgeMapping.table()).append(SqlFragment.SPACE).append(edgeAlias)
-                .append(SqlKeyword.WHERE).append(correlation);
+        // ── Semi-join: IN (SELECT joinCol FROM edgeTable WHERE filter …) ─────────
+        // Build the optional non-id filter fragment (shared across UNION branches).
+        StringBuilder filterBuf = new StringBuilder();
         for (HasFilter filter : whereClause.filters()) {
             String column = resolver.mapEdgeFilterProperty(edgeMapping, filter.property());
             if (SqlKeyword.IS_NULL_OP.equals(filter.operator())) {
-                existsSql.append(SqlKeyword.AND).append(edgeAlias).append(SqlFragment.DOT).append(column).append(SqlKeyword.IS_NULL);
+                filterBuf.append(SqlKeyword.AND).append(column).append(SqlKeyword.IS_NULL);
             } else {
-                existsSql.append(SqlKeyword.AND).append(edgeAlias).append(SqlFragment.DOT).append(column)
-                        .append(SqlFragment.SPACE).append(filter.operator()).append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
+                filterBuf.append(SqlKeyword.AND).append(column)
+                        .append(SqlFragment.SPACE).append(filter.operator())
+                        .append(SqlFragment.SPACE).append(SqlKeyword.PLACEHOLDER);
                 addParam(params, filter.typedValue());
             }
         }
-        return existsSql.append(SqlFragment.CLOSE_PAREN).toString();
+        String filterSql = filterBuf.toString(); // starts with " AND …" or empty
+
+        String inOp = negated ? " NOT IN (" : " IN (";
+
+        if (GremlinToken.BOTH_E.equals(whereClause.left())) {
+            // bothE: vertex id may appear as out-column OR in-column
+            // For each direction we need independent bind parameters, so duplicate them.
+            StringBuilder unionSub = new StringBuilder()
+                    .append(SqlKeyword.SELECT).append(edgeMapping.outColumn())
+                    .append(SqlKeyword.FROM).append(edgeMapping.table());
+            if (!filterSql.isEmpty()) {
+                // filterSql starts with " AND "; replace leading AND with WHERE
+                unionSub.append(SqlKeyword.WHERE).append(filterSql.substring(SqlKeyword.AND.length()));
+                // Duplicate parameters for the second branch
+                for (HasFilter filter : whereClause.filters()) {
+                    addParam(params, filter.typedValue());
+                }
+            }
+            unionSub.append(SqlKeyword.UNION_ALL)
+                    .append(SqlKeyword.SELECT).append(edgeMapping.inColumn())
+                    .append(SqlKeyword.FROM).append(edgeMapping.table());
+            if (!filterSql.isEmpty()) {
+                unionSub.append(SqlKeyword.WHERE).append(filterSql.substring(SqlKeyword.AND.length()));
+            }
+            return idRef + inOp + unionSub + SqlFragment.CLOSE_PAREN;
+        }
+
+        // outE or inE
+        String joinCol = GremlinToken.OUT_E.equals(whereClause.left())
+                ? edgeMapping.outColumn()
+                : edgeMapping.inColumn();
+        StringBuilder subSel = new StringBuilder()
+                .append(SqlKeyword.SELECT).append(joinCol)
+                .append(SqlKeyword.FROM).append(edgeMapping.table());
+        if (!filterSql.isEmpty()) {
+            subSel.append(SqlKeyword.WHERE).append(filterSql.substring(SqlKeyword.AND.length()));
+        }
+        return idRef + inOp + subSel + SqlFragment.CLOSE_PAREN;
     }
 
     private String buildNeighborHasPredicateSql(WhereClause whereClause, VertexMapping vertexMapping,

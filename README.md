@@ -38,8 +38,6 @@ DB_URL="jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE" mvn exec:java
 |--------|------|---------------------------------------------------|
 | `GET` | `/health` | Service health                                    |
 | `POST` | `/gremlin/query` | Execute Gremlin natively (sql backend by default) |
-| `POST` | `/gremlin/query/tx` | Execute with transaction semantics                |
-| `GET` | `/gremlin/provider` | Active provider info                              |
 | `POST` | `/query/explain` | SQL translation only (no execution)               |
 | `POST` | `/mapping/upload` | Upload JSON mapping file                          |
 | `GET` | `/mapping/status` | Mapping store status                              |
@@ -228,7 +226,7 @@ Then run the demo:
 
 ```bash
 mvn exec:java                              # terminal 1 — start engine
-jupyter notebook aml_demo_queries.ipynb   # terminal 2 — open notebook
+jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb   # terminal 2 — open notebook
 ```
 
 Run cells top-to-bottom. Queries S1–S8 (simple) and C1–C11 (complex, including 10-hop) execute against the live service. See `QUICK_REFERENCE.md` for all queries in copy-paste form.

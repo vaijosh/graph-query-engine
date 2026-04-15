@@ -60,14 +60,19 @@ HYBRID_BACKENDS_JSON = (
 # ── Engine provider check / restart ────────────────────────────────────────────
 
 def _get_current_provider() -> str | None:
-    """Return the engine's active provider name, or None if the engine is not reachable."""
+    """Return the engine's active provider name from /health, or None if unreachable.
+
+    Uses /health (which includes provider + backends) instead of the removed
+    /gremlin/provider endpoint. The provider is always 'sql' or 'sql-multi';
+    use _get_registered_backend_ids() to check which backends are registered.
+    """
     try:
         import urllib.request
-        with urllib.request.urlopen(f"{BASE_URL}/gremlin/provider", timeout=5) as resp:
+        with urllib.request.urlopen(f"{BASE_URL}/health", timeout=5) as resp:
             import json
             data = json.loads(resp.read())
-            # Response shape: {"provider": "tinkergraph"} or {"graphProvider": "sql"} etc.
-            return (data.get("provider") or data.get("graphProvider") or "").lower()
+            # /health returns {"status":"ok","provider":"sql"|"sql-multi","backends":[...],...}
+            return (data.get("provider") or "").lower()
     except Exception:
         return None
 
@@ -127,24 +132,24 @@ def ensure_iceberg_provider(repo_root: str) -> None:
     Guarantee the engine is running with the SQL provider and the 'iceberg' backend
     registered as the default (first) backend so datasource routing works correctly.
 
-    - If the engine is already up with 'iceberg' as the first registered backend → no-op.
-    - If the engine is up but iceberg is not registered → kill and restart with BACKENDS env.
-    - If the engine is not up → start it with BACKENDS env.
+    Decision logic (based on /health):
+    - Engine up, 'iceberg' is the first registered backend → no-op.
+    - Engine up, iceberg not the first backend → kill and restart with BACKENDS env.
+    - Engine not reachable → start with BACKENDS env.
+
+    Note: provider is always 'sql' (single-backend) or 'sql-multi' (BackendRegistry
+    active). Both are valid; what matters is whether 'iceberg' is the default backend.
     """
     current = _get_current_provider()
 
-    if current == "sql":
+    if current is not None:  # engine is reachable (provider is "sql" or "sql-multi")
         backend_ids = _get_registered_backend_ids()
         # iceberg must be the FIRST (default) backend for routing to work
         if backend_ids and backend_ids[0] == "iceberg":
-            print("Engine is already running with the SQL provider and 'iceberg' as default backend – no restart needed.")
+            print("Engine is already running with 'iceberg' as default backend – no restart needed.")
             return
-        print(f"Engine is running with SQL provider but backends are {backend_ids} — need 'iceberg' as default.")
+        print(f"Engine is running but registered backends are {backend_ids} — need 'iceberg' as default.")
         print("Restarting engine with iceberg BACKENDS config…")
-        _kill_engine()
-    elif current is not None:
-        print(f"Provider mismatch: current provider is '{current}', need 'sql'.")
-        print("Restarting engine with Iceberg/SQL provider…")
         _kill_engine()
     else:
         print("Engine is not running. Starting with Iceberg/SQL provider…")

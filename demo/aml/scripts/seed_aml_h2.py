@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS aml_banks (
 CREATE TABLE IF NOT EXISTS aml_accounts (
     id BIGINT PRIMARY KEY,
     account_id   VARCHAR, bank_id    VARCHAR,
-    account_type VARCHAR, risk_score INTEGER,
+    account_type VARCHAR, risk_score DOUBLE,
     is_blocked   VARCHAR, opened_date VARCHAR
 );
 CREATE TABLE IF NOT EXISTS aml_alerts (
@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS aml_transfers (
     currency        VARCHAR, payment_format VARCHAR,
     event_time      VARCHAR, is_laundering  VARCHAR
 );
+CREATE INDEX IF NOT EXISTS idx_transfers_from ON aml_transfers(from_account_id);
+CREATE INDEX IF NOT EXISTS idx_transfers_to   ON aml_transfers(to_account_id);
+CREATE INDEX IF NOT EXISTS idx_transfers_laundering ON aml_transfers(is_laundering);
 CREATE TABLE IF NOT EXISTS aml_account_bank (
     id BIGINT PRIMARY KEY,
     account_id BIGINT, bank_id BIGINT,
@@ -148,15 +151,15 @@ CREATE TABLE IF NOT EXISTS aml_transfer_channel (
 """
 
 WIPE_SQL = """
-DELETE FROM aml_transfer_channel;
-DELETE FROM aml_account_alert;
-DELETE FROM aml_bank_country;
-DELETE FROM aml_account_bank;
-DELETE FROM aml_transfers;
-DELETE FROM aml_alerts;
-DELETE FROM aml_accounts;
-DELETE FROM aml_banks;
-DELETE FROM aml_countries;
+DROP TABLE IF EXISTS aml_transfer_channel;
+DROP TABLE IF EXISTS aml_account_alert;
+DROP TABLE IF EXISTS aml_bank_country;
+DROP TABLE IF EXISTS aml_account_bank;
+DROP TABLE IF EXISTS aml_transfers;
+DROP TABLE IF EXISTS aml_alerts;
+DROP TABLE IF EXISTS aml_accounts;
+DROP TABLE IF EXISTS aml_banks;
+DROP TABLE IF EXISTS aml_countries;
 """
 
 
@@ -239,8 +242,7 @@ def _csvread_insert(table: str, csv_file: pathlib.Path, columns: list[str], db_u
     # Cast id / numeric columns that may arrive as strings from CSVREAD
     cast_cols = ", ".join(
         f"CAST({c} AS BIGINT) AS {c}" if c in bigint_cols
-        else f"CAST({c} AS DOUBLE) AS {c}" if c == "amount"
-        else f"CAST({c} AS INTEGER) AS {c}" if c == "risk_score"
+        else f"CAST({c} AS DOUBLE) AS {c}" if c in ("amount", "risk_score")
         else c
         for c in columns
     )
@@ -344,11 +346,24 @@ def _build_data_tables(csv_path: str, max_rows: int):
     for key, aid in account_map.items():
         bank_str, acct_str = key.split(":", 1)
         bid     = bank_map[bank_str]
-        risk    = 85 if aid in laundering_accounts else 30
-        blocked = "true" if aid in laundering_accounts and risk > 80 else "false"
+        # Use same deterministic hash-based risk score as Iceberg seeder (0.0–1.0 DOUBLE scale).
+        # This ensures H2 and Iceberg return comparable results for risk-score queries.
+        h = int(hashlib.md5(key.encode()).hexdigest(), 16)
+        bucket = h % 100
+        if bucket < 5:
+            risk = round(0.85 + (h % 15) / 100.0, 2)
+            blocked = "true"
+        elif bucket < 20:
+            risk = round(0.71 + (h % 14) / 100.0, 2)
+            blocked = "false"
+        else:
+            risk = round(0.05 + (h % 65) / 100.0, 2)
+            blocked = "false"
         has_opened_date = (int(hashlib.md5(acct_str.encode()).hexdigest(), 16) * 11) % 100 >= 30
         opened_date_val = "2020-01-01" if has_opened_date else ""
-        account_rows.append((aid, acct_str, bank_str, "CHECKING", risk, blocked, opened_date_val))
+        # Use same account_type logic as Iceberg seeder for cross-backend consistency
+        acct_type = "BUSINESS" if h % 3 == 0 else "PERSONAL"
+        account_rows.append((aid, acct_str, bank_str, acct_type, risk, blocked, opened_date_val))
         account_bank_rows.append((aid, aid, bid, "2020-01-01", "true"))
 
     # Build alert rows
@@ -404,12 +419,17 @@ def seed_csv_bulk(csv_path: str, max_rows: int = 100_000, wipe: bool = False) ->
                   f"(threshold {threshold:,}) — reloading with wipe …")
             wipe = True   # fall through to wipe + reload
 
-    # 1. Create tables
-    _run_sql(DDL, db_url, h2_jar)
-
+    # 1. Wipe first (DROP TABLE), then recreate with correct DDL.
+    #    Order matters: if the existing table has a stale column type (e.g. INTEGER
+    #    instead of DOUBLE for risk_score), running DDL first is a no-op because of
+    #    "CREATE TABLE IF NOT EXISTS", and the stale schema survives the DELETE-based
+    #    wipe.  DROP TABLE removes the stale schema; CREATE TABLE then builds the
+    #    correct one.
     if wipe:
-        print("Wiping existing data …")
+        print("Wiping existing data (DROP TABLE) …")
         _run_sql(WIPE_SQL, db_url, h2_jar)
+
+    _run_sql(DDL, db_url, h2_jar)
 
     # 2. Parse CSV and collect rows
     data = _build_data_tables(csv_path, max_rows)
@@ -554,12 +574,16 @@ def _seed_sql(csv_path: str, max_rows: int = 100_000, wipe: bool = False) -> dic
             wipe = True
 
     # ── Collect ALL SQL into one big script ───────────────────────────────
+    # WIPE (DROP TABLE) must come BEFORE DDL (CREATE TABLE IF NOT EXISTS).
+    # If the existing table has a stale column type, running DDL first is a no-op
+    # and the stale schema survives; DROP TABLE removes it first so DDL recreates
+    # the table with the correct schema.
     all_sql: list[str] = []
 
-    all_sql.append(DDL)
     if wipe:
-        print("Will wipe existing data …")
+        print("Will wipe existing data (DROP TABLE) …")
         all_sql.append(WIPE_SQL)
+    all_sql.append(DDL)
 
     # ── Insert countries ──────────────────────────────────────────────────
     for c in COUNTRIES:
@@ -648,12 +672,23 @@ def _seed_sql(csv_path: str, max_rows: int = 100_000, wipe: bool = False) -> dic
     for key, aid in account_map.items():
         bank_str, acct_str = key.split(":", 1)
         bid     = bank_map[bank_str]
-        risk    = 85 if aid in laundering_accounts else 30
-        blocked = "true" if aid in laundering_accounts and risk > 80 else "false"
+        # Use same deterministic hash-based risk score as Iceberg seeder (0.0–1.0 DOUBLE scale).
+        h = int(hashlib.md5(key.encode()).hexdigest(), 16)
+        bucket = h % 100
+        if bucket < 5:
+            risk = round(0.85 + (h % 15) / 100.0, 2)
+            blocked = "true"
+        elif bucket < 20:
+            risk = round(0.71 + (h % 14) / 100.0, 2)
+            blocked = "false"
+        else:
+            risk = round(0.05 + (h % 65) / 100.0, 2)
+            blocked = "false"
         # ~30% of accounts have no openedDate (NULL), mirroring the Groovy loader
         has_opened_date = (int(hashlib.md5(acct_str.encode()).hexdigest(), 16) * 11) % 100 >= 30
         opened_date_val = "'2020-01-01'" if has_opened_date else "NULL"
-        all_sql.append(f"MERGE INTO aml_accounts KEY(id) VALUES ({aid},'{acct_str}','{bank_str}','CHECKING',{risk},'{blocked}',{opened_date_val});")
+        acct_type = "BUSINESS" if h % 3 == 0 else "PERSONAL"
+        all_sql.append(f"MERGE INTO aml_accounts KEY(id) VALUES ({aid},'{acct_str}','{bank_str}','{acct_type}',{risk},'{blocked}',{opened_date_val});")
         all_sql.append(f"MERGE INTO aml_account_bank KEY(id) VALUES ({aid},{aid},{bid},'2020-01-01','true');")
 
     # ── Transfers ─────────────────────────────────────────────────────────

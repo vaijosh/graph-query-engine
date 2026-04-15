@@ -16,6 +16,7 @@ import com.graphqueryengine.query.translate.sql.model.HopStep;
 import com.graphqueryengine.query.translate.sql.model.ParsedTraversal;
 import com.graphqueryengine.query.translate.sql.model.ProjectionField;
 import com.graphqueryengine.query.translate.sql.model.ProjectionKind;
+import com.graphqueryengine.query.translate.sql.model.WhereClause;
 import com.graphqueryengine.query.translate.sql.parse.GremlinStepParser;
 
 import javax.script.ScriptException;
@@ -153,15 +154,42 @@ public class WcojOptimiser {
             LongPredicate startFilter = buildStartFilter(conn, config, parsed);
 
             // 3. Run leapfrog join
+            // preHopLimit is the seed-vertex limit (e.g. g.V().limit(5).out(...)) — it
+            // controls how many seed vertices are loaded but must NOT cap the output row
+            // count.  Only an explicit limit() appended AFTER the hops acts as a result
+            // limit.  Passing preHopLimit as the LeapfrogTrieJoin limit was causing
+            // g.V().hasLabel('Bank').limit(5).in('BELONGS_TO')... to return only 5 rows
+            // instead of all accounts belonging to those 5 banks.
             int limit = parsed.limit() != null ? parsed.limit() : 0;
-            if (parsed.preHopLimit() != null && limit <= 0)
-                limit = parsed.preHopLimit();
+
+            // ── Fast path: dedup().count() without simplePath ────────────────────
+            // BFS frontier expansion — O(E × hops), no path arrays allocated.
+            // This avoids the degree^n combinatorial explosion that causes OOM on
+            // dense cyclic graphs (e.g. 10-hop repeat from a hub with 14k neighbours).
+            if (parsed.countRequested() && parsed.dedupRequested() && !parsed.simplePathRequested()) {
+                LeapfrogTrieJoin bfsJoin = new LeapfrogTrieJoin(
+                        indices, outDirs, false, startFilter, 0);
+                long t0 = System.currentTimeMillis();
+                long cnt = bfsJoin.countDistinctReachable();
+                LOG.info(String.format("[WCOJ] %d-hop dedup.count() BFS produced %d in %d ms",
+                        hopCount, cnt, System.currentTimeMillis() - t0));
+                return new GremlinExecutionResult(gremlin, List.of(cnt), 1);
+            }
 
             LeapfrogTrieJoin join = new LeapfrogTrieJoin(
                     indices, outDirs, parsed.simplePathRequested(), startFilter, limit);
 
             long t0 = System.currentTimeMillis();
-            List<long[]> paths = join.enumerate();
+            List<long[]> paths;
+            try {
+                paths = join.enumerate();
+            } catch (IllegalStateException capEx) {
+                // Path count exceeded MAX_PATHS hard cap — fall back to SQL.
+                throw new WcojFallbackException(capEx.getMessage());
+            } catch (OutOfMemoryError oom) {
+                // Belt-and-suspenders: should not reach here after the cap check, but just in case.
+                throw new WcojFallbackException("WCOJ ran out of heap enumerating paths: " + oom.getMessage());
+            }
             long ms = System.currentTimeMillis() - t0;
             LOG.info(String.format("[WCOJ] %d-hop join produced %d paths in %d ms",
                     hopCount, paths.size(), ms));
@@ -320,6 +348,11 @@ public class WcojOptimiser {
         if (!parsed.projections().isEmpty() && !isSimplePropertyProjection(parsed.projections())) {
             return false;
         }
+        // count() without dedup() on a cyclic graph is unbounded (degree^n paths).
+        // SQL handles this correctly as COUNT(DISTINCT terminal); WCOJ must not enumerate.
+        if (parsed.countRequested() && !parsed.dedupRequested() && !parsed.simplePathRequested()) {
+            return false;
+        }
         for (HopStep hop : parsed.hops()) {
             if (GremlinToken.OUT_E.equals(hop.direction())
                     || GremlinToken.IN_E.equals(hop.direction())
@@ -374,14 +407,79 @@ public class WcojOptimiser {
         return seedIds::contains;
     }
 
-    private static String buildSeedGremlin(ParsedTraversal parsed) {
+    static String buildSeedGremlin(ParsedTraversal parsed) {
         StringBuilder sb = new StringBuilder("g.V().hasLabel('")
                 .append(parsed.label()).append("')");
         for (var f : parsed.filters()) {
             sb.append(".has('").append(f.property()).append("','").append(f.value()).append("')");
         }
+        // Re-emit the where() clause so that the seed SQL includes the correct predicate
+        // (e.g. where(outE('TRANSFER').has('isLaundering','1')) must not be dropped,
+        // otherwise WCOJ starts from an arbitrary vertex and paths come back empty).
+        if (parsed.whereClause() != null) {
+            String whereGremlin = renderWhereClause(parsed.whereClause());
+            if (whereGremlin != null && !whereGremlin.isBlank()) {
+                sb.append(".where(").append(whereGremlin).append(")");
+            }
+        }
         if (parsed.preHopLimit() != null) sb.append(".limit(").append(parsed.preHopLimit()).append(")");
         return sb.toString();
+    }
+
+    /**
+     * Converts a {@link WhereClause} back into a Gremlin fragment suitable for
+     * inclusion inside a {@code .where(...)} step.
+     * Only the kinds relevant to seed filtering are supported here.
+     * Unsupported kinds (e.g. alias comparisons) return {@code null}, which causes
+     * the where clause to be omitted from the seed query (safe – results in a superset
+     * of seeds, filtered at the outer query stage).
+     */
+    static String renderWhereClause(WhereClause wc) {
+        if (wc == null) return null;
+        switch (wc.kind()) {
+            case EDGE_EXISTS: {
+                // e.g. outE('TRANSFER').has('isLaundering','1')
+                String dir    = wc.left();   // "outE" or "inE"
+                String eLabel = wc.right();  // edge label
+                StringBuilder sb = new StringBuilder(dir).append("('").append(eLabel).append("')");
+                for (var f : wc.filters()) {
+                    sb.append(".has('").append(f.property()).append("','").append(f.value()).append("')");
+                }
+                return sb.toString();
+            }
+            case AND: {
+                // and(p1, p2, ...)
+                StringBuilder sb = new StringBuilder("and(");
+                for (int i = 0; i < wc.clauses().size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    String inner = renderWhereClause(wc.clauses().get(i));
+                    if (inner == null) return null; // cannot render compound – skip whole where
+                    sb.append(inner);
+                }
+                sb.append(")");
+                return sb.toString();
+            }
+            case OR: {
+                StringBuilder sb = new StringBuilder("or(");
+                for (int i = 0; i < wc.clauses().size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    String inner = renderWhereClause(wc.clauses().get(i));
+                    if (inner == null) return null;
+                    sb.append(inner);
+                }
+                sb.append(")");
+                return sb.toString();
+            }
+            case NOT: {
+                if (wc.clauses().isEmpty()) return null;
+                String inner = renderWhereClause(wc.clauses().get(0));
+                return inner == null ? null : "not(" + inner + ")";
+            }
+            default:
+                // NEQ_ALIAS, EQ_ALIAS, PROJECT_GT, etc. are alias comparisons that don't
+                // make sense in the seed sub-query context; omit them safely.
+                return null;
+        }
     }
 
     // ── Label resolution ──────────────────────────────────────────────────────

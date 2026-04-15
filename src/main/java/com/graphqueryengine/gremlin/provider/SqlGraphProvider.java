@@ -19,12 +19,15 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * A {@link GraphProvider} that executes Gremlin queries by translating them to SQL
@@ -151,7 +154,6 @@ public class SqlGraphProvider implements GraphProvider {
     // raw user input. All user-supplied values travel via the `params` list and are
     // bound with ps.setObject() — no SQL injection risk. Suppress IDE dataflow warning.
     @Override
-    @SuppressWarnings("SqlSourceToSinkFlow")
     public GremlinExecutionResult execute(String gremlin) throws ScriptException {
         MappingConfig mappingConfig = mappingStore.getActive()
                 .map(MappingStore.StoredMapping::config)
@@ -186,48 +188,64 @@ public class SqlGraphProvider implements GraphProvider {
         DatabaseManager dm = resolveManager(translationResult, mappingConfig);
 
         assert sql != null;
-        try (Connection conn = dm.connection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
+        try (Connection conn = dm.connection()) {
+            // Materialise any _degN inline aggregates into session temp tables
+            // so H2 can't re-correlate them back into per-row scans.
+            String rewrittenSql = materialiseDegreeSubqueries(conn, sql);
 
-            for (int i = 0; i < params.size(); i++) {
-                ps.setObject(i + 1, params.get(i));
-            }
-
-            try (ResultSet rs = ps.executeQuery()) {
-                ResultSetMetaData meta = rs.getMetaData();
-                int cols = meta.getColumnCount();
-                List<Object> results = new ArrayList<>();
-
-                // Detect if this is a path query (column names end with a digit: name0, name1, ...)
-                boolean isPath = cols > 1;
-                for (int c = 1; c <= cols && isPath; c++) {
-                    if (!meta.getColumnLabel(c).matches(".+\\d+$")) isPath = false;
+            try (PreparedStatement ps = conn.prepareStatement(rewrittenSql)) {
+                for (int i = 0; i < params.size(); i++) {
+                    ps.setObject(i + 1, params.get(i));
                 }
 
-                while (rs.next()) {
-                    if (cols == 1) {
-                        results.add(rs.getObject(1));
-                    } else if (isPath) {
-                        List<Object> path = new ArrayList<>();
-                        for (int c = 1; c <= cols; c++) path.add(rs.getObject(c));
-                        results.add(path);
-                    } else {
-                        Map<String, Object> row = new LinkedHashMap<>();
-                        for (int c = 1; c <= cols; c++) {
-                            Object val = rs.getObject(c);
-                            row.put(meta.getColumnLabel(c), val == null ? null : List.of(val));
-                        }
-                        results.add(row);
+                try (ResultSet rs = ps.executeQuery()) {
+                    ResultSetMetaData meta = rs.getMetaData();
+                    int cols = meta.getColumnCount();
+                    List<Object> results = new ArrayList<>();
+
+                    // Detect if this is a path query (column names end with a digit: name0, name1, ...)
+                    boolean isPath = cols > 1;
+                    for (int c = 1; c <= cols && isPath; c++) {
+                        if (!meta.getColumnLabel(c).matches(".+\\d+$")) isPath = false;
                     }
-                }
 
-                return new GremlinExecutionResult(gremlin, results, results.size());
+                    while (rs.next()) {
+                        if (cols == 1) {
+                            results.add(rs.getObject(1));
+                        } else if (isPath) {
+                            List<Object> path = new ArrayList<>();
+                            for (int c = 1; c <= cols; c++) path.add(rs.getObject(c));
+                            results.add(path);
+                        } else {
+                            Map<String, Object> row = new LinkedHashMap<>();
+                            for (int c = 1; c <= cols; c++) {
+                                Object val = rs.getObject(c);
+                                row.put(meta.getColumnLabel(c), val == null ? null : List.of(val));
+                            }
+                            results.add(row);
+                        }
+                    }
+
+                    return new GremlinExecutionResult(gremlin, results, results.size());
+                }
             }
         } catch (SQLException ex) {
             throw new ScriptException("SQL execution error: " + ex.getMessage());
         }
     }
 
+    /**
+     * Executes {@code gremlin} as a read-only query and wraps the result with transaction
+     * metadata fields for clients that expect them.
+     *
+     * <p><strong>This method does NOT open a real JDBC transaction.</strong>
+     * It calls {@link #execute(String)} (which runs in auto-commit mode) and then
+     * decorates the result with hardcoded {@code transactionMode="read-only"} and
+     * {@code transactionStatus="committed"}.
+     *
+     * <p>Write operations ({@code addV}, {@code addE}, {@code property}, {@code drop})
+     * are not supported by the SQL translator and will throw {@link ScriptException}.
+     */
     @Override
     public GremlinTransactionalExecutionResult executeInTransaction(String gremlin) throws ScriptException {
         GremlinExecutionResult result = execute(gremlin);
@@ -237,6 +255,65 @@ public class SqlGraphProvider implements GraphProvider {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Matches inline degree-aggregate subqueries of the form:
+     * <pre>
+     *   LEFT JOIN (SELECT &lt;joinCol&gt; AS _id, COUNT(*) AS _cnt
+     *              FROM &lt;table&gt; [WHERE ...] GROUP BY &lt;joinCol&gt;
+     *              LIMIT 2147483647) _degN
+     *          ON _degN._id = ...
+     * </pre>
+     * The LIMIT fence prevents H2's predicate-pushdown only in embedded mode.
+     * In {@code AUTO_SERVER} (remote) mode H2 may strip it and re-correlate the
+     * GROUP BY into a per-row scan, causing O(N²) runtimes on large datasets.
+     *
+     * <p>This method materialises every such subquery into a session-scoped
+     * H2 local temporary table ({@code DROP TABLE IF EXISTS} + {@code CREATE ... AS SELECT})
+     * using the <em>same</em> connection that will run the main query.  The main SQL is
+     * then rewritten to reference those temp tables directly, so H2 never sees the
+     * inline aggregation at all.
+     *
+     * <p>For non-H2 dialects (Trino, DuckDB, etc.) the SQL will not contain the
+     * {@code LIMIT 2147483647} sentinel inside a {@code _deg\d+} alias, so the pattern
+     * will not match and the original SQL is returned unchanged.
+     */
+    private static final Pattern DEG_SUBQUERY_PATTERN = Pattern.compile(
+            "LEFT JOIN \\((.+?LIMIT 2147483647)\\) (_deg\\d+)\\s+ON",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+    private static String materialiseDegreeSubqueries(Connection conn, String sql) throws SQLException {
+        Matcher m = DEG_SUBQUERY_PATTERN.matcher(sql);
+        if (!m.find()) return sql;  // no degree aggregates — nothing to do
+
+        // Rebuild from the start
+        m.reset();
+        StringBuilder rewritten = new StringBuilder();
+        int lastEnd = 0;
+
+        try (Statement stmt = conn.createStatement()) {
+            while (m.find()) {
+                String aggSql  = m.group(1); // e.g. SELECT from_account_id AS _id, COUNT(*) ...
+                String alias   = m.group(2); // e.g. _deg0
+
+                // Drop any leftover temp table from a previous (possibly failed) call in this session
+                stmt.execute("DROP TABLE IF EXISTS " + alias);
+                // Materialise: CREATE LOCAL TEMPORARY TABLE _degN NOT PERSISTENT AS SELECT ...
+                stmt.execute("CREATE LOCAL TEMPORARY TABLE " + alias
+                        + " NOT PERSISTENT AS " + aggSql);
+                // Index on _id so the subsequent LEFT JOIN is a fast lookup, not an O(N²) scan
+                stmt.execute("CREATE INDEX " + alias + "_idx ON " + alias + "(_id)");
+
+                // Rewrite: replace  LEFT JOIN (SELECT ... LIMIT 2147483647) _degN  ON
+                //      with        LEFT JOIN _degN  ON
+                rewritten.append(sql, lastEnd, m.start());
+                rewritten.append("LEFT JOIN ").append(alias).append(" ON");
+                lastEnd = m.end();
+            }
+        }
+        rewritten.append(sql, lastEnd, sql.length());
+        return rewritten.toString();
+    }
 
     /**
      * Resolves the {@link DatabaseManager} to use for a translated query.

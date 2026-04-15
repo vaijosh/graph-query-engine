@@ -230,6 +230,6 @@ echo "Next steps:"
 echo "  1. Start the engine:      mvn exec:java"
 echo "  2. Load into the engine:"
 echo "     curl -X POST \"http://localhost:7000/admin/load-aml-csv?path=\$(pwd)/demo/data/aml-demo.csv&maxRows=${NORMALIZE_ROWS}\""
-echo "  3. Open the notebook:     jupyter notebook aml_demo_queries.ipynb"
+  echo "  3. Open the notebook:     jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb"
 echo ""
 

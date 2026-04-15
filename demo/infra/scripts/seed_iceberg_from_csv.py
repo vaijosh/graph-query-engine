@@ -79,12 +79,22 @@ COUNTRIES = [
 
 
 def _java_hashcode(text: str) -> int:
+    """Legacy Java String.hashCode() equivalent — kept for reference but no longer used."""
     h = 0
     for ch in text:
         h = (31 * h + ord(ch)) & 0xFFFFFFFF
     if h >= 0x80000000:
         h -= 0x100000000
     return h
+
+
+def _account_hash(key: str) -> int:
+    """
+    Deterministic hash for account risk-score generation.
+    Uses Python MD5 to match seed_aml_h2.py so both backends produce identical
+    risk scores for the same account key — enabling fair H2 vs Iceberg comparisons.
+    """
+    return int(hashlib.md5(key.encode()).hexdigest(), 16)
 
 
 # ── CSV helpers ──────────────────────────────────────────────────────────────
@@ -336,7 +346,7 @@ def build_aml_tables(csv_path: Path, max_rows: int) -> dict[str, tuple[list, lis
                     account_id = next_account_id
                     next_account_id += 1
                     accounts[acct_key] = account_id
-                    h = abs(_java_hashcode(acct_key))
+                    h = _account_hash(acct_key)
                     bucket = h % 100
                     if bucket < 5:
                         risk_score = round(0.85 + (h % 15) / 100.0, 2)

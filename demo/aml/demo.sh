@@ -90,7 +90,7 @@ demo_provider_detection() {
     print_section "Demo 2: Provider Detection (Phase 2)"
     print_step "Detecting active Gremlin provider..."
 
-    RESPONSE=$(curl -s "$BASE_URL/gremlin/provider")
+    RESPONSE=$(curl -s "$BASE_URL/health")
     echo "Response:"
     echo "$RESPONSE" | jq . 2>/dev/null || echo "$RESPONSE"
     print_success "Provider detected"
@@ -268,24 +268,20 @@ demo_simple_path() {
 
 # Demo 11: Transaction Semantics (Phase 2)
 demo_transaction_semantics() {
-    print_section "Demo 11: Transaction Semantics (Phase 2)"
+    print_section "Demo 11: Simple Query"
     print_input "Vertex ID: 1, Property: name"
-    print_step "Executing query within transaction context"
+    print_step "Executing query"
     print_query "g.V(1).values('name')"
     echo ""
 
-    RESPONSE=$(curl -s -X POST "$BASE_URL/gremlin/query/tx" \
+    RESPONSE=$(curl -s -X POST "$BASE_URL/gremlin/query" \
         -H "Content-Type: application/json" \
         -d '{"gremlin":"g.V(1).values(\"name\")"}')
 
     print_output
     RESULT=$(echo "$RESPONSE" | jq -r '.results[0]' 2>/dev/null || echo "?")
     echo "   Result: $RESULT"
-    TX_STATUS=$(echo "$RESPONSE" | jq -r '.transactionStatus' 2>/dev/null || echo "?")
-    echo "   Transaction status: $TX_STATUS"
-    TX_MODE=$(echo "$RESPONSE" | jq -r '.transactionMode' 2>/dev/null || echo "?")
-    echo "   Transaction mode: $TX_MODE"
-    print_success "Transaction execution complete"
+    print_success "Query execution complete"
 }
 
 # Demo 12: SQL Mapping & Explain Mode (Phase 5)
@@ -467,9 +463,8 @@ main() {
     echo ""
     echo "Key Endpoints:"
     echo "  POST /gremlin/query       - Execute Gremlin natively"
-    echo "  POST /gremlin/query/tx    - Execute with transaction semantics"
     echo "  POST /query/explain       - See SQL translation (Phase 5)"
-    echo "  GET  /gremlin/provider    - Detect active provider"
+    echo "  GET  /health               - Engine health + active provider + registered backends"
     echo "  POST /admin/seed-gremlin-10hop-tx  - Load demo graph"
     echo ""
     echo "Documentation: See README.md for full API details"

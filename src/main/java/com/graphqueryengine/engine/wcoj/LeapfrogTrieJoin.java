@@ -2,7 +2,9 @@ package com.graphqueryengine.engine.wcoj;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.LongPredicate;
 
 /**
@@ -57,6 +59,23 @@ public class LeapfrogTrieJoin {
     private final int limit;
 
     /**
+     * Hard cap on the number of paths that {@link #enumerate()} will materialise.
+     * When exceeded an {@link IllegalStateException} is thrown so the caller can fall
+     * back to SQL instead of running out of heap.
+     * Configurable via the {@code WCOJ_MAX_PATHS} env var (default 5,000,000).
+     */
+    static final int MAX_PATHS_DEFAULT = 5_000_000;
+    private static final int MAX_PATHS;
+    static {
+        int cap = MAX_PATHS_DEFAULT;
+        String env = System.getenv("WCOJ_MAX_PATHS");
+        if (env != null && !env.isBlank()) {
+            try { cap = Integer.parseInt(env.trim()); } catch (NumberFormatException ignored) {}
+        }
+        MAX_PATHS = cap;
+    }
+
+    /**
      * @param indices       One {@link AdjacencyIndex} per hop (all loaded).
      * @param outDirections {@code true}=out-edge, {@code false}=in-edge, one per hop.
      * @param simplePath    If {@code true}, no vertex may appear twice in a path.
@@ -84,6 +103,9 @@ public class LeapfrogTrieJoin {
      *
      * <p>The enumeration is depth-first with leapfrog intersection at each level,
      * so memory use is bounded by {@code O(hopCount + results.size() * (hopCount+1))}.
+     *
+     * @throws IllegalStateException if the result set exceeds {@link #MAX_PATHS} entries.
+     *         Callers should catch this and fall back to SQL to avoid OOM on dense graphs.
      */
     public List<long[]> enumerate() {
         List<long[]> results = new ArrayList<>();
@@ -104,10 +126,68 @@ public class LeapfrogTrieJoin {
         return results;
     }
 
+    /**
+     * Count the number of <em>distinct</em> terminal vertices reachable in exactly
+     * {@code hopCount} hops, without materialising any intermediate paths.
+     *
+     * <p>This is used for {@code repeat(out(...)).times(n).dedup().count()} queries.
+     * Instead of DFS-enumerating every path (which is O(degree^n) on a dense cyclic
+     * graph and causes OOM), it performs a BFS layer expansion:
+     * <ul>
+     *   <li>Start from the seed set (filtered by {@code startFilter}).</li>
+     *   <li>At each hop, expand every vertex in the current frontier using the
+     *       adjacency index and collect all neighbours into the next frontier set.</li>
+     *   <li>After all hops, return the size of the final frontier set.</li>
+     * </ul>
+     *
+     * <p>Memory: O(|frontier|) per layer — only two {@link HashSet}s exist at once.
+     * Time:   O(E × hopCount) — each edge is visited once per layer it's reachable from.
+     *
+     * <p>No path arrays are allocated. The {@link #MAX_PATHS} cap does not apply here
+     * because we never materialise individual paths.
+     *
+     * @return the count of distinct terminal vertex IDs after all hops.
+     */
+    public long countDistinctReachable() {
+        int hopCount = indices.length;
+
+        // Seed frontier
+        long[] seeds = outDirections[0]
+                ? indices[0].outSources()
+                : allInTargets(indices[0]);
+
+        Set<Long> frontier = new HashSet<>();
+        for (long seed : seeds) {
+            if (startFilter == null || startFilter.test(seed)) {
+                frontier.add(seed);
+            }
+        }
+        if (frontier.isEmpty()) return 0L;
+
+        // Layer-by-layer BFS expansion
+        for (int hop = 0; hop < hopCount; hop++) {
+            NeighbourLookup idx = indices[hop];
+            Set<Long> next = new HashSet<>();
+            for (long v : frontier) {
+                long[] neighbours = outDirections[hop]
+                        ? idx.outNeighbours(v)
+                        : idx.inNeighbours(v);
+                for (long n : neighbours) next.add(n);
+            }
+            frontier = next;
+            if (frontier.isEmpty()) return 0L;
+        }
+        return frontier.size();
+    }
+
     // ── DFS with Leapfrog Intersection ────────────────────────────────────────
 
     private void dfs(long[] path, int depth, int hopCount, List<long[]> out) {
         if (limit > 0 && out.size() >= limit) return;
+        if (out.size() >= MAX_PATHS)
+            throw new IllegalStateException(
+                    "WCOJ path count exceeded hard cap of " + MAX_PATHS
+                    + " — falling back to SQL. Use WCOJ_MAX_PATHS env var to adjust.");
         if (depth == hopCount) {
             out.add(Arrays.copyOf(path, path.length));
             return;

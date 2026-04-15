@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.graphqueryengine.config.DatabaseConfig;
 import com.graphqueryengine.gremlin.GremlinExecutionResult;
 import com.graphqueryengine.gremlin.GremlinExecutionService;
-import com.graphqueryengine.gremlin.GremlinTransactionalExecutionResult;
 import com.graphqueryengine.gremlin.provider.BackendRegistry;
 import com.graphqueryengine.http.RouterServer;
 import com.graphqueryengine.http.RouterServer.RequestContext;
@@ -348,7 +347,6 @@ public class App {
             GremlinExecutionService svc = resolveServiceForRequest(ctx, backendRegistry, gremlinExecutionService);
             try {
                 logGremlinWithSqlIfAvailable(
-                        "/gremlin/query",
                         request.gremlin(),
                         ctx,
                         mappingStore,
@@ -361,34 +359,6 @@ public class App {
                 ctx.status(400).json(Map.of("error", ex.getMessage()));
             }
         });
-
-        app.post("/gremlin/query/tx", ctx -> {
-            QueryRequest request;
-            try {
-                request = ctx.bodyAsClass(QueryRequest.class);
-            } catch (Exception ex) {
-                ctx.status(400).json(Map.of("error", "Body must be JSON: {\"gremlin\":\"...\"}"));
-                return;
-            }
-
-            GremlinExecutionService svc = resolveServiceForRequest(ctx, backendRegistry, gremlinExecutionService);
-            try {
-                logGremlinWithSqlIfAvailable(
-                        "/gremlin/query/tx",
-                        request.gremlin(),
-                        ctx,
-                        mappingStore,
-                        translator,
-                        isSqlTraceEnabledForRequest(ctx)
-                );
-                GremlinTransactionalExecutionResult response = svc.executeInTransaction(request.gremlin());
-                ctx.json(response);
-            } catch (IllegalArgumentException | ScriptException ex) {
-                ctx.status(400).json(Map.of("error", ex.getMessage()));
-            }
-        });
-
-        app.get("/gremlin/provider", ctx -> ctx.json(Map.of("provider", gremlinExecutionService.providerId())));
 
         // List all registered backends (id + url, no credentials).
         app.get("/backends", ctx -> {
@@ -481,30 +451,29 @@ public class App {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    private static void logGremlinWithSqlIfAvailable(String endpoint,
-                                                     String gremlin,
+    private static void logGremlinWithSqlIfAvailable(String gremlin,
                                                      RequestContext ctx,
                                                      MappingStore mappingStore,
                                                      GraphQueryTranslator translator,
                                                      boolean sqlTraceEnabledForRequest) {
-        LOG.info("[GREMLIN] endpoint={} query={}", endpoint, gremlin);
+        LOG.info("[GREMLIN] endpoint={} query={}", "/gremlin/query", gremlin);
 
         if (!sqlTraceEnabledForRequest) {
-            LOG.debug("[SQL-TRACE] endpoint={} disabled for this request", endpoint);
+            LOG.debug("[SQL-TRACE] endpoint={} disabled for this request", "/gremlin/query");
             return;
         }
 
         MappingStore.StoredMapping selectedMapping = resolveMappingForRequest(ctx, mappingStore).orElse(null);
         if (selectedMapping == null) {
-            LOG.info("[SQL-TRACE] endpoint={} mapping=missing (upload mapping to enable SQL translation logs)", endpoint);
+            LOG.info("[SQL-TRACE] endpoint={} mapping=missing (upload mapping to enable SQL translation logs)", "/gremlin/query");
             return;
         }
 
         try {
             TranslationResult translation = translator.translate(gremlin, selectedMapping.config());
-            logSqlTranslation(endpoint, gremlin, translation);
+            logSqlTranslation("/gremlin/query", gremlin, translation);
         } catch (IllegalArgumentException ex) {
-            LOG.info("[SQL-TRACE] endpoint={} unavailable={}", endpoint, ex.getMessage());
+            LOG.info("[SQL-TRACE] endpoint={} unavailable={}", "/gremlin/query", ex.getMessage());
         }
     }
 

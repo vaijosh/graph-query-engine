@@ -140,7 +140,7 @@ class EdgeMappingExplicitLabelTest {
                 ".project('accountId').by('accountId').limit(5)",
                 icebergWithLabels());
         String sql = r.sql();
-        assertTrue(sql.contains("EXISTS"),             "EXISTS for where(outE)");
+        assertTrue(sql.contains("IN (SELECT"),      "IN (SELECT …) semi-join for where(outE)");
         assertTrue(sql.contains("aml.account_alert"),  "FLAGGED_BY Iceberg edge table");
         assertTrue(sql.endsWith("LIMIT 5"));
     }

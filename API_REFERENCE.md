@@ -4,7 +4,7 @@
 
 | Header | Applies to | Description |
 |--------|------------|-------------|
-| `X-SQL-Trace: true\|false` | `/gremlin/query`, `/gremlin/query/tx`, `/query/explain` | Override SQL trace **logging** for this request (default: follows `SQL_TRACE` env var). Controls what is written to the **server log** — not what is returned in the response body. |
+| `X-SQL-Trace: true\|false` | `/gremlin/query`, `/query/explain` | Override SQL trace **logging** for this request (default: follows `SQL_TRACE` env var). Controls what is written to the **server log** — not what is returned in the response body. |
 | `X-Mapping-Id: <id>` | `/query/explain`, `/mapping` | Use a specific stored mapping instead of the active one |
 
 
@@ -52,31 +52,6 @@ curl -X POST http://localhost:7000/gremlin/query \
 
 ---
 
-### `POST /gremlin/query/tx`
-Execute a Gremlin traversal within a transaction context.
-
-**Body** — same as `/gremlin/query`
-
-**Response**
-```json
-{
-  "gremlin": "g.V(1).values(\"name\")",
-  "results": ["Acct-1"],
-  "resultCount": 1,
-  "transactionMode": "NON_TRANSACTIONAL_GRAPH",
-  "transactionStatus": "EXECUTED"
-}
-```
-
-> `transactionMode` values: `NATIVE_GRAPH_TX` | `NON_TRANSACTIONAL_GRAPH`  
-> `transactionStatus` values: `COMMITTED` | `EXECUTED`
-
----
-
-### `GET /gremlin/provider`
-```json
-{"provider":"sql"}
-```
 
 ---
 

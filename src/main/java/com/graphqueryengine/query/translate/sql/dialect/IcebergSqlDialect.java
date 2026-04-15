@@ -38,6 +38,16 @@ public class IcebergSqlDialect extends StandardSqlDialect {
 	}
 
 	/**
+	 * Trino/Iceberg does not support {@code LIMIT} inside a derived-table subquery
+	 * used in a {@code FROM}/{@code JOIN} clause.  The clause that H2 needs to prevent
+	 * correlated re-scanning must be omitted for Trino.
+	 */
+	@Override
+	public boolean requiresDerivedTableLimit() {
+		return false;
+	}
+
+	/**
 	 * Returns {@code true} — signals to {@code WhereClauseBuilder} that it should
 	 * coerce ID-column and COUNT-comparison parameters to {@link Long} for strict Trino
 	 * type matching on BIGINT columns.
