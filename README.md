@@ -4,9 +4,35 @@ Accepts a graph mapping file and Gremlin traversal strings, translates supported
 
 ## Quick start
 
+### Option 1 — Docker (recommended, zero setup)
+
+```bash
+cd demo
+docker compose up          # full stack: engine + Iceberg/Trino + Jupyter
+# OR — H2 only (lighter, no Iceberg):
+docker compose up engine jupyter
+```
+
+- Notebooks: **http://localhost:8888** (password: `GqeDemo123`)
+- Engine API: **http://localhost:7000**
+
+Open the AML or Social Networking notebook and run cells top-to-bottom to load data and execute queries.
+
+> **Kaggle data** (AML dataset) requires a Kaggle API token.  
+> Set `KAGGLE_USERNAME` and `KAGGLE_KEY` environment variables before `docker compose up`,  
+> or pass them via a `.env` file in the `demo/` directory.
+
+### Option 2 — Local (Maven)
+
 ```bash
 mvn exec:java   # start service on port 7000
 mvn test        # run all tests
+```
+
+Then open a notebook:
+
+```bash
+jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb
 ```
 
 ## Configuration
@@ -122,26 +148,30 @@ For a full mapping reference (including `outColumn`/`inColumn` and FK-style rela
 
 ## Local Iceberg container test
 
-```zsh
-cd /Users/vjoshi/SourceCode/graph-query-engine
-chmod +x scripts/iceberg_local_up.sh scripts/iceberg_seed_trino.sh scripts/iceberg_local_down.sh
-./scripts/iceberg_local_up.sh
-./scripts/iceberg_seed_trino.sh
+Start the full Iceberg stack (Trino + MinIO + Iceberg REST) using Docker Compose:
+
+```bash
+cd demo
+docker compose up minio minio-init iceberg-rest trino
 ```
 
-Start the API service in another terminal:
+Or bring up just the lightweight Iceberg infra stack:
 
-```zsh
-cd /Users/vjoshi/SourceCode/graph-query-engine
+```bash
+bash demo/infra/scripts/iceberg_local_up.sh
+```
+
+Start the engine in another terminal:
+
+```bash
 mvn exec:java
 ```
 
-Upload local Iceberg mapping and generate SQL:
+Upload the local Iceberg mapping and run a query:
 
-```zsh
-cd /Users/vjoshi/SourceCode/graph-query-engine
+```bash
 curl -X POST http://localhost:7000/mapping/upload \
-  -F "file=@mappings/iceberg-local-mapping.json" \
+  -F "file=@demo/aml/mappings/iceberg-local-mapping.json" \
   -F "id=iceberg-local" \
   -F "activate=true"
 
@@ -151,17 +181,17 @@ curl -X POST http://localhost:7000/query/explain \
   -d '{"gremlin":"g.V().hasLabel(\"Account\").values(\"accountId\").limit(5)"}'
 ```
 
-To execute a translated SQL query directly in Trino:
+To execute translated SQL directly in Trino:
 
-```zsh
-docker exec -i iceberg-trino trino --server http://localhost:8080 --execute "SELECT account_id FROM iceberg.aml.accounts LIMIT 5"
+```bash
+docker exec -i iceberg-trino trino --server http://localhost:8080 \
+  --execute "SELECT account_id FROM iceberg.aml.accounts LIMIT 5"
 ```
 
-When done:
+Tear down:
 
-```zsh
-cd /Users/vjoshi/SourceCode/graph-query-engine
-./scripts/iceberg_local_down.sh
+```bash
+bash demo/infra/scripts/iceberg_local_down.sh
 ```
 
 For stack internals and troubleshooting, see `infra/iceberg/README.md`.
@@ -201,32 +231,32 @@ curl -X POST http://localhost:7000/query/explain \
 
 ## AML demo (Jupyter notebook)
 
-The IBM AML dataset is **not checked into git** (files range from 32 MB to 16 GB).
-Download it first using the provided script:
+### Docker (easiest)
 
 ```bash
-# Requires Kaggle CLI and a ~/.kaggle/kaggle.json API token
-# Get your token at https://www.kaggle.com/settings → API → Create New Token
-pip install kaggle
-
-# Download HI-Small only (fastest, ~500 MB) and normalize 100k rows
-./scripts/download_aml_data.sh --variant HI-Small
-
-# Or download all variants (all sizes, ~70 GB total)
-./scripts/download_aml_data.sh
-
-# Options:
-#   --variant HI-Small|HI-Medium|HI-Large|LI-Small|LI-Medium|LI-Large
-#   --rows 50000          number of rows for aml-demo.csv (default: 100000)
-#   --skip-normalize      skip the normalize_aml.py step
-#   --src HI-Medium_Trans.csv   pick a different source for normalization
+cd demo
+KAGGLE_USERNAME=<your-username> KAGGLE_KEY=<your-key> docker compose up
 ```
 
-Then run the demo:
+Open **http://localhost:8888** (password: `GqeDemo123`) and run `aml/notebooks/aml_sql_showcase.ipynb`.
+
+### Local
+
+The IBM AML dataset is **not checked into git** (files range from 32 MB to 16 GB).
 
 ```bash
-mvn exec:java                              # terminal 1 — start engine
-jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb   # terminal 2 — open notebook
+# Requires Kaggle CLI and ~/.kaggle/kaggle.json API token
+# Get your token at https://www.kaggle.com/settings → API → Create New Token
+pip install kaggle
+```
+
+Then from the notebook (cell 1) set `MAX_ROWS` and `BACKEND` and run all cells — the notebook downloads and seeds data automatically.
+
+Or manually:
+
+```bash
+mvn exec:java                                                         # terminal 1
+jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb           # terminal 2
 ```
 
 Run cells top-to-bottom. Queries S1–S8 (simple) and C1–C11 (complex, including 10-hop) execute against the live service. See `QUICK_REFERENCE.md` for all queries in copy-paste form.
@@ -307,39 +337,23 @@ WCOJ_MAX_EDGES=500000 mvn exec:java
 ## Project layout
 
 ```
+demo/
+├── docker-compose.yml              # Full stack: engine + Iceberg + Jupyter
+├── docker-mappings/                # Docker-specific mappings (trino:8080 URLs)
+├── aml/                            # AML use-case notebooks, scripts, mappings
+├── social_networking/              # Social-network use-case notebooks, scripts, mappings
+├── infra/                          # Iceberg/Trino/MinIO infra scripts
+└── requirements.txt                # Python dependencies for notebooks
+docker/
+├── Dockerfile.local                # Local build from pre-built JAR
+└── entrypoint.sh                   # Engine startup + mapping upload
 src/main/java/com/graphqueryengine/
-├── App.java                          # HTTP routes
-├── engine/
-│   └── wcoj/
-│       ├── AdjacencyIndex.java       # CSR in-memory edge index
-│       ├── AdjacencyIndexRegistry.java  # lazy-load registry with size guard
-│       ├── LeapfrogIterator.java     # sorted iterator with seek()
-│       ├── LeapfrogTrieJoin.java     # WCOJ multi-hop path enumeration
-│       └── WcojGraphProvider.java   # GraphProvider using WCOJ + SQL fallback
-├── gremlin/
-│   ├── GremlinExecutionService.java
-│   └── provider/
-│       ├── GraphProvider.java        # Provider SPI
-│       ├── SqlGraphProvider.java     # SQL translation + JDBC execution
-│       ├── TinkerGraphProvider.java
-│       └── TinkerGraphTransactionApi.java
-├── query/
-│   ├── GremlinSqlTranslator.java     # Gremlin → SQL
-│   └── QueryExecutionService.java
-├── mapping/
-├── db/
+├── App.java                        # HTTP routes
+├── engine/wcoj/                    # WCOJ Leapfrog optimiser
+├── gremlin/provider/               # SQL graph provider
+├── query/                          # Gremlin → SQL translator
+├── mapping/                        # Mapping store
+├── db/                             # JDBC backend registry
 └── config/
-
-mappings/       Sample mapping JSON files
-benchmarks/     LSQB workload definitions
-scripts/        download_aml_data.sh, normalize_aml.py, benchmark_lsqb.py
-demo/data/      AML dataset CSVs  ← not in git, run scripts/download_aml_data.sh
+benchmarks/    LSQB workload definitions
 ```
-
-## IntelliJ sync
-
-```bash
-chmod +x scripts/intellij-reset.sh && ./scripts/intellij-reset.sh
-```
-
-Or: delete `GraphQueryEngine.iml`, run `mvn -U clean test`, then **Reload All Maven Projects**.

@@ -48,18 +48,27 @@ def _repo_root() -> pathlib.Path:
 
 
 def _h2_jar() -> str:
+    # Allow Docker / CI environments to supply the H2 JAR path explicitly.
+    env_jar = os.environ.get("H2_JAR")
+    if env_jar and pathlib.Path(env_jar).exists():
+        return env_jar
     home = pathlib.Path.home()
     jars = sorted(glob.glob(
         str(home / ".m2/repository/com/h2database/h2/**/*.jar"), recursive=True
     ))
     if not jars:
         raise RuntimeError(
-            "H2 jar not found in ~/.m2. Run 'mvn test-compile' once to download it."
+            "H2 jar not found in ~/.m2. Run 'mvn test-compile' once to download it, "
+            "or set the H2_JAR environment variable."
         )
     return jars[-1]
 
 
 def _db_url(repo_root: pathlib.Path) -> str:
+    # Allow Docker / CI to override the DB path via an environment variable.
+    db_path_env = os.environ.get("DB_PATH")
+    if db_path_env:
+        return f"jdbc:h2:file:{db_path_env}"
     db_file = repo_root / "data" / "graph"
     # No AUTO_SERVER — seed runs standalone with the app server stopped.
     return f"jdbc:h2:file:{db_file}"

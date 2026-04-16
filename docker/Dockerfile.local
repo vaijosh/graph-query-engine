@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dockerfile.local — fast local build using pre-built JAR
+#
+# Build context must be the repo root (one level up from this file).
+# Used automatically by docker/docker-compose.yml.
+#
+# Manual build:
+#   mvn package -DskipTests
+#   docker build -f docker/Dockerfile.local -t graph-query-engine:local .
+# ─────────────────────────────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jre-alpine
+
+LABEL org.opencontainers.image.title="graph-query-engine (local)"
+
+RUN mkdir -p /app/data /app/mappings /app/wcoj-index-cache /app/docker
+
+WORKDIR /app
+
+# Pre-built JAR from local target/
+COPY target/graph-query-engine-0.1.0.jar app.jar
+
+
+# Entrypoint
+COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+RUN chmod +x /app/docker/entrypoint.sh
+
+# Install curl (used by entrypoint health-wait loop)
+RUN apk add --no-cache curl
+
+ENV DB_URL="jdbc:h2:file:/app/data/graph;AUTO_SERVER=TRUE" \
+    DB_USER="sa" \
+    DB_PASSWORD="" \
+    DB_DRIVER="" \
+    WCOJ_ENABLED="true" \
+    WCOJ_MAX_EDGES="5000000" \
+    WCOJ_DISK_QUOTA_MB="2048" \
+    WCOJ_INDEX_TTL_SECONDS="30" \
+    SERVER_PORT="7000" \
+    ACTIVE_MAPPING="aml-h2" \
+    JAVA_OPTS="-Xmx2g -Xms512m"
+
+EXPOSE 7000
+
+VOLUME ["/app/data", "/app/wcoj-index-cache"]
+
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+

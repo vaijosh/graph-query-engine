@@ -1,0 +1,207 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph Query Engine — full stack
+#
+# Services:
+#   engine       — graph-query-engine REST server  (port 7000)
+#   trino        — Trino SQL engine for Iceberg     (port 8080)
+#   iceberg-rest — Iceberg REST catalog             (port 8181)
+#   minio        — MinIO S3-compatible object store (ports 9000/9001)
+#   jupyter      — Jupyter notebook server          (port 8888)
+#
+# Run from the demo/ directory:
+#   cd demo
+#   docker compose up          # full stack (engine + Iceberg + Jupyter)
+#   docker compose up engine jupyter   # H2-only (no Iceberg/Trino)
+#
+# Or from the repo root:
+#   docker compose -f demo/docker-compose.yml up
+#
+# Notebooks at http://localhost:8888  (password: GqeDemo123)
+# Engine API  at http://localhost:7000
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  gqe-net:
+    driver: bridge
+
+volumes:
+  wcoj-cache:       # WCOJ index cache (spill-to-disk)
+  minio-data:       # MinIO object storage
+  jupyter-work:     # Persistent notebook outputs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph Query Engine
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  engine:
+    # Pull from Docker Hub by default. To build locally instead:
+    #   docker compose up --build
+    image: vaijosh/graph-query-engine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.local
+    container_name: gqe-engine
+    ports:
+      - "7000:7000"
+    environment:
+      DB_URL:   "jdbc:h2:file:/app/data/graph;AUTO_SERVER=TRUE"
+      DB_USER:  "sa"
+      DB_PASSWORD: ""
+      WCOJ_ENABLED:            "true"
+      WCOJ_MAX_EDGES:          "5000000"
+      WCOJ_DISK_QUOTA_MB:      "2048"
+      WCOJ_INDEX_TTL_SECONDS:  "30"
+      JAVA_OPTS: "-Xmx4g -Xms512m"
+      ACTIVE_MAPPING: "aml-h2"
+    volumes:
+      - ../data:/app/data
+      - wcoj-cache:/app/wcoj-index-cache
+      # Demo mappings (Docker-specific, trino:8080 URLs) — mounted at runtime
+      # so the engine image itself stays mapping-agnostic
+      - ./docker-mappings:/app/mappings:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - gqe-net
+    restart: unless-stopped
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Iceberg stack — starts by default with `docker compose up`.
+# To run H2-only (lighter): docker compose up engine jupyter
+# ─────────────────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: iceberg-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_DOMAIN:        minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      default:
+        aliases:
+          - warehouse.minio
+          - aml.minio
+      gqe-net:
+        aliases:
+          - warehouse.minio
+          - aml.minio
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: iceberg-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin --api s3v4 &&
+      mc mb --ignore-existing local/warehouse &&
+      mc mb --ignore-existing local/aml &&
+      exit 0
+      "
+    networks:
+      - gqe-net
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_REGION:              us-east-1
+      AWS_ACCESS_KEY_ID:       minioadmin
+      AWS_SECRET_ACCESS_KEY:   minioadmin
+      CATALOG_WAREHOUSE:       s3://warehouse
+      CATALOG_IO__IMPL:        org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT:     http://minio:9000
+      CATALOG_S3_PATH_STYLE_ACCESS: "true"
+    ports:
+      - "8181:8181"
+    networks:
+      - gqe-net
+
+  trino:
+    image: trinodb/trino:471
+    container_name: iceberg-trino
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID:     minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION:            us-east-1
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/iceberg/trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./infra/iceberg/trino/catalog/hive.properties:/etc/trino/catalog/hive.properties:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    networks:
+      - gqe-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Jupyter notebook server
+# ─────────────────────────────────────────────────────────────────────────────
+  jupyter:
+    image: jupyter/scipy-notebook:latest
+    container_name: gqe-jupyter
+    depends_on:
+      engine:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+    environment:
+      # Jupyter password: GqeDemo123  (token auth disabled)
+      JUPYTER_TOKEN: ""
+      BASE_URL:       "http://engine:7000"
+      TRINO_HOST:     "trino"
+      TRINO_PORT:     "8080"
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY:    "minioadmin"
+      MINIO_SECRET_KEY:    "minioadmin"
+      KAGGLE_USERNAME:     "${KAGGLE_USERNAME:-}"
+      KAGGLE_KEY:          "${KAGGLE_KEY:-}"
+      DOCKER_MAPPINGS_DIR: "/home/jovyan/docker-mappings"
+      REPO_ROOT:           "/home/jovyan"
+    volumes:
+      # Demo notebooks and scripts (this directory)
+      - .:/home/jovyan/demo
+      # Shared data directory (H2 DB + CSVs)
+      - ../data:/home/jovyan/data
+      # Docker-specific mapping files (trino:8080 URLs)
+      - ./docker-mappings:/home/jovyan/docker-mappings:ro
+      # Persistent notebook outputs
+      - jupyter-work:/home/jovyan/work
+    user: root
+    command: >
+      bash -c "
+        pip install --quiet -r /home/jovyan/demo/requirements.txt &&
+        start-notebook.sh --ServerApp.token='' --ServerApp.password='argon2:$$argon2id$$v=19$$m=10240,t=10,p=8$$gxaFt7mdz/Kcfb+HCjNZOA$$NlwjhrKr25Pfs4LIupuvEE1JveYhS9koZ/t8O+NxFkM' --ServerApp.notebook_dir='/home/jovyan/demo'
+      "
+    networks:
+      - gqe-net
+    restart: unless-stopped
+

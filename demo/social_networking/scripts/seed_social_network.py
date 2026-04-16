@@ -32,28 +32,34 @@ import subprocess
 import sys
 import time
 
-BASE_URL = "http://localhost:7000"
+import os as _os_env
+
+BASE_URL        = _os_env.environ.get("BASE_URL",        "http://localhost:7000")
+_TRINO_HOST     = _os_env.environ.get("TRINO_HOST",      "localhost")
+_TRINO_PORT     = _os_env.environ.get("TRINO_PORT",      "8080")
+_MINIO_ENDPOINT = _os_env.environ.get("MINIO_ENDPOINT",  "http://localhost:9000")
+_MINIO_KEY      = _os_env.environ.get("MINIO_ACCESS_KEY","minioadmin")
+_MINIO_SECRET   = _os_env.environ.get("MINIO_SECRET_KEY","minioadmin")
+
 TRINO_CONTAINER = "iceberg-trino"
-TRINO_SERVER = "http://localhost:8080"
+TRINO_SERVER    = f"http://{_TRINO_HOST}:{_TRINO_PORT}"
 
 # BACKENDS JSON for iceberg-only mode — Trino is the default (first) backend.
-# The engine uses the BackendRegistry and routes all queries to Trino.
 ICEBERG_BACKENDS_JSON = (
-    '[{"id":"iceberg","url":"jdbc:trino://localhost:8080/iceberg","user":"admin","driverClass":"io.trino.jdbc.TrinoDriver"}]'
+    f'[{{"id":"iceberg","url":"jdbc:trino://{_TRINO_HOST}:{_TRINO_PORT}/iceberg","user":"admin","driverClass":"io.trino.jdbc.TrinoDriver"}}]'
 )
 
-# Maven env for iceberg mode — use BACKENDS so the engine starts in multi-backend mode
-# with iceberg as the default, enabling datasource-aware routing from the mapping.
+# Maven env for iceberg mode
 ICEBERG_ENGINE_ENV = {
     "GRAPH_PROVIDER": "sql",
     "QUERY_TRANSLATOR_BACKEND": "iceberg",
     "BACKENDS": ICEBERG_BACKENDS_JSON,
 }
 
-# BACKENDS JSON for multi-backend hybrid mode (Person/edges in H2, Company/City/Skill in Iceberg)
+# BACKENDS JSON for multi-backend hybrid mode
 HYBRID_BACKENDS_JSON = (
-    '[{"id":"h2","url":"jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE"},'
-    '{"id":"iceberg","url":"jdbc:trino://localhost:8080/iceberg","user":"admin","driverClass":"io.trino.jdbc.TrinoDriver"}]'
+    f'[{{"id":"h2","url":"jdbc:h2:file:./data/graph;AUTO_SERVER=TRUE"}},'
+    f'{{"id":"iceberg","url":"jdbc:trino://{_TRINO_HOST}:{_TRINO_PORT}/iceberg","user":"admin","driverClass":"io.trino.jdbc.TrinoDriver"}}]'
 )
 
 
@@ -188,17 +194,7 @@ def _h2_person_count(db_url: str, h2_jar: str) -> int:
 
 def _trino_person_count() -> int:
     """Return the number of rows in iceberg.social_network.persons, or -1 on error."""
-    cmd = ["docker", "exec", "-i", TRINO_CONTAINER, "trino",
-           "--server", TRINO_SERVER,
-           "--execute", "SELECT COUNT(*) FROM iceberg.social_network.persons"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-    if result.returncode != 0:
-        return -1
-    for line in result.stdout.splitlines():
-        line = line.strip().strip('"')
-        if line.isdigit():
-            return int(line)
-    return -1
+    return _trino_count("SELECT COUNT(*) FROM iceberg.social_network.persons")
 
 
 
@@ -508,7 +504,7 @@ DELETE FROM sn_persons; DELETE FROM sn_companies; DELETE FROM sn_cities; DELETE 
 # ── Iceberg/Trino seeding ──────────────────────────────────────────────────────
 
 def trino(sql: str) -> None:
-    """Execute SQL via docker exec (legacy helper, used by sql mode)."""
+    """Execute SQL via docker exec (legacy helper — only works when docker CLI is available)."""
     cmd = ["docker", "exec", "-i", TRINO_CONTAINER, "trino",
            "--server", TRINO_SERVER, "--execute", sql]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -519,11 +515,11 @@ def trino(sql: str) -> None:
 
 
 def _trino_exec(sql: str) -> list:
-    """Execute SQL via trino Python client if available, else docker exec."""
+    """Execute SQL via the trino Python client. Falls back to docker exec only if trino package is missing."""
     try:
         import trino as _trino  # type: ignore
         conn = _trino.dbapi.connect(
-            host="localhost", port=8080, user="admin",
+            host=_TRINO_HOST, port=int(_TRINO_PORT), user="admin",
             http_scheme="http", request_timeout=600,
         )
         cur = conn.cursor()
@@ -533,7 +529,14 @@ def _trino_exec(sql: str) -> list:
         except Exception:
             return []
     except ImportError:
-        trino(sql)
+        # trino package not installed — fall back to docker exec (local dev only)
+        try:
+            trino(sql)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Neither the 'trino' Python package nor the 'docker' CLI is available. "
+                "Install trino: pip install trino"
+            )
         return []
 
 
@@ -554,9 +557,9 @@ def _upload_csv_to_minio(csv_bytes: bytes, key: str) -> None:
         import boto3  # type: ignore
         s3 = boto3.client(
             "s3",
-            endpoint_url="http://localhost:9000",
-            aws_access_key_id="minioadmin",
-            aws_secret_access_key="minioadmin",
+            endpoint_url=_MINIO_ENDPOINT,
+            aws_access_key_id=_MINIO_KEY,
+            aws_secret_access_key=_MINIO_SECRET,
             region_name="us-east-1",
         )
         try:
@@ -572,8 +575,8 @@ def _upload_csv_to_minio(csv_bytes: bytes, key: str) -> None:
             tmp_path = tf.name
         try:
             subprocess.run(
-                ["mc", "alias", "set", "local", "http://localhost:9000",
-                 "minioadmin", "minioadmin", "--api", "s3v4"],
+                ["mc", "alias", "set", "local", _MINIO_ENDPOINT,
+                 _MINIO_KEY, _MINIO_SECRET, "--api", "s3v4"],
                 check=True, capture_output=True,
             )
             subprocess.run(

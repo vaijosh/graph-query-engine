@@ -53,14 +53,15 @@ from pathlib import Path
 from typing import Any
 
 # ── constants ────────────────────────────────────────────────────────────────
+import os as _os_env
 
-MINIO_ENDPOINT   = "http://localhost:9000"
-MINIO_ACCESS_KEY = "minioadmin"
-MINIO_SECRET_KEY = "minioadmin"
+MINIO_ENDPOINT   = _os_env.environ.get("MINIO_ENDPOINT",   "http://localhost:9000")
+MINIO_ACCESS_KEY = _os_env.environ.get("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY = _os_env.environ.get("MINIO_SECRET_KEY", "minioadmin")
 MINIO_BUCKET     = "warehouse"
 
-TRINO_HOST      = "localhost"
-TRINO_PORT      = 8080
+TRINO_HOST      = _os_env.environ.get("TRINO_HOST", "localhost")
+TRINO_PORT      = int(_os_env.environ.get("TRINO_PORT", "8080"))
 TRINO_USER      = "admin"
 TRINO_CONTAINER = "iceberg-trino"
 
@@ -248,7 +249,7 @@ def _trino_via_client(sql: str) -> list[Any]:
 
 def _trino_via_docker(sql: str) -> None:
     cmd = ["docker", "exec", TRINO_CONTAINER, "trino",
-           "--server", f"http://localhost:{TRINO_PORT}",
+           "--server", f"http://{TRINO_HOST}:{TRINO_PORT}",
            "--execute", sql]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
@@ -261,7 +262,13 @@ def trino_exec(sql: str) -> list[Any]:
         import trino  # noqa: F401
         return _trino_via_client(sql)
     except ImportError:
-        _trino_via_docker(sql)
+        try:
+            _trino_via_docker(sql)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Neither the 'trino' Python package nor the 'docker' CLI is available. "
+                "Install trino: pip install trino"
+            )
         return []
 
 

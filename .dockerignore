@@ -1,0 +1,35 @@
+# ── Build artefacts ───────────────────────────────────────────────────────────
+target/
+!target/graph-query-engine-*.jar
+
+# ── IDE / OS files ────────────────────────────────────────────────────────────
+.idea/
+*.iml
+.DS_Store
+*.swp
+*.class
+
+# ── Runtime data (populated at runtime via volumes) ──────────────────────────
+data/*.mv.db
+data/*.trace.db
+wcoj-index-cache/
+
+# ── Python caches ─────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# ── Engine mapping store (runtime state) ─────────────────────────────────────
+.mapping-store/
+
+# ── Large generated SQL files ─────────────────────────────────────────────────
+demo/infra/scripts/seed_aml_generated.sql
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Benchmarks (not needed at runtime) ───────────────────────────────────────
+benchmarks/
+
