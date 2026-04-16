@@ -175,7 +175,20 @@ Trino can take 30–60 seconds to start. Check: `curl http://localhost:8080/v1/i
 Ensure the full stack is running (`docker compose up`, not `docker compose up engine jupyter`).
 
 **Building from source (after code changes):**
+
+Option A — build, push to Docker Hub, then start the stack:
 ```bash
+# Single command: compiles, packages, builds Docker image, pushes :latest
+mvn package -DskipTests -P docker-push
+cd demo && docker compose up
+```
+
+Option B — local rebuild without pushing:
+```bash
+# 1. Build the fat JAR and copy the H2 JAR to target/dependency/
+mvn package -DskipTests
+
+# 2. Rebuild and start the Docker stack
 cd demo
 docker compose up --build
 ```

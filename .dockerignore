@@ -1,6 +1,7 @@
 # ── Build artefacts ───────────────────────────────────────────────────────────
 target/
 !target/graph-query-engine-*.jar
+!target/dependency/h2.jar
 
 # ── IDE / OS files ────────────────────────────────────────────────────────────
 .idea/

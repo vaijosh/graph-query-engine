@@ -42,6 +42,10 @@ WORKDIR /app
 # ── Fat JAR ───────────────────────────────────────────────────────────────────
 COPY --from=build /build/target/graph-query-engine-0.1.0.jar app.jar
 
+# ── H2 JAR (for seed scripts / Shell tool) ───────────────────────────────────
+RUN mkdir -p /opt
+COPY --from=build /build/target/dependency/h2.jar /opt/h2.jar
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
 RUN chmod +x /app/docker/entrypoint.sh
@@ -51,6 +55,7 @@ ENV DB_URL="jdbc:h2:file:/app/data/graph;AUTO_SERVER=TRUE" \
     DB_USER="sa" \
     DB_PASSWORD="" \
     DB_DRIVER="" \
+    H2_JAR="/opt/h2.jar" \
     GRAPH_PROVIDER="sql" \
     WCOJ_ENABLED="true" \
     WCOJ_MAX_EDGES="5000000" \

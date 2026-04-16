@@ -152,6 +152,30 @@
                     </execution>
                 </executions>
             </plugin>
+            <!-- Copy H2 JAR to target/dependency/ so Dockerfiles can embed it without wget -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.8.1</version>
+                <executions>
+                    <execution>
+                        <id>copy-h2-jar</id>
+                        <phase>prepare-package</phase>
+                        <goals><goal>copy</goal></goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>com.h2database</groupId>
+                                    <artifactId>h2</artifactId>
+                                    <version>2.3.232</version>
+                                    <destFileName>h2.jar</destFileName>
+                                </artifactItem>
+                            </artifactItems>
+                            <outputDirectory>${project.build.directory}/dependency</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
@@ -174,5 +198,90 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- ─────────────────────────────────────────────────────────────────────
+         docker-push profile
+         Builds the fat JAR + H2 JAR, then builds and pushes the Docker image.
+
+         Usage:
+           mvn package -P docker-push                   # build & push :latest
+           mvn package -P docker-push -Ddocker.tag=1.2  # build & push a version tag too
+         ───────────────────────────────────────────────────────────────────── -->
+    <profiles>
+        <profile>
+            <id>docker-push</id>
+            <properties>
+                <docker.image>vaijosh/graph-query-engine</docker.image>
+                <docker.tag>${project.version}</docker.tag>
+                <docker.dockerfile>docker/Dockerfile.local</docker.dockerfile>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <executions>
+                            <!-- 1. docker build -->
+                            <execution>
+                                <id>docker-build</id>
+                                <phase>package</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>docker</executable>
+                                    <arguments>
+                                        <argument>build</argument>
+                                        <argument>-f</argument>  <argument>${docker.dockerfile}</argument>
+                                        <argument>-t</argument>  <argument>${docker.image}:latest</argument>
+                                        <argument>.</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <!-- 2. optional version tag -->
+                            <execution>
+                                <id>docker-tag</id>
+                                <phase>package</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>docker</executable>
+                                    <arguments>
+                                        <argument>tag</argument>
+                                        <argument>${docker.image}:latest</argument>
+                                        <argument>${docker.image}:${docker.tag}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <!-- 3. docker push :latest -->
+                            <execution>
+                                <id>docker-push-latest</id>
+                                <phase>package</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>docker</executable>
+                                    <arguments>
+                                        <argument>push</argument>
+                                        <argument>${docker.image}:latest</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                            <!-- 4. docker push :<version> -->
+                            <execution>
+                                <id>docker-push-tag</id>
+                                <phase>package</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>docker</executable>
+                                    <arguments>
+                                        <argument>push</argument>
+                                        <argument>${docker.image}:${docker.tag}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
 

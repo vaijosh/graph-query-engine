@@ -10,8 +10,9 @@
 #
 # Run from the demo/ directory:
 #   cd demo
-#   docker compose up          # full stack (engine + Iceberg + Jupyter)
-#   docker compose up engine jupyter   # H2-only (no Iceberg/Trino)
+#   docker compose up          # full stack (engine + Iceberg + Jupyter, BACKEND=iceberg)
+#   docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter
+#                              # H2-only (no Iceberg/Trino, BACKEND=h2)
 #
 # Or from the repo root:
 #   docker compose -f demo/docker-compose.yml up
@@ -71,7 +72,8 @@ services:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Iceberg stack — starts by default with `docker compose up`.
-# To run H2-only (lighter): docker compose up engine jupyter
+# To run H2-only (lighter):
+#   docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter
 # ─────────────────────────────────────────────────────────────────────────────
   minio:
     image: minio/minio:latest
@@ -133,6 +135,11 @@ services:
       CATALOG_IO__IMPL:        org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT:     http://minio:9000
       CATALOG_S3_PATH_STYLE_ACCESS: "true"
+      # Suppress noisy NoSuchViewException ERRORs — Trino always probes for a
+      # view fallback after resolving a table; downgraded to WARN in log4j.properties.
+      JAVA_TOOL_OPTIONS: "-Dlog4j.configuration=file:/etc/iceberg-rest/log4j.properties"
+    volumes:
+      - ./infra/iceberg/iceberg-rest/log4j.properties:/etc/iceberg-rest/log4j.properties:ro
     ports:
       - "8181:8181"
     networks:
@@ -177,15 +184,22 @@ services:
       # Jupyter password: GqeDemo123  (token auth disabled)
       JUPYTER_TOKEN: ""
       BASE_URL:       "http://engine:7000"
-      TRINO_HOST:     "trino"
-      TRINO_PORT:     "8080"
+      TRINO_HOST:         "trino"
+      TRINO_PORT:         "8080"
+      ENGINE_TRINO_HOST:  "trino"
       MINIO_ENDPOINT: "http://minio:9000"
       MINIO_ACCESS_KEY:    "minioadmin"
       MINIO_SECRET_KEY:    "minioadmin"
       KAGGLE_USERNAME:     "${KAGGLE_USERNAME:-}"
       KAGGLE_KEY:          "${KAGGLE_KEY:-}"
+      # Controls BACKEND in notebooks automatically.
+      # Full stack (docker compose up)          → iceberg (default)
+      # H2-only (docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter)
+      #                                         → h2  (set by docker-compose.h2.yml override)
+      NOTEBOOK_BACKEND:    "${NOTEBOOK_BACKEND:-iceberg}"
       DOCKER_MAPPINGS_DIR: "/home/jovyan/docker-mappings"
       REPO_ROOT:           "/home/jovyan"
+      H2_JAR:              "/opt/h2.jar"
     volumes:
       # Demo notebooks and scripts (this directory)
       - .:/home/jovyan/demo
@@ -198,6 +212,8 @@ services:
     user: root
     command: >
       bash -c "
+        apt-get update -qq && apt-get install -y --no-install-recommends default-jre-headless wget && rm -rf /var/lib/apt/lists/* &&
+        wget -q https://repo1.maven.org/maven2/com/h2database/h2/2.3.232/h2-2.3.232.jar -O /opt/h2.jar &&
         pip install --quiet -r /home/jovyan/demo/requirements.txt &&
         start-notebook.sh --ServerApp.token='' --ServerApp.password='argon2:$$argon2id$$v=19$$m=10240,t=10,p=8$$gxaFt7mdz/Kcfb+HCjNZOA$$NlwjhrKr25Pfs4LIupuvEE1JveYhS9koZ/t8O+NxFkM' --ServerApp.notebook_dir='/home/jovyan/demo'
       "

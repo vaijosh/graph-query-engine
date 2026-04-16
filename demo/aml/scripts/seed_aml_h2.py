@@ -48,20 +48,41 @@ def _repo_root() -> pathlib.Path:
 
 
 def _h2_jar() -> str:
-    # Allow Docker / CI environments to supply the H2 JAR path explicitly.
+    """Locate the H2 JAR, downloading it automatically if not found.
+
+    Priority: H2_JAR env var → /opt/h2.jar (Docker) → ~/.m2 → auto-download to /tmp
+    """
+    import urllib.request
+
+    _H2_VERSION = "2.3.232"
+    _H2_URL = (
+        f"https://repo1.maven.org/maven2/com/h2database/h2/{_H2_VERSION}/h2-{_H2_VERSION}.jar"
+    )
+
+    # 1. Explicit env override
     env_jar = os.environ.get("H2_JAR")
     if env_jar and pathlib.Path(env_jar).exists():
         return env_jar
+
+    # 2. Pre-downloaded Docker location
+    if pathlib.Path("/opt/h2.jar").exists():
+        return "/opt/h2.jar"
+
+    # 3. Maven local repository
     home = pathlib.Path.home()
     jars = sorted(glob.glob(
         str(home / ".m2/repository/com/h2database/h2/**/*.jar"), recursive=True
     ))
-    if not jars:
-        raise RuntimeError(
-            "H2 jar not found in ~/.m2. Run 'mvn test-compile' once to download it, "
-            "or set the H2_JAR environment variable."
-        )
-    return jars[-1]
+    if jars:
+        return jars[-1]
+
+    # 4. Auto-download to /tmp as last resort
+    tmp_jar = pathlib.Path(f"/tmp/h2-{_H2_VERSION}.jar")
+    if not tmp_jar.exists():
+        print(f"  Downloading H2 JAR from Maven Central → {tmp_jar} …")
+        urllib.request.urlretrieve(_H2_URL, tmp_jar)
+        print("  ✓ H2 JAR downloaded.")
+    return str(tmp_jar)
 
 
 def _db_url(repo_root: pathlib.Path) -> str:

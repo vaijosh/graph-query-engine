@@ -19,6 +19,11 @@ WORKDIR /app
 # Pre-built JAR from local target/
 COPY target/graph-query-engine-0.1.0.jar app.jar
 
+# H2 JAR copied from Maven build output (target/dependency/h2.jar)
+# Run `mvn package -DskipTests` first to generate it.
+RUN mkdir -p /opt
+COPY target/dependency/h2.jar /opt/h2.jar
+
 
 # Entrypoint
 COPY docker/entrypoint.sh /app/docker/entrypoint.sh
@@ -31,6 +36,7 @@ ENV DB_URL="jdbc:h2:file:/app/data/graph;AUTO_SERVER=TRUE" \
     DB_USER="sa" \
     DB_PASSWORD="" \
     DB_DRIVER="" \
+    H2_JAR="/opt/h2.jar" \
     WCOJ_ENABLED="true" \
     WCOJ_MAX_EDGES="5000000" \
     WCOJ_DISK_QUOTA_MB="2048" \

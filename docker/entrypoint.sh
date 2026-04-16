@@ -7,6 +7,17 @@ set -e
 ENGINE_URL="http://localhost:${SERVER_PORT:-7000}"
 MAPPINGS_DIR="/app/mappings"
 
+# ── 0. Clear stale mapping-store so mounted /app/mappings/ always wins ───────
+# Without this, a mapping uploaded in a previous container session (e.g. a local
+# run with localhost:8080) persists in the writable layer and the engine loads it
+# at startup — overriding the Docker-specific mappings (trino:8080) mounted at
+# /app/mappings/. Wiping here guarantees a clean slate on every container start.
+MAPPING_STORE_DIR="/app/.mapping-store"
+if [ -d "${MAPPING_STORE_DIR}" ]; then
+  echo "[entrypoint] Clearing stale mapping-store at ${MAPPING_STORE_DIR} …"
+  rm -rf "${MAPPING_STORE_DIR}"
+fi
+
 # ── 1. Start the engine in the background ────────────────────────────────────
 echo "[entrypoint] Starting graph-query-engine on port ${SERVER_PORT:-7000} …"
 java \

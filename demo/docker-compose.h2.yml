@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.h2.yml — H2-only override
+#
+# Overrides NOTEBOOK_BACKEND=h2 so notebooks automatically select the H2
+# backend when Iceberg/Trino is not running.
+#
+# Usage (H2-only, lighter stack):
+#   docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter
+#
+# Full stack (Iceberg default — no override needed):
+#   docker compose up
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  jupyter:
+    environment:
+      NOTEBOOK_BACKEND: "h2"
+

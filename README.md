@@ -8,9 +8,9 @@ Accepts a graph mapping file and Gremlin traversal strings, translates supported
 
 ```bash
 cd demo
-docker compose up          # full stack: engine + Iceberg/Trino + Jupyter
+docker compose up          # full stack: engine + Iceberg/Trino + Jupyter (BACKEND=iceberg)
 # OR — H2 only (lighter, no Iceberg):
-docker compose up engine jupyter
+docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter
 ```
 
 - Notebooks: **http://localhost:8888** (password: `GqeDemo123`)
@@ -28,6 +28,19 @@ Open the AML or Social Networking notebook and run cells top-to-bottom to load d
 mvn exec:java   # start service on port 7000
 mvn test        # run all tests
 ```
+
+> **Building and pushing the Docker image:**
+> ```bash
+> # Build JAR + Docker image + push :latest in one command
+> mvn package -DskipTests -P docker-push
+>
+> # Also push a version tag (e.g. 0.1.0)
+> mvn package -DskipTests -P docker-push -Ddocker.tag=0.1.0 -Ddocker.tag.skip=false
+>
+> # Local stack rebuild only (no push)
+> mvn package -DskipTests          # produces target/graph-query-engine-*.jar and target/dependency/h2.jar
+> cd demo && docker compose up --build
+> ```
 
 Then open a notebook:
 
@@ -345,6 +358,7 @@ demo/
 ├── infra/                          # Iceberg/Trino/MinIO infra scripts
 └── requirements.txt                # Python dependencies for notebooks
 docker/
+├── Dockerfile                  # CI/prod multi-stage build (bundles H2 JAR via Maven)
 ├── Dockerfile.local                # Local build from pre-built JAR
 └── entrypoint.sh                   # Engine startup + mapping upload
 src/main/java/com/graphqueryengine/

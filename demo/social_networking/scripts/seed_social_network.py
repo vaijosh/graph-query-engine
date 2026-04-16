@@ -27,7 +27,9 @@ Usage:
 """
 
 import argparse
+import glob
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -172,6 +174,48 @@ def ensure_iceberg_provider(repo_root: str) -> None:
                 print("\nEngine is ready with SQL provider.")
                 return
     print("\nWarning: engine did not come up within 3 minutes. Continuing anyway…")
+
+# ── H2 JAR resolver ────────────────────────────────────────────────────────────
+
+_H2_VERSION = "2.3.232"
+_H2_DOWNLOAD_URL = (
+    f"https://repo1.maven.org/maven2/com/h2database/h2/{_H2_VERSION}/h2-{_H2_VERSION}.jar"
+)
+_H2_CACHE_PATH = pathlib.Path("/opt/h2.jar")
+
+
+def _resolve_h2_jar() -> str:
+    """Locate the H2 JAR, downloading it automatically if not found.
+
+    Priority: H2_JAR env var → /opt/h2.jar → ~/.m2 → auto-download to /tmp/h2.jar
+    """
+    import urllib.request
+
+    # 1. Explicit env override
+    env_jar = os.environ.get("H2_JAR")
+    if env_jar and pathlib.Path(env_jar).exists():
+        return env_jar
+
+    # 2. Pre-downloaded Docker location
+    if _H2_CACHE_PATH.exists():
+        return str(_H2_CACHE_PATH)
+
+    # 3. Maven local repository
+    home = pathlib.Path.home()
+    m2_jars = sorted(glob.glob(
+        str(home / ".m2/repository/com/h2database/h2/**/*.jar"), recursive=True
+    ))
+    if m2_jars:
+        return m2_jars[-1]
+
+    # 4. Auto-download to /tmp as last resort
+    tmp_jar = pathlib.Path(f"/tmp/h2-{_H2_VERSION}.jar")
+    if not tmp_jar.exists():
+        print(f"  Downloading H2 JAR from Maven Central → {tmp_jar} …")
+        urllib.request.urlretrieve(_H2_DOWNLOAD_URL, tmp_jar)
+        print("  ✓ H2 JAR downloaded.")
+    return str(tmp_jar)
+
 
 # ── Data-exists checks ─────────────────────────────────────────────────────────
 
@@ -336,14 +380,8 @@ def seed_h2(wipe: bool, mode: str = "csvread") -> None:
     r.raise_for_status()
     print(f"Mapping uploaded: {r.json().get('mappingId')}")
 
-    # ── Locate the H2 jar in the Maven local repository ───────────────────────
-    home = pathlib.Path.home()
-    h2_jars = sorted(glob.glob(str(home / ".m2/repository/com/h2database/h2/**/*.jar"),
-                               recursive=True))
-    if not h2_jars:
-        raise RuntimeError(
-            "H2 jar not found in ~/.m2. Run 'mvn test-compile' once to download it.")
-    h2_jar = h2_jars[-1]
+    # ── Locate (or download) the H2 jar ──────────────────────────────────────
+    h2_jar = _resolve_h2_jar()
 
     # ── Locate repo root for DB file ──────────────────────────────────────────
     repo_root = pathlib.Path(__file__).resolve().parents[3]
@@ -707,6 +745,8 @@ def seed_iceberg(wipe: bool, mode: str = "csv") -> None:
             print(f"✓ ({cnt} rows)")
 
         print("Iceberg CSV bulk seed complete.")
+        _upload_iceberg_mapping()
+        return
 
     else:
         # ── Legacy: row-by-row INSERT via docker exec ──────────────────────────
@@ -748,6 +788,83 @@ def seed_iceberg(wipe: bool, mode: str = "csv") -> None:
                   f"({eid},{coid},{cid})")
         print("Iceberg seed complete.")
 
+    _upload_iceberg_mapping()
+
+
+# ── Iceberg mapping upload ──────────────────────────────────────────────────────
+
+def _upload_iceberg_mapping() -> None:
+    """
+    Upload (and activate) the social-network iceberg mapping to the engine,
+    building the Trino JDBC URL dynamically from TRINO_HOST / TRINO_PORT env vars.
+
+    This ensures the engine always connects to the correct Trino host regardless
+    of whether we are running inside Docker (trino:8080) or locally (localhost:8080),
+    and overwrites any stale mapping-store entry left over from a previous run.
+    """
+    import json as _json
+
+    mapping = {
+        "backends": {
+            "iceberg": {
+                "url":         f"jdbc:trino://{_TRINO_HOST}:{_TRINO_PORT}/iceberg",
+                "user":        "admin",
+                "password":    "",
+                "driverClass": "io.trino.jdbc.TrinoDriver",
+            }
+        },
+        "defaultDatasource": "iceberg",
+        "vertices": {
+            "Person":  {"table": "iceberg:iceberg.social_network.persons",  "idColumn": "id",
+                        "properties": {"name": "name", "age": "age", "email": "email",
+                                       "city": "city", "country": "country", "joinedAt": "joined_at"}},
+            "Company": {"table": "iceberg:iceberg.social_network.companies","idColumn": "id",
+                        "properties": {"name": "name", "industry": "industry", "country": "country",
+                                       "founded": "founded", "employees": "employees"}},
+            "City":    {"table": "iceberg:iceberg.social_network.cities",   "idColumn": "id",
+                        "properties": {"name": "name", "country": "country",
+                                       "population": "population", "timezone": "timezone"}},
+            "Skill":   {"table": "iceberg:iceberg.social_network.skills",   "idColumn": "id",
+                        "properties": {"name": "name", "category": "category"}},
+        },
+        "edges": {
+            "KNOWS":     {"table": "iceberg:iceberg.social_network.knows",       "idColumn": "id",
+                          "outColumn": "person_a_id",  "inColumn": "person_b_id",
+                          "outVertexLabel": "Person",  "inVertexLabel": "Person",
+                          "properties": {"since": "since", "strength": "strength"}},
+            "WORKS_AT":  {"table": "iceberg:iceberg.social_network.works_at",    "idColumn": "id",
+                          "outColumn": "person_id",    "inColumn": "company_id",
+                          "outVertexLabel": "Person",  "inVertexLabel": "Company",
+                          "properties": {"role": "role", "startYear": "start_year"}},
+            "LIVES_IN":  {"table": "iceberg:iceberg.social_network.lives_in",    "idColumn": "id",
+                          "outColumn": "person_id",    "inColumn": "city_id",
+                          "outVertexLabel": "Person",  "inVertexLabel": "City",
+                          "properties": {"since": "since"}},
+            "HAS_SKILL": {"table": "iceberg:iceberg.social_network.has_skill",   "idColumn": "id",
+                          "outColumn": "person_id",    "inColumn": "skill_id",
+                          "outVertexLabel": "Person",  "inVertexLabel": "Skill",
+                          "properties": {"level": "level", "yearsOfExp": "years_of_exp"}},
+            "LOCATED_IN":{"table": "iceberg:iceberg.social_network.company_city","idColumn": "id",
+                          "outColumn": "company_id",   "inColumn": "city_id",
+                          "outVertexLabel": "Company", "inVertexLabel": "City",
+                          "properties": {}},
+        },
+    }
+
+    import requests as _req
+    payload = _json.dumps(mapping).encode("utf-8")
+    r = _req.post(
+        f"{BASE_URL}/mapping/upload",
+        files={"file": ("social-iceberg.json", payload, "application/json")},
+        params={"id": "social-iceberg", "name": "Social Iceberg", "activate": "true"},
+        timeout=15,
+    )
+    if r.status_code == 200:
+        print(f"Mapping uploaded and activated: social-iceberg "
+              f"(Trino → {_TRINO_HOST}:{_TRINO_PORT})")
+    else:
+        print(f"WARNING: Mapping upload failed ({r.status_code}): {r.text[:400]}")
+
 
 # ── Hybrid seeding (H2 + Iceberg) ─────────────────────────────────────────────
 
@@ -770,16 +887,74 @@ def seed_hybrid(wipe: bool, h2_mode: str = "csvread", iceberg_mode: str = "csv")
     seed_iceberg(wipe, mode=iceberg_mode)
 
     print("\n=== Hybrid seed: uploading hybrid mapping… ===")
-    mapping_path = pathlib.Path(__file__).parent.parent / "mappings" / "social-network-hybrid-mapping.json"
-    with open(mapping_path, "rb") as f:
-        r = _req.post(
-            f"{BASE_URL}/mapping/upload",
-            files={"file": (mapping_path.name, f, "application/json")},
-            params={"id": "social-hybrid", "name": "Social Network Hybrid", "activate": "true"},
-            timeout=15,
-        )
+    import json as _json
+    hybrid_mapping = {
+        "defaultDatasource": "h2",
+        "backends": {
+            "h2": {
+                "url":         "jdbc:h2:file:/app/data/graph;AUTO_SERVER=TRUE",
+                "user":        "sa",
+                "password":    "",
+                "driverClass": "org.h2.Driver",
+            },
+            "iceberg": {
+                "url":         f"jdbc:trino://{_TRINO_HOST}:{_TRINO_PORT}/iceberg",
+                "user":        "admin",
+                "password":    "",
+                "driverClass": "io.trino.jdbc.TrinoDriver",
+            },
+        },
+        "vertices": {
+            "Person":  {"datasource": "h2",      "table": "sn_persons",
+                        "idColumn": "id",
+                        "properties": {"name": "name", "age": "age", "email": "email",
+                                       "city": "city", "country": "country", "joinedAt": "joined_at"}},
+            "Company": {"datasource": "iceberg", "table": "iceberg:iceberg.social_network.companies",
+                        "idColumn": "id",
+                        "properties": {"name": "name", "industry": "industry", "country": "country",
+                                       "founded": "founded", "employees": "employees"}},
+            "City":    {"datasource": "iceberg", "table": "iceberg:iceberg.social_network.cities",
+                        "idColumn": "id",
+                        "properties": {"name": "name", "country": "country",
+                                       "population": "population", "timezone": "timezone"}},
+            "Skill":   {"datasource": "iceberg", "table": "iceberg:iceberg.social_network.skills",
+                        "idColumn": "id",
+                        "properties": {"name": "name", "category": "category"}},
+        },
+        "edges": {
+            "KNOWS":     {"datasource": "h2",      "table": "sn_knows",     "idColumn": "id",
+                          "outColumn": "person_a_id", "inColumn": "person_b_id",
+                          "outVertexLabel": "Person", "inVertexLabel": "Person",
+                          "properties": {"since": "since", "strength": "strength"}},
+            "WORKS_AT":  {"datasource": "h2",      "table": "sn_works_at",  "idColumn": "id",
+                          "outColumn": "person_id",  "inColumn": "company_id",
+                          "outVertexLabel": "Person", "inVertexLabel": "Company",
+                          "properties": {"role": "role", "startYear": "start_year"}},
+            "LIVES_IN":  {"datasource": "h2",      "table": "sn_lives_in",  "idColumn": "id",
+                          "outColumn": "person_id",  "inColumn": "city_id",
+                          "outVertexLabel": "Person", "inVertexLabel": "City",
+                          "properties": {"since": "since"}},
+            "HAS_SKILL": {"datasource": "h2",      "table": "sn_has_skill", "idColumn": "id",
+                          "outColumn": "person_id",  "inColumn": "skill_id",
+                          "outVertexLabel": "Person", "inVertexLabel": "Skill",
+                          "properties": {"level": "level", "yearsOfExp": "years_of_exp"}},
+            "LOCATED_IN":{"datasource": "iceberg", "table": "iceberg:iceberg.social_network.company_city",
+                          "idColumn": "id",
+                          "outColumn": "company_id", "inColumn": "city_id",
+                          "outVertexLabel": "Company","inVertexLabel": "City",
+                          "properties": {}},
+        },
+    }
+    payload = _json.dumps(hybrid_mapping).encode("utf-8")
+    r = _req.post(
+        f"{BASE_URL}/mapping/upload",
+        files={"file": ("social-network-hybrid-mapping.json", payload, "application/json")},
+        params={"id": "social-hybrid", "name": "Social Network Hybrid", "activate": "true"},
+        timeout=15,
+    )
     if r.ok:
-        print(f"Hybrid mapping uploaded and activated: {r.json().get('mappingId')}")
+        print(f"Hybrid mapping uploaded and activated: {r.json().get('mappingId')} "
+              f"(Trino → {_TRINO_HOST}:{_TRINO_PORT})")
     else:
         print(f"WARNING: Hybrid mapping upload failed ({r.status_code}): {r.text[:400]}")
 

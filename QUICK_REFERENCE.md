@@ -46,6 +46,7 @@ jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb
 | **Docker full stack** | `cd demo && docker compose up` |
 | **Docker H2 only** | `cd demo && docker compose up engine jupyter` |
 | **Docker stop** | `cd demo && docker compose down` |
+| **Build & push Docker image** | `mvn package -DskipTests -P docker-push` |
 | **Start engine (Maven)** | `mvn exec:java` |
 | **Run all tests** | `mvn test` |
 | **Open AML notebook** | `jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb` |
@@ -169,13 +170,23 @@ BACKEND = 'iceberg'  # Iceberg via Trino (requires Docker Iceberg stack)
 
 ## Docker Image
 
-The engine is published to Docker Hub:
+The engine is published to Docker Hub (includes the H2 JAR at `/opt/h2.jar`):
 
 ```bash
 docker pull vaijosh/graph-query-engine:latest
 ```
 
-To rebuild locally after code changes:
+To build and push after code changes — single command:
+
+```bash
+# Build JAR + Docker image + push :latest to Docker Hub
+mvn package -DskipTests -P docker-push
+
+# Also tag and push a version (e.g. 0.1.0)
+mvn package -DskipTests -P docker-push -Ddocker.tag=0.1.0 -Ddocker.tag.skip=false
+```
+
+To rebuild the local Docker stack only (no push):
 
 ```bash
 mvn package -DskipTests
@@ -226,6 +237,7 @@ curl -X POST "http://localhost:7000/mapping/active?id=aml"
 | Jupyter token prompt | Use password `GqeDemo123` (Docker) |
 | OOM on deep traversal | Reduce hops or set `WCOJ_MAX_EDGES=500000` |
 | Iceberg tables missing | Run seed cell with `WIPE = True` after Iceberg stack is up |
+| Jupyter slow on first start | Normal — JRE + H2 JAR (~2 MB) are downloaded once on first container creation |
 
 ---
 
