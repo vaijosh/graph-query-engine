@@ -9,7 +9,7 @@ cd demo
 docker compose up
 
 # H2 only (lighter, no Iceberg):
-docker compose up engine jupyter
+docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter
 ```
 
 | Service | URL | Credentials |
@@ -44,7 +44,7 @@ jupyter notebook demo/aml/notebooks/aml_sql_showcase.ipynb
 | Task | Command |
 |------|---------|
 | **Docker full stack** | `cd demo && docker compose up` |
-| **Docker H2 only** | `cd demo && docker compose up engine jupyter` |
+| **Docker H2 only** | `cd demo && docker compose -f docker-compose.yml -f docker-compose.h2.yml up engine jupyter` |
 | **Docker stop** | `cd demo && docker compose down` |
 | **Build & push Docker image** | `mvn package -DskipTests -P docker-push` |
 | **Start engine (Maven)** | `mvn exec:java` |
